@@ -1,6 +1,10 @@
 # ChromaDB persistent store — data lives here, not in git
 chroma_db/
 
+# RAG corpus — track the folder but not large binary files
+RAG-corpus/*.pdf
+RAG-corpus/*.PDF
+
 # Python
 __pycache__/
 *.py[cod]
