@@ -1,5 +1,6 @@
 """Embed documents and store them in ChromaDB."""
 import sys
+import re
 import json
 from pathlib import Path
 from pypdf import PdfReader
@@ -24,25 +25,101 @@ def _save_manifest(manifest: dict[str, float]) -> None:
     MANIFEST_PATH.write_text(json.dumps(manifest, indent=2))
 
 
-# ── text extraction ───────────────────────────────────────────────────────────
+# ── text extraction & smart chunking ─────────────────────────────────────────
 
-def _chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> list[str]:
-    words = text.split()
-    chunks, i = [], 0
-    while i < len(words):
-        chunks.append(" ".join(words[i : i + chunk_size]))
-        i += chunk_size - overlap
-    return chunks
+_HEADING_RE = re.compile(
+    r'^(?:'
+    r'\d+(\.\d+)*\.?\s{1,4}[A-Z][a-z]'  # numbered: "1.3 Numerical Methods"
+    r'|(Algorithm|Theorem|Lemma|Proof|Corollary|Definition|Remark|Example|Exercise)\s*[\d.:]'
+    r')'
+)
 
 
-def _extract_pdf(path: Path) -> list[str]:
+def _is_heading(line: str) -> bool:
+    line = line.strip()
+    if not line or len(line) > 80:
+        return False
+    if _HEADING_RE.match(line):
+        return True
+    # ALL CAPS short line with at least 4 alpha chars (chapter/section titles)
+    alpha = [c for c in line if c.isalpha()]
+    if len(alpha) >= 4 and len(line) < 60 and line.upper() == line:
+        return True
+    return False
+
+
+def _split_sentences(text: str) -> list[str]:
+    parts = re.split(r'(?<=[.!?])\s+', text.strip())
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _merge_into_chunks(paragraphs: list[str], max_words: int = 500, overlap: int = 2) -> list[str]:
+    """Merge paragraphs into sentence-bounded chunks with sentence-level overlap."""
+    chunks: list[str] = []
+    buffer: list[str] = []
+
+    for para in paragraphs:
+        for sentence in _split_sentences(para):
+            buffer.append(sentence)
+            if sum(len(s.split()) for s in buffer) >= max_words:
+                chunks.append(" ".join(buffer))
+                buffer = buffer[-overlap:] if len(buffer) > overlap else buffer[:]
+
+    if buffer:
+        last = " ".join(buffer)
+        if not chunks or last != chunks[-1]:
+            chunks.append(last)
+
+    return [c for c in chunks if c.strip()]
+
+
+def _smart_chunk(text: str, max_words: int = 500, overlap: int = 2) -> list[tuple[str, str]]:
+    """
+    Tier 1: paragraph-aware splitting with sentence-boundary overflow and overlap.
+    Tier 2: section headings detected as hard breaks; heading prepended to each chunk.
+    Returns list of (heading, chunk_text) pairs.
+    """
+    sections: list[tuple[str, list[str]]] = []
+    current_heading = ""
+    current_lines: list[str] = []
+
+    for line in text.splitlines():
+        if _is_heading(line):
+            if current_lines:
+                sections.append((current_heading, current_lines))
+            current_heading = line.strip()
+            current_lines = []
+        else:
+            current_lines.append(line)
+
+    if current_lines:
+        sections.append((current_heading, current_lines))
+
+    result: list[tuple[str, str]] = []
+    for heading, lines in sections:
+        paragraphs = [
+            p.strip()
+            for p in re.split(r'\n\s*\n', "\n".join(lines))
+            if p.strip()
+        ]
+        if not paragraphs:
+            continue
+        for chunk in _merge_into_chunks(paragraphs, max_words, overlap):
+            body = f"{heading}\n{chunk}" if heading else chunk
+            result.append((heading, body))
+
+    return result
+
+
+def _extract_pdf(path: Path) -> str:
+    """Extract all text from a PDF as a single string (pages joined with double newline)."""
     reader = PdfReader(path)
     pages = []
     for page in reader.pages:
         text = (page.extract_text() or "").strip()
         if text:
             pages.append(text)
-    return pages
+    return "\n\n".join(pages)
 
 
 # ── ingestion ─────────────────────────────────────────────────────────────────
@@ -57,21 +134,20 @@ def ingest_texts(documents: list[str], ids: list[str], collection_name: str = "d
 def ingest_file(path: Path, collection_name: str = "default") -> int:
     suffix = path.suffix.lower()
     if suffix == ".pdf":
-        pages = _extract_pdf(path)
+        full_text = _extract_pdf(path)
     elif suffix == ".txt":
-        pages = [path.read_text(encoding="utf-8")]
+        full_text = path.read_text(encoding="utf-8")
     else:
         raise ValueError(f"Unsupported file type: {suffix}")
 
-    chunks, ids = [], []
-    for page_num, page_text in enumerate(pages):
-        for chunk_num, chunk in enumerate(_chunk_text(page_text)):
-            chunks.append(chunk)
-            ids.append(f"{path.stem}__p{page_num}__c{chunk_num}")
+    chunk_pairs = _smart_chunk(full_text)
 
-    if not chunks:
+    if not chunk_pairs:
         print(f"  Warning: no text extracted from '{path.name}'.")
         return 0
+
+    chunks = [text for _, text in chunk_pairs]
+    ids = [f"{path.stem}__ch{i}" for i in range(len(chunks))]
 
     collection = client.get_or_create_collection(collection_name, embedding_function=embedding_fn)
     collection.upsert(documents=chunks, ids=ids)
