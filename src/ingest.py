@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from pypdf import PdfReader
 from db import client, embedding_fn, REPO_ROOT, DB_PATH
+import graph as kg
 
 CORPUS_PATH = REPO_ROOT / "RAG-corpus"
 MANIFEST_PATH = DB_PATH / ".manifest.json"
@@ -49,6 +50,7 @@ def _extract_pdf(path: Path) -> list[str]:
 def ingest_texts(documents: list[str], ids: list[str], collection_name: str = "default") -> int:
     collection = client.get_or_create_collection(collection_name, embedding_function=embedding_fn)
     collection.upsert(documents=documents, ids=ids)
+    kg.update(documents, ids)
     return len(documents)
 
 
@@ -73,6 +75,7 @@ def ingest_file(path: Path, collection_name: str = "default") -> int:
 
     collection = client.get_or_create_collection(collection_name, embedding_function=embedding_fn)
     collection.upsert(documents=chunks, ids=ids)
+    kg.update(chunks, ids)
     return len(chunks)
 
 

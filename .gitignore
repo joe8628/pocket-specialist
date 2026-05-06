@@ -1,6 +1,9 @@
 # ChromaDB persistent store — data lives here, not in git
 chroma_db/
 
+# Knowledge graph — derived from corpus, not committed
+knowledge_graph/graph.json
+
 # RAG corpus — track the folder but not large binary files
 RAG-corpus/*.pdf
 RAG-corpus/*.PDF

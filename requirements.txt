@@ -2,3 +2,5 @@ chromadb
 sentence-transformers
 anthropic
 pypdf
+spacy
+networkx
