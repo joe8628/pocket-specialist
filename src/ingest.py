@@ -1,6 +1,8 @@
 """Embed documents and store them in ChromaDB."""
 import sys
 import re
+import csv
+import io
 import json
 from pathlib import Path
 from pypdf import PdfReader
@@ -9,7 +11,7 @@ import graph as kg
 
 CORPUS_PATH = REPO_ROOT / "RAG-corpus"
 MANIFEST_PATH = DB_PATH / ".manifest.json"
-SUPPORTED = {".pdf", ".txt"}
+SUPPORTED = {".pdf", ".txt", ".md", ".markdown", ".csv"}
 
 
 # ── manifest ──────────────────────────────────────────────────────────────────
@@ -25,6 +27,64 @@ def _save_manifest(manifest: dict[str, float]) -> None:
     MANIFEST_PATH.write_text(json.dumps(manifest, indent=2))
 
 
+# ── format detection ─────────────────────────────────────────────────────────
+
+_PDF_MAGIC = b'%PDF'
+
+
+def _sniff_format(path: Path) -> str:
+    """
+    Detect document format by inspecting file content, not just extension.
+    Returns one of: 'pdf', 'markdown', 'csv', 'text', 'unsupported'.
+    """
+    try:
+        with open(path, 'rb') as f:
+            raw = f.read(8192)
+    except OSError:
+        return 'unsupported'
+
+    # PDF: magic bytes take priority over extension
+    if raw.startswith(_PDF_MAGIC):
+        return 'pdf'
+
+    # Null bytes → binary format we can't handle
+    if b'\x00' in raw:
+        return 'unsupported'
+
+    # Decode as text; try UTF-8 then Latin-1 as fallback
+    sample = None
+    for enc in ('utf-8', 'latin-1'):
+        try:
+            sample = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    if sample is None:
+        return 'unsupported'
+
+    lines = [l for l in sample.splitlines() if l.strip()]
+    if not lines:
+        return 'text'
+
+    # Markdown: at least one ATX heading (#) in the first 40 lines
+    if any(re.match(r'^#{1,6}\s+\S', l) for l in lines[:40]):
+        return 'markdown'
+
+    # CSV: consistent column count across first 10 data lines
+    try:
+        dialect = csv.Sniffer().sniff(sample[:4096], delimiters=',;\t|')
+        rows = list(csv.reader(io.StringIO('\n'.join(lines[:20])), dialect))
+        non_empty = [r for r in rows if r]
+        if non_empty and len(non_empty[0]) > 1:
+            col_counts = [len(r) for r in non_empty[:10]]
+            if max(col_counts) - min(col_counts) <= 1:
+                return 'csv'
+    except csv.Error:
+        pass
+
+    return 'text'
+
+
 # ── text extraction & smart chunking ─────────────────────────────────────────
 
 _HEADING_RE = re.compile(
@@ -36,14 +96,19 @@ _HEADING_RE = re.compile(
 
 
 def _is_heading(line: str) -> bool:
-    line = line.strip()
-    if not line or len(line) > 80:
+    stripped = line.strip()
+    if not stripped:
         return False
-    if _HEADING_RE.match(line):
+    # Markdown ATX headings — check before length guard (headings can be long)
+    if re.match(r'^#{1,6}\s+\S', stripped):
+        return True
+    if len(stripped) > 80:
+        return False
+    if _HEADING_RE.match(stripped):
         return True
     # ALL CAPS short line with at least 4 alpha chars (chapter/section titles)
-    alpha = [c for c in line if c.isalpha()]
-    if len(alpha) >= 4 and len(line) < 60 and line.upper() == line:
+    alpha = [c for c in stripped if c.isalpha()]
+    if len(alpha) >= 4 and len(stripped) < 60 and stripped.upper() == stripped:
         return True
     return False
 
@@ -87,7 +152,7 @@ def _smart_chunk(text: str, max_words: int = 500, overlap: int = 2) -> list[tupl
         if _is_heading(line):
             if current_lines:
                 sections.append((current_heading, current_lines))
-            current_heading = line.strip()
+            current_heading = re.sub(r'^#{1,6}\s+', '', line.strip())
             current_lines = []
         else:
             current_lines.append(line)
@@ -122,6 +187,39 @@ def _extract_pdf(path: Path) -> str:
     return "\n\n".join(pages)
 
 
+def _extract_csv(path: Path) -> str:
+    """
+    Convert CSV rows to readable text: 'Header1: val1 | Header2: val2 ...' per row.
+    Each row becomes one paragraph so the chunker treats it as a logical unit.
+    """
+    with open(path, newline='', encoding='utf-8', errors='replace') as f:
+        sample = f.read(4096)
+        f.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=',;\t|')
+            has_header = csv.Sniffer().has_header(sample)
+        except csv.Error:
+            dialect = csv.excel
+            has_header = False
+        rows = list(csv.reader(f, dialect))
+
+    if not rows:
+        return ''
+
+    headers = rows[0] if has_header else [f'col{i}' for i in range(len(rows[0]))]
+    data_rows = rows[1:] if has_header else rows
+
+    lines = []
+    for row in data_rows:
+        if not any(cell.strip() for cell in row):
+            continue
+        parts = [f'{h}: {v}' for h, v in zip(headers, row) if v.strip()]
+        if parts:
+            lines.append(' | '.join(parts))
+
+    return '\n\n'.join(lines)
+
+
 # ── ingestion ─────────────────────────────────────────────────────────────────
 
 def ingest_texts(documents: list[str], ids: list[str], collection_name: str = "default") -> int:
@@ -132,13 +230,17 @@ def ingest_texts(documents: list[str], ids: list[str], collection_name: str = "d
 
 
 def ingest_file(path: Path, collection_name: str = "default") -> int:
-    suffix = path.suffix.lower()
-    if suffix == ".pdf":
+    fmt = _sniff_format(path)
+
+    if fmt == 'pdf':
         full_text = _extract_pdf(path)
-    elif suffix == ".txt":
-        full_text = path.read_text(encoding="utf-8")
+    elif fmt in ('text', 'markdown'):
+        full_text = path.read_text(encoding='utf-8', errors='replace')
+    elif fmt == 'csv':
+        full_text = _extract_csv(path)
     else:
-        raise ValueError(f"Unsupported file type: {suffix}")
+        print(f"  Warning: unrecognised format for '{path.name}', skipping.")
+        return 0
 
     chunk_pairs = _smart_chunk(full_text)
 
