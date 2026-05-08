@@ -5,7 +5,18 @@ import csv
 import io
 import json
 from pathlib import Path
-from pypdf import PdfReader
+_marker_converter = None
+
+
+def _get_marker_converter():
+    global _marker_converter
+    if _marker_converter is not None:
+        return _marker_converter
+    print("  Loading Marker models (first run only)...")
+    from marker.converters.pdf import PdfConverter
+    from marker.models import create_model_dict
+    _marker_converter = PdfConverter(artifact_dict=create_model_dict())
+    return _marker_converter
 from db import client, embedding_fn, REPO_ROOT, DB_PATH
 import graph as kg
 
@@ -177,14 +188,10 @@ def _smart_chunk(text: str, max_words: int = 500, overlap: int = 2) -> list[tupl
 
 
 def _extract_pdf(path: Path) -> str:
-    """Extract all text from a PDF as a single string (pages joined with double newline)."""
-    reader = PdfReader(path)
-    pages = []
-    for page in reader.pages:
-        text = (page.extract_text() or "").strip()
-        if text:
-            pages.append(text)
-    return "\n\n".join(pages)
+    """Extract PDF as Markdown with LaTeX equations preserved via Marker."""
+    converter = _get_marker_converter()
+    rendered = converter(str(path))
+    return rendered.markdown
 
 
 def _extract_csv(path: Path) -> str:

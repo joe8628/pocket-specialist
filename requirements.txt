@@ -1,6 +1,6 @@
 chromadb
 sentence-transformers
 anthropic
-pypdf
+marker-pdf
 spacy
 networkx
