@@ -1,6 +1,6 @@
 chromadb
 sentence-transformers
 anthropic
-marker-pdf
+marker-pdf==1.10.2
 spacy
 networkx

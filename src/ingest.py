@@ -5,6 +5,10 @@ import csv
 import io
 import json
 from pathlib import Path
+
+from db import client, embedding_fn, REPO_ROOT, DB_PATH
+import graph as kg
+
 _marker_converter = None
 
 
@@ -12,13 +16,17 @@ def _get_marker_converter():
     global _marker_converter
     if _marker_converter is not None:
         return _marker_converter
-    print("  Loading Marker models (first run only)...")
+    import torch
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "Marker requires a CUDA-capable GPU. "
+            "Check that your NVIDIA driver and PyTorch CUDA versions are compatible."
+        )
+    print(f"  Loading Marker models on {torch.cuda.get_device_name(0)} (first run only)...")
     from marker.converters.pdf import PdfConverter
     from marker.models import create_model_dict
     _marker_converter = PdfConverter(artifact_dict=create_model_dict())
     return _marker_converter
-from db import client, embedding_fn, REPO_ROOT, DB_PATH
-import graph as kg
 
 CORPUS_PATH = REPO_ROOT / "RAG-corpus"
 MANIFEST_PATH = DB_PATH / ".manifest.json"
@@ -125,6 +133,9 @@ def _is_heading(line: str) -> bool:
 
 
 def _split_sentences(text: str) -> list[str]:
+    # Treat display math blocks as atomic — never split inside $$...$$
+    if text.strip().startswith('$$'):
+        return [text.strip()]
     parts = re.split(r'(?<=[.!?])\s+', text.strip())
     return [p.strip() for p in parts if p.strip()]
 
