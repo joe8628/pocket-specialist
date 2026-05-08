@@ -1,6 +1,8 @@
-chromadb
-sentence-transformers
-anthropic
+chromadb==1.5.9
+sentence-transformers==5.4.1
+anthropic==0.46.0
 marker-pdf==1.10.2
-spacy
-networkx
+transformers==5.8.0
+huggingface_hub==1.14.0
+spacy==3.8.14
+networkx==3.6.1
