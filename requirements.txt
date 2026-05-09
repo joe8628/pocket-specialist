@@ -4,6 +4,7 @@ anthropic
 marker-pdf
 docling
 olmocr
+nougat-ocr
 pypdf
 spacy
 networkx
