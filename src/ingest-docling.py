@@ -195,8 +195,28 @@ def _smart_chunk(text: str, max_words: int = 500, overlap: int = 2) -> list[tupl
 
 def _extract_docling(path: Path) -> str:
     """Extract document content as Markdown using Docling."""
+    import logging
+    from docling.datamodel.base_models import ConversionStatus
+
     converter = _get_docling_converter()
-    result = converter.convert(str(path))
+
+    # docling calls _log.exception() (with full traceback) before marking a
+    # document invalid; silence that logger during the call so the noise goes
+    # away, then check the result status ourselves and raise a clean error.
+    docling_log = logging.getLogger("docling.datamodel.document")
+    prev_level = docling_log.level
+    docling_log.setLevel(logging.CRITICAL)
+    try:
+        result = converter.convert(str(path), raises_on_error=False)
+    finally:
+        docling_log.setLevel(prev_level)
+
+    if result.status not in (ConversionStatus.SUCCESS, ConversionStatus.PARTIAL_SUCCESS):
+        raise RuntimeError(
+            f"Docling could not convert '{path.name}' "
+            f"(status: {result.status.value}) — file may be encrypted or corrupt"
+        )
+
     return result.document.export_to_markdown()
 
 
