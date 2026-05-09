@@ -202,7 +202,8 @@ def _extract_pdf(path: Path) -> str:
     """Extract PDF as Markdown with LaTeX equations preserved via Marker."""
     converter = _get_marker_converter()
     rendered = converter(str(path))
-    return rendered.markdown
+    # Strip HTML span tags that marker injects for page anchors — pure noise for RAG
+    return re.sub(r'<span[^>]*>.*?</span>', '', rendered.markdown, flags=re.DOTALL)
 
 
 def _extract_csv(path: Path) -> str:
@@ -328,7 +329,7 @@ if __name__ == "__main__":
         sys.exit(0)
 
     # Single file path provided
-    file_path = Path(sys.argv[1])
+    file_path = Path(sys.argv[1]).resolve()
     collection_name = sys.argv[2] if len(sys.argv) > 2 else "default"
 
     if not file_path.exists():

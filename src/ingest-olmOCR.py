@@ -446,7 +446,7 @@ if __name__ == "__main__":
         ingest_corpus()
         sys.exit(0)
 
-    file_path = Path(args[0])
+    file_path = Path(args[0]).resolve()
     collection_name = args[1] if len(args) > 1 else "default"
 
     if not file_path.exists():
