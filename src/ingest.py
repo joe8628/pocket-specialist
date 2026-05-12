@@ -123,10 +123,19 @@ _HEADING_RE = re.compile(
     r')'
 )
 
+# Matches BASIC/Fortran line-numbered code: "1234 PRINT X" or "10 FOR I=1 TO N"
+_CODE_LINE_RE = re.compile(r'^\s*\d{2,5}\s+[A-Za-z\'`]')
+
+_MIN_PROSE_WORDS = 5
+_MEANINGFUL_LATEX_RE = re.compile(r'\\(?:frac|int|sum|prod|partial|nabla|cdot|times|alpha|beta|gamma|delta|sigma|omega|lambda|mu|pi|theta|phi|psi|hat|bar|vec|mathbf|mathrm)\b|\$\$')
+
 
 def _is_heading(line: str) -> bool:
     stripped = line.strip()
     if not stripped:
+        return False
+    # Never treat BASIC/Fortran line-numbered code as a heading
+    if _CODE_LINE_RE.match(stripped):
         return False
     # Markdown ATX headings — check before length guard (headings can be long)
     if re.match(r'^#{1,6}\s+\S', stripped):
@@ -140,6 +149,34 @@ def _is_heading(line: str) -> bool:
     if len(alpha) >= 4 and len(stripped) < 60 and stripped.upper() == stripped:
         return True
     return False
+
+
+def _merge_code_runs(lines: list[str]) -> list[str]:
+    """Collapse consecutive BASIC/Fortran line-numbered code lines into one fenced block."""
+    result: list[str] = []
+    code_buf: list[str] = []
+
+    def flush_code():
+        if code_buf:
+            result.append("```\n" + "\n".join(code_buf) + "\n```")
+            code_buf.clear()
+
+    for line in lines:
+        if _CODE_LINE_RE.match(line):
+            code_buf.append(line.rstrip())
+        else:
+            flush_code()
+            result.append(line)
+    flush_code()
+    return result
+
+
+def _is_meaningful_chunk(text: str) -> bool:
+    """Return False for chunks that are pure noise (no prose and no meaningful math)."""
+    prose_words = len(re.findall(r'[a-zA-Z]{3,}', text))
+    if prose_words >= _MIN_PROSE_WORDS:
+        return True
+    return bool(_MEANINGFUL_LATEX_RE.search(text))
 
 
 def _split_sentences(text: str) -> list[str]:
@@ -194,18 +231,102 @@ def _smart_chunk(text: str, max_words: int = 500, overlap: int = 2) -> list[tupl
 
     result: list[tuple[str, str]] = []
     for heading, lines in sections:
+        merged_lines = _merge_code_runs(lines)
         paragraphs = [
             p.strip()
-            for p in re.split(r'\n\s*\n', "\n".join(lines))
+            for p in re.split(r'\n\s*\n', "\n".join(merged_lines))
             if p.strip()
         ]
         if not paragraphs:
             continue
         for chunk in _merge_into_chunks(paragraphs, max_words, overlap):
             body = f"{heading}\n{chunk}" if heading else chunk
-            result.append((heading, body))
+            if _is_meaningful_chunk(body):
+                result.append((heading, body))
 
     return result
+
+
+_PAGE_NUMBER_RE = re.compile(
+    r'^\s*(?:Page\s+)?\d{1,4}(?:\s+of\s+\d{1,4})?\s*$',
+    re.IGNORECASE,
+)
+
+
+def _strip_page_artifacts(text: str) -> str:
+    """
+    Remove page headers/footers from Marker-extracted PDF markdown.
+
+    Two passes:
+    1. Bare page-number lines — isolated digits (1-4) optionally preceded by
+       "Page " or followed by " of N".  BASIC line numbers are excluded because
+       _merge_code_runs handles them inside fenced blocks; here we only see lines
+       that survived as standalone paragraphs.
+    2. Running headers/footers — short lines (< 72 chars, no code/math markers)
+       that appear more than once per ~30 lines of document, i.e. suspiciously
+       periodic.  Threshold: max(3, total_lines // 30).
+    """
+    lines = text.splitlines()
+    total = len(lines)
+
+    # Pass 1: count occurrences of each short non-code line
+    from collections import Counter
+    freq: Counter[str] = Counter()
+    for line in lines:
+        s = line.strip()
+        if s and len(s) < 72 and not _CODE_LINE_RE.match(s):
+            freq[s] += 1
+
+    # Running-header threshold scales with document length
+    rh_threshold = max(3, total // 30)
+
+    running_headers: set[str] = set()
+    for line_text, count in freq.items():
+        if count >= rh_threshold:
+            # Exclude lines that look like code, math, or markdown tables
+            if re.search(r'[\\|`${}]', line_text):
+                continue
+            # Exclude section headings that legitimately repeat (short ALL-CAPS
+            # structural markers are fine to keep — they're usually unique)
+            running_headers.add(line_text)
+
+    cleaned: list[str] = []
+    for line in lines:
+        s = line.strip()
+        if _PAGE_NUMBER_RE.match(s):
+            continue
+        if s in running_headers:
+            continue
+        cleaned.append(line)
+
+    return "\n".join(cleaned)
+
+
+_BR_RE = re.compile(r'<br\s*/?>', re.IGNORECASE)
+# Invisible Unicode that causes subtle word-boundary issues
+_INVISIBLE_RE = re.compile(
+    r'[\xad'           # soft hyphen U+00AD
+    r'​'          # zero-width space
+    r'‌'          # zero-width non-joiner
+    r'‍'          # zero-width joiner
+    r'﻿'          # BOM / zero-width no-break space
+    r']'
+)
+
+
+def _strip_ocr_artifacts(text: str) -> str:
+    """
+    Clean residual HTML and Unicode artifacts left by Marker after PDF extraction.
+
+    - <br> / <br/> inside table cells → single space (Marker emits these for
+      multi-line cell content, most visibly in table-of-contents tables)
+    - Soft hyphens, zero-width spaces, BOM, and other invisible Unicode → removed
+    - Non-breaking spaces → regular spaces
+    """
+    text = _BR_RE.sub(' ', text)
+    text = _INVISIBLE_RE.sub('', text)
+    text = text.replace(' ', ' ')   # non-breaking space → regular space
+    return text
 
 
 def _extract_pdf(path: Path) -> str:
@@ -213,7 +334,9 @@ def _extract_pdf(path: Path) -> str:
     converter = _get_marker_converter()
     rendered = converter(str(path))
     # Strip HTML span tags that marker injects for page anchors — pure noise for RAG
-    return re.sub(r'<span[^>]*>.*?</span>', '', rendered.markdown, flags=re.DOTALL)
+    text = re.sub(r'<span[^>]*>.*?</span>', '', rendered.markdown, flags=re.DOTALL)
+    text = _strip_ocr_artifacts(text)
+    return _strip_page_artifacts(text)
 
 
 def _extract_csv(path: Path) -> str:
@@ -249,11 +372,59 @@ def _extract_csv(path: Path) -> str:
     return '\n\n'.join(lines)
 
 
+# ── metadata helpers ──────────────────────────────────────────────────────────
+
+_PDF_DATE_RE = re.compile(r"D:(\d{4})(\d{2})(\d{2})")
+
+
+def _parse_pdf_date(raw: str) -> str:
+    """Convert PDF date string 'D:YYYYMMDDHHmmss...' to 'YYYY-MM-DD', or ''."""
+    m = _PDF_DATE_RE.match(raw or "")
+    return f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else ""
+
+
+def _pdf_doc_metadata(path: Path) -> dict:
+    """Extract title, author, page_count, creation_date from PDF without GPU."""
+    try:
+        import pypdf
+        reader = pypdf.PdfReader(str(path), strict=False)
+        meta = reader.metadata or {}
+        return {
+            "title": str(meta.get("/Title", "")).strip() or path.stem,
+            "author": str(meta.get("/Author", "")).strip(),
+            "page_count": len(reader.pages),
+            "creation_date": _parse_pdf_date(str(meta.get("/CreationDate", ""))),
+        }
+    except Exception:
+        return {"title": path.stem, "author": "", "page_count": 0, "creation_date": ""}
+
+
+def _file_metadata(path: Path, fmt: str) -> dict:
+    """Base provenance metadata common to all document types."""
+    stat = path.stat()
+    base = {
+        "source": str(path.relative_to(REPO_ROOT)),
+        "filename": path.name,
+        "doc_type": fmt,
+        "mtime": stat.st_mtime,
+    }
+    if fmt == "pdf":
+        base.update(_pdf_doc_metadata(path))
+    else:
+        base.update({"title": path.stem, "author": "", "page_count": 0, "creation_date": ""})
+    return base
+
+
 # ── ingestion ─────────────────────────────────────────────────────────────────
 
-def ingest_texts(documents: list[str], ids: list[str], collection_name: str = "default") -> int:
+def ingest_texts(
+    documents: list[str],
+    ids: list[str],
+    metadatas: list[dict] | None = None,
+    collection_name: str = "default",
+) -> int:
     collection = client.get_or_create_collection(collection_name, embedding_function=embedding_fn)
-    collection.upsert(documents=documents, ids=ids)
+    collection.upsert(documents=documents, ids=ids, metadatas=metadatas)
     kg.update(documents, ids)
     return len(documents)
 
@@ -277,11 +448,17 @@ def ingest_file(path: Path, collection_name: str = "default") -> int:
         print(f"  Warning: no text extracted from '{path.name}'.")
         return 0
 
-    chunks = [text for _, text in chunk_pairs]
-    ids = [f"{path.stem}__ch{i}" for i in range(len(chunks))]
+    base_meta = _file_metadata(path, fmt)
+    chunks = []
+    ids = []
+    metadatas = []
+    for i, (heading, text) in enumerate(chunk_pairs):
+        chunks.append(text)
+        ids.append(f"{path.stem}__ch{i}")
+        metadatas.append({**base_meta, "heading": heading, "chunk_index": i})
 
     collection = client.get_or_create_collection(collection_name, embedding_function=embedding_fn)
-    collection.upsert(documents=chunks, ids=ids)
+    collection.upsert(documents=chunks, ids=ids, metadatas=metadatas)
     kg.update(chunks, ids)
     return len(chunks)
 
