@@ -135,8 +135,22 @@ _SECTION_HEADING_NAMES_RE = re.compile(
 # Boilerplate sections to drop entirely (not worth indexing)
 _BOILERPLATE_HEADING_RE = re.compile(
     r'^(?:references?|bibliography|acknowledgements?|acknowledgments?|'
-    r'further\s+reading|index)\s*$',
+    r'further\s+reading|index|'
+    # Journal delivery footers (AIP, APS, etc.)
+    r'articles?\s+you\s+may\s+be\s+interested\s+in|'
+    r'related\s+content|cited\s+by|'
+    r'recommended\s+articles?|'
+    r'supplementary\s+(?:material|data|information)|'
+    r'author\s+(?:information|affiliations?|contributions?)|'
+    r'funding\s+information|'
+    r'conflict(?:s)?\s+of\s+interest|'
+    r'data\s+availability)\s*$',
     re.IGNORECASE,
+)
+
+# Bullet/numbered-list TOC entry: "  3. Chapter Name .... 47" or "  • Section"
+_TOC_ENTRY_RE = re.compile(
+    r'^\s*(?:[\d]+\.[\d.]*\s+\S|\•|\–|\-)\s*.{3,60}(?:\.{3,}|\s{3,})\s*\d{1,4}\s*$'
 )
 
 # Matches BASIC/Fortran line-numbered code: "1234 PRINT X" or "10 FOR I=1 TO N"
@@ -159,8 +173,20 @@ def _is_heading(line: str) -> bool:
     # Never treat BASIC/Fortran line-numbered code as a heading
     if _CODE_LINE_RE.match(stripped):
         return False
-    # Markdown ATX headings — check before length guard (headings can be long)
+    # Markdown ATX headings — with rejection guards for non-heading content
     if re.match(r'^#{1,6}\s+\S', stripped):
+        content = re.sub(r'^#{1,6}\s+', '', stripped)
+        # Display math masquerading as ATX heading (e.g. "# $$\frac{a}{b}$$")
+        if content.startswith('$$') or content.startswith('\\['):
+            return False
+        # Binary/hex literals and pure-symbol lines with no real words
+        if not re.search(r'[a-zA-Z]{3,}', content):
+            return False
+        # Algorithm pseudocode labels that Marker ATX-encodes: "# Step 1:", "# Output:"
+        # These look like headings but are indented code structure — detected by the
+        # surrounding fence context in _smart_chunk; reject bare keyword-colon lines.
+        if re.match(r'^(?:input|output|step\s*\d|procedure|function|return|if|else|end)\s*[:\d]?$', content, re.IGNORECASE):
+            return False
         return True
     if len(stripped) > 80:
         return False
@@ -219,9 +245,34 @@ def _is_table_row_dominated(text: str) -> bool:
     return pipe_lines / len(lines) >= 0.5
 
 
+def _is_toc_chunk(text: str) -> bool:
+    """True when the majority of lines are TOC entries (dotted leaders + page numbers)."""
+    lines = [l for l in text.splitlines() if l.strip()]
+    if len(lines) < 3:
+        return False
+    toc_lines = sum(1 for l in lines if _TOC_ENTRY_RE.match(l))
+    return toc_lines / len(lines) >= 0.5
+
+
+_URL_RE = re.compile(r'^\s*(?:https?://|www\.)\S+\s*$')
+
+
+def _is_url_dominated(text: str) -> bool:
+    """True when most non-empty lines are bare URLs (reference/link-dump artifacts)."""
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if len(lines) < 2:
+        return False
+    url_lines = sum(1 for l in lines if _URL_RE.match(l))
+    return url_lines / len(lines) >= 0.6
+
+
 def _is_meaningful_chunk(text: str) -> bool:
     """Return False for chunks that are pure noise (no prose and no meaningful math)."""
     if _is_table_row_dominated(text):
+        return False
+    if _is_toc_chunk(text):
+        return False
+    if _is_url_dominated(text):
         return False
     prose_words = _prose_word_count(text)
     if prose_words >= _MIN_PROSE_WORDS:
@@ -284,6 +335,9 @@ def _smart_chunk(text: str, max_words: int = 500, overlap: int = 2) -> list[tupl
     for heading, lines in sections:
         if _is_boilerplate_heading(heading):
             continue
+        # Strip trailing page numbers fused onto headings by the printer
+        # e.g. "6.1 Root Finding 103" → "6.1 Root Finding"
+        heading = re.sub(r'\s+\d{2,4}$', '', heading).strip()
         merged_lines = _merge_code_runs(lines)
         paragraphs = [
             p.strip()
@@ -356,6 +410,8 @@ def _strip_page_artifacts(text: str) -> str:
 
 
 _BR_RE = re.compile(r'<br\s*/?>', re.IGNORECASE)
+# Marker emits <sup>N</sup> for footnote markers; Scherer PDFs double-encode as <sup>&lt;sup&gt;N&lt;/sup&gt;</sup>
+_SUP_RE = re.compile(r'<sup>(?:&lt;sup&gt;.*?&lt;/sup&gt;|.*?)</sup>', re.IGNORECASE | re.DOTALL)
 # Invisible Unicode that causes subtle word-boundary issues
 _INVISIBLE_RE = re.compile(
     r'[\xad'           # soft hyphen U+00AD
@@ -376,10 +432,31 @@ def _strip_ocr_artifacts(text: str) -> str:
     - Soft hyphens, zero-width spaces, BOM, and other invisible Unicode → removed
     - Non-breaking spaces → regular spaces
     """
+    text = _SUP_RE.sub('', text)
     text = _BR_RE.sub(' ', text)
     text = _INVISIBLE_RE.sub('', text)
     text = text.replace(' ', ' ')   # non-breaking space → regular space
     return text
+
+
+def _verify_cache_content(pdf_path: Path, cache_file: Path, raw: str) -> None:
+    """Warn if the cached markdown has no word overlap with the PDF filename stem.
+
+    Catches source-content swaps where a misaligned cache file gets written
+    (Escande/Fujita-style bug): the stem words of the PDF name should appear
+    somewhere in the first 200 lines of the extracted text.
+    """
+    stem_words = {w.lower() for w in re.findall(r'[a-zA-Z]{4,}', pdf_path.stem)}
+    if not stem_words:
+        return
+    head = "\n".join(raw.splitlines()[:200]).lower()
+    overlap = sum(1 for w in stem_words if w in head)
+    if overlap == 0:
+        print(
+            f"  Warning: cache content may be misaligned — none of the filename words "
+            f"({', '.join(sorted(stem_words)[:5])}) appear in the extracted text of "
+            f"{cache_file.name}. Check for a source-content swap."
+        )
 
 
 def _marker_cache_file(pdf_path: Path) -> Path:
@@ -420,6 +497,7 @@ def _extract_pdf(path: Path) -> str:
             raise
         MARKER_CACHE_PATH.mkdir(parents=True, exist_ok=True)
         cache_file.write_text(raw, encoding='utf-8')
+        _verify_cache_content(path, cache_file, raw)
         print(f"    cached → {cache_file.name}")
 
     # Cleaning pipeline applied on top of the (possibly cached) raw markdown
@@ -465,6 +543,31 @@ def _extract_csv(path: Path) -> str:
 
 _PDF_DATE_RE = re.compile(r"D:(\d{4})(\d{2})(\d{2})")
 
+# Titles that are clearly word-processor artifacts, not real document titles.
+# \b is placed inside each alternative (not after the group) so dash-terminated
+# patterns like "Microsoft Word -" don't fail the boundary check.
+_PLACEHOLDER_TITLE_RE = re.compile(
+    r'^(?:'
+    r'microsoft\s+word\s*[-–—]'      # "Microsoft Word - Document1"
+    r'|untitled\b'                    # "Untitled"
+    r'|document\s*\d*\b'             # "Document", "Document1"  (not "Documentation")
+    r'|new\s+document\b'
+    r'|temp(?:orary)?\b'
+    r'|draft\b'
+    r'|\.docx?\b'
+    r'|presentation\s*\d*\b'
+    r'|workbook\s*\d*\b'
+    r'|copy\s+of\b'
+    r'|revision\s+\d'
+    r')',
+    re.IGNORECASE,
+)
+# Authors that are clearly placeholder/garbage: 1-3 chars, all digits, or common filler words
+_PLACEHOLDER_AUTHOR_RE = re.compile(
+    r'^(?:[a-z]{1,3}|unknown|author|user|admin|default|n/?a|na|\d+)\s*$',
+    re.IGNORECASE,
+)
+
 
 def _parse_pdf_date(raw: str) -> str:
     """Convert PDF date string 'D:YYYYMMDDHHmmss...' to 'YYYY-MM-DD', or ''."""
@@ -478,9 +581,21 @@ def _pdf_doc_metadata(path: Path) -> dict:
         import pypdf
         reader = pypdf.PdfReader(str(path), strict=False)
         meta = reader.metadata or {}
+
+        raw_title = str(meta.get("/Title", "")).strip()
+        if raw_title and _PLACEHOLDER_TITLE_RE.match(raw_title):
+            print(f"  Warning: ignoring placeholder PDF title '{raw_title}' for {path.name}")
+            raw_title = ""
+        title = raw_title or path.stem
+
+        raw_author = str(meta.get("/Author", "")).strip()
+        if raw_author and _PLACEHOLDER_AUTHOR_RE.match(raw_author):
+            print(f"  Warning: ignoring placeholder PDF author '{raw_author}' for {path.name}")
+            raw_author = ""
+
         return {
-            "title": str(meta.get("/Title", "")).strip() or path.stem,
-            "author": str(meta.get("/Author", "")).strip(),
+            "title": title,
+            "author": raw_author,
             "page_count": len(reader.pages),
             "creation_date": _parse_pdf_date(str(meta.get("/CreationDate", ""))),
         }
