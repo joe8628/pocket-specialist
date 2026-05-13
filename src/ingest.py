@@ -6,6 +6,7 @@ import io
 import json
 from pathlib import Path
 
+from chromadb.api.types import Metadata
 from db import client, embedding_fn, REPO_ROOT, DB_PATH
 import graph as kg
 
@@ -27,7 +28,7 @@ def _get_marker_converter():
     # Default of 256 pre-allocates a 3.56 GB KV cache; 32 keeps peak VRAM ~7 GB
     # on an 11 GB card (RTX 2080 Ti) instead of crashing the GPU driver at ~10.5 GB.
     from surya.settings import settings as _surya_settings
-    _surya_settings.RECOGNITION_BATCH_SIZE = 128
+    _surya_settings.RECOGNITION_BATCH_SIZE = 256
     # batch=36 at 1200x1200 needs 3.09 GB for a single 512-ch feature map — OOM.
     # batch=24 needs 2.06 GB — still OOM (8.06 GB allocated + 2.06 GB > 10.55 GB).
     # batch=16 needs ~1.37 GB, leaving ~2.3 GB headroom — safe on RTX 2080 Ti.
@@ -711,7 +712,7 @@ def _file_metadata(path: Path, fmt: str) -> dict:
 def ingest_texts(
     documents: list[str],
     ids: list[str],
-    metadatas: list[dict] | None = None,
+    metadatas: list[Metadata] | None = None,
     collection_name: str = "default",
 ) -> int:
     collection = client.get_or_create_collection(collection_name, embedding_function=embedding_fn)
@@ -742,7 +743,7 @@ def ingest_file(path: Path, collection_name: str = "default") -> int:
     base_meta = _file_metadata(path, fmt)
     chunks = []
     ids = []
-    metadatas = []
+    metadatas: list[Metadata] = []
     for i, (heading, text) in enumerate(chunk_pairs):
         chunks.append(text)
         ids.append(f"{path.stem}__ch{i}")
