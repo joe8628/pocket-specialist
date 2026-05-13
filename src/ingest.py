@@ -537,6 +537,7 @@ def _extract_pdf(path: Path) -> str:
     pdf_mtime = path.stat().st_mtime
 
     if cache_file.exists() and cache_file.stat().st_mtime >= pdf_mtime:
+        print(f"    (from cache)", end=" ", flush=True)
         raw = cache_file.read_text(encoding='utf-8')
     else:
         try:
@@ -625,6 +626,29 @@ _PLACEHOLDER_AUTHOR_RE = re.compile(
 )
 
 
+# Anna's Archive filename: "Title -- Author -- Publisher -- isbn13 X -- hash -- Anna's Archive"
+_ANNAS_ARCHIVE_RE = re.compile(
+    r"^(.+?)\s+--\s+(.+?)\s+--\s+.+--\s+Anna's\s+Archive$",
+    re.IGNORECASE,
+)
+
+
+def _parse_annas_archive_stem(stem: str) -> tuple[str, str]:
+    """Return (title, author) parsed from an Anna's Archive PDF filename stem, or ('', '')."""
+    m = _ANNAS_ARCHIVE_RE.match(stem.strip())
+    if not m:
+        return "", ""
+
+    def _unescape(s: str) -> str:
+        # "O_J_" style initials → "O.J."
+        s = re.sub(r'\b([A-Z])_([A-Z])_\b', r'\1.\2.', s)
+        # Trailing underscore before a space → colon+space: "Physics_ Sim" → "Physics: Sim"
+        s = re.sub(r'_(?=\s)', ':', s)
+        return s.strip()
+
+    return _unescape(m.group(1)), _unescape(m.group(2))
+
+
 def _parse_pdf_date(raw: str) -> str:
     """Convert PDF date string 'D:YYYYMMDDHHmmss...' to 'YYYY-MM-DD', or ''."""
     m = _PDF_DATE_RE.match(raw or "")
@@ -642,15 +666,22 @@ def _pdf_doc_metadata(path: Path) -> dict:
         if raw_title and _PLACEHOLDER_TITLE_RE.match(raw_title):
             print(f"  Warning: ignoring placeholder PDF title '{raw_title}' for {path.name}")
             raw_title = ""
-        title = raw_title or path.stem
 
         raw_author = str(meta.get("/Author", "")).strip()
         if raw_author and _PLACEHOLDER_AUTHOR_RE.match(raw_author):
             print(f"  Warning: ignoring placeholder PDF author '{raw_author}' for {path.name}")
             raw_author = ""
 
+        # When embedded metadata is missing/garbage, try parsing from the filename
+        if not raw_title or not raw_author:
+            fn_title, fn_author = _parse_annas_archive_stem(path.stem)
+            if not raw_title and fn_title:
+                raw_title = fn_title
+            if not raw_author and fn_author:
+                raw_author = fn_author
+
         return {
-            "title": title,
+            "title": raw_title or path.stem,
             "author": raw_author,
             "page_count": len(reader.pages),
             "creation_date": _parse_pdf_date(str(meta.get("/CreationDate", ""))),
