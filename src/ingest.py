@@ -289,6 +289,61 @@ def _split_sentences(text: str) -> list[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
+# Sentence-opening patterns that signal a mid-derivation context orphan.
+# These phrases only make sense when the predecessor sentence/equation is present.
+_ORPHAN_OPENING_RE = re.compile(
+    r'^(?:'
+    # Bare equation back-references: "(38)," "(3.14);" "(A.2),"
+    r'\([\d.A-Za-z]+\)\s*[,;]'
+    # Named equation references: "Eq. (5)", "Eqs. (3)–(5)"
+    r'|[Ee]q(?:uation)?s?\.?\s*\('
+    # Anaphoric connectives that open a result sentence
+    r'|(?:therefore|thus|hence|consequently|accordingly),?\s'
+    # Anaphoric pronoun + verb (optional intervening noun): "This gives", "These results show", "Its value is"
+    r'|(?:this|these|those|its|their)\s+(?:\w+\s+)?(?:gives?|shows?|implies?|is\b|are\b|means?|yields?|results?)'
+    # Math-relative clauses that anchor to a preceding expression
+    r'|where\s+[A-Za-z_]\w*\s+(?:is|are|denotes?|represents?)'
+    r'|with\s+[A-Za-z_]\w*\s+(?:being|denoting)'
+    r'|in\s+which\s'
+    # In-formula continuations: "into (38)", "from (3.2)", "substituting into ("
+    r'|into\s*\('
+    r'|from\s+\('
+    r'|substitut\w+\s+(?:into\s+)?\('
+    r')',
+    re.IGNORECASE,
+)
+
+
+def _merge_orphan_openers(chunks: list[str], max_words: int = 500) -> list[str]:
+    """Backward-merge chunks whose first sentence is an orphaned back-reference.
+
+    Two strategies depending on combined size:
+      1. Full merge: ≤ 120% of max_words → concatenate predecessor and orphan.
+      2. Context prepend: too large → prefix the orphan with the predecessor's
+         last sentence, giving the minimum context to interpret the reference.
+    Operates within a single section's chunk list; cross-section orphans are
+    out of scope.
+    """
+    if len(chunks) <= 1:
+        return chunks
+
+    result = [chunks[0]]
+    for chunk in chunks[1:]:
+        sentences = _split_sentences(chunk)
+        first = sentences[0].strip() if sentences else ""
+        if first and _ORPHAN_OPENING_RE.match(first):
+            prev = result[-1]
+            if len((prev + " " + chunk).split()) <= int(max_words * 1.2):
+                result[-1] = prev + " " + chunk
+                continue
+            # Too large to fully merge — prepend predecessor's last sentence
+            prev_sentences = _split_sentences(prev)
+            if len(prev_sentences) >= 2:
+                chunk = prev_sentences[-1] + " " + chunk
+        result.append(chunk)
+    return result
+
+
 def _merge_into_chunks(paragraphs: list[str], max_words: int = 500, overlap: int = 2) -> list[str]:
     """Merge paragraphs into sentence-bounded chunks with sentence-level overlap."""
     chunks: list[str] = []
@@ -306,7 +361,8 @@ def _merge_into_chunks(paragraphs: list[str], max_words: int = 500, overlap: int
         if not chunks or last != chunks[-1]:
             chunks.append(last)
 
-    return [c for c in chunks if c.strip()]
+    chunks = [c for c in chunks if c.strip()]
+    return _merge_orphan_openers(chunks, max_words)
 
 
 def _smart_chunk(text: str, max_words: int = 500, overlap: int = 2) -> list[tuple[str, str]]:
