@@ -48,6 +48,13 @@ python src/ingest.py path/to/document.pdf my-collection
 
 The manifest (`chroma_db/.manifest.json`) tracks mtimes so unchanged files are skipped on re-runs.
 
+To reset the database and re-ingest from scratch:
+
+```bash
+rm -rf chroma_db
+python src/ingest.py
+```
+
 ---
 
 ## Search
@@ -103,10 +110,13 @@ Applied to PDF output after Marker extraction, in order:
 
 Structure-aware chunking in two tiers:
 
-- **Tier 1** — section headings act as hard breaks; detected patterns: numbered headings (`1.3 Methods`), Markdown ATX (`## ...`), ALL-CAPS titles, algorithm/theorem/lemma markers
+- **Tier 1** — section headings act as hard breaks; detected patterns: numbered headings (`1.3 Methods`), Markdown ATX (`## ...`), ALL-CAPS titles, algorithm/theorem/lemma markers, and plain section-name lines (`References`, `Acknowledgments`, `Abstract`, etc.)
 - **Tier 2** — within each section, paragraphs are merged into ≤500-word chunks at sentence boundaries with 2-sentence overlap
 - **Code block merging** — consecutive BASIC/Fortran line-numbered lines (e.g. `1234 PRINT X`) are collapsed into a single fenced ` ``` ` block instead of being split into per-line fragments
-- **Noise filter** — chunks with fewer than 5 real English words and no meaningful LaTeX (`\frac`, `\int`, `$$`, etc.) are discarded
+- **Boilerplate section filter** — sections whose heading matches a boilerplate pattern (`References`, `Bibliography`, `Acknowledgments`, `Further Reading`, `Index`) are dropped entirely before chunking
+- **Noise filter** — chunks are discarded when:
+  - More than 50% of lines are markdown pipe-table rows (table-of-contents artifacts)
+  - Fewer than 25 prose words outside fenced code blocks, with no meaningful LaTeX (`\frac`, `\int`, `$$`, etc.) — bare code snippets and one-liner comments no longer survive as standalone chunks
 
 ### Metadata Capture
 

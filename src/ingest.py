@@ -39,6 +39,7 @@ def _get_marker_converter():
     return _marker_converter
 
 CORPUS_PATH = REPO_ROOT / "RAG-corpus"
+MARKER_CACHE_PATH = REPO_ROOT / "marker_cache"
 MANIFEST_PATH = DB_PATH / ".manifest.json"
 SUPPORTED = {".pdf", ".txt", ".md", ".markdown", ".csv"}
 
@@ -123,11 +124,32 @@ _HEADING_RE = re.compile(
     r')'
 )
 
+# Single-word/short section titles that Marker emits without ATX markers or numbering
+_SECTION_HEADING_NAMES_RE = re.compile(
+    r'^(?:references?|bibliography|acknowledgements?|acknowledgments?|'
+    r'further\s+reading|preface|foreword|abstract|appendix\b|index|'
+    r'contents?|notation|glossary)\s*$',
+    re.IGNORECASE,
+)
+
+# Boilerplate sections to drop entirely (not worth indexing)
+_BOILERPLATE_HEADING_RE = re.compile(
+    r'^(?:references?|bibliography|acknowledgements?|acknowledgments?|'
+    r'further\s+reading|index)\s*$',
+    re.IGNORECASE,
+)
+
 # Matches BASIC/Fortran line-numbered code: "1234 PRINT X" or "10 FOR I=1 TO N"
 _CODE_LINE_RE = re.compile(r'^\s*\d{2,5}\s+[A-Za-z\'`]')
 
-_MIN_PROSE_WORDS = 5
+_MIN_PROSE_WORDS = 25
 _MEANINGFUL_LATEX_RE = re.compile(r'\\(?:frac|int|sum|prod|partial|nabla|cdot|times|alpha|beta|gamma|delta|sigma|omega|lambda|mu|pi|theta|phi|psi|hat|bar|vec|mathbf|mathrm)\b|\$\$')
+
+
+def _is_boilerplate_heading(heading: str) -> bool:
+    """True for section headings whose content should be dropped entirely."""
+    clean = re.sub(r'[\*_`#]', '', heading).strip()
+    return bool(_BOILERPLATE_HEADING_RE.match(clean))
 
 
 def _is_heading(line: str) -> bool:
@@ -143,6 +165,10 @@ def _is_heading(line: str) -> bool:
     if len(stripped) > 80:
         return False
     if _HEADING_RE.match(stripped):
+        return True
+    # Plain single-word section names Marker emits without ATX markers
+    plain = re.sub(r'[\*_`#]', '', stripped).strip()
+    if _SECTION_HEADING_NAMES_RE.match(plain):
         return True
     # ALL CAPS short line with at least 4 alpha chars (chapter/section titles)
     alpha = [c for c in stripped if c.isalpha()]
@@ -171,12 +197,37 @@ def _merge_code_runs(lines: list[str]) -> list[str]:
     return result
 
 
+def _prose_word_count(text: str) -> int:
+    """Count words in prose lines, ignoring text inside fenced code blocks."""
+    in_fence = False
+    count = 0
+    for line in text.splitlines():
+        if line.strip().startswith('```'):
+            in_fence = not in_fence
+            continue
+        if not in_fence:
+            count += len(re.findall(r'[a-zA-Z]{3,}', line))
+    return count
+
+
+def _is_table_row_dominated(text: str) -> bool:
+    """True when the majority of lines are markdown pipe-table rows (TOC artifacts)."""
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if len(lines) < 2:
+        return False
+    pipe_lines = sum(1 for l in lines if l.startswith('|'))
+    return pipe_lines / len(lines) >= 0.5
+
+
 def _is_meaningful_chunk(text: str) -> bool:
     """Return False for chunks that are pure noise (no prose and no meaningful math)."""
-    prose_words = len(re.findall(r'[a-zA-Z]{3,}', text))
+    if _is_table_row_dominated(text):
+        return False
+    prose_words = _prose_word_count(text)
     if prose_words >= _MIN_PROSE_WORDS:
         return True
-    return bool(_MEANINGFUL_LATEX_RE.search(text))
+    # Short math-heavy chunks are OK if they contain real LaTeX notation
+    return bool(_MEANINGFUL_LATEX_RE.search(text)) and prose_words >= 5
 
 
 def _split_sentences(text: str) -> list[str]:
@@ -231,6 +282,8 @@ def _smart_chunk(text: str, max_words: int = 500, overlap: int = 2) -> list[tupl
 
     result: list[tuple[str, str]] = []
     for heading, lines in sections:
+        if _is_boilerplate_heading(heading):
+            continue
         merged_lines = _merge_code_runs(lines)
         paragraphs = [
             p.strip()
@@ -329,12 +382,48 @@ def _strip_ocr_artifacts(text: str) -> str:
     return text
 
 
+def _marker_cache_file(pdf_path: Path) -> Path:
+    """Return the cache path for a PDF's raw Marker output."""
+    rel = pdf_path.relative_to(CORPUS_PATH)
+    # Flatten subdirectory separators so the cache stays a flat directory
+    name = str(rel.with_suffix('.md')).replace('/', '__').replace('\\', '__')
+    return MARKER_CACHE_PATH / name
+
+
 def _extract_pdf(path: Path) -> str:
-    """Extract PDF as Markdown with LaTeX equations preserved via Marker."""
-    converter = _get_marker_converter()
-    rendered = converter(str(path))
-    # Strip HTML span tags that marker injects for page anchors — pure noise for RAG
-    text = re.sub(r'<span[^>]*>.*?</span>', '', rendered.markdown, flags=re.DOTALL)
+    """Extract PDF as Markdown via Marker, caching the raw output to marker_cache/.
+
+    Marker only runs when the PDF is newer than its cached markdown. The cache
+    stores the unmodified Marker output — useful for inspecting OCR quality and
+    tuning the cleaning/chunking pipeline without re-running the GPU.
+
+    Raises RuntimeError for encrypted/password-protected PDFs so the caller can
+    skip the file with a clear message rather than a cryptic PDFium traceback.
+    """
+    cache_file = _marker_cache_file(path)
+    pdf_mtime = path.stat().st_mtime
+
+    if cache_file.exists() and cache_file.stat().st_mtime >= pdf_mtime:
+        raw = cache_file.read_text(encoding='utf-8')
+    else:
+        try:
+            converter = _get_marker_converter()
+            rendered = converter(str(path))
+            raw = rendered.markdown
+        except Exception as exc:
+            msg = str(exc)
+            if "security scheme" in msg.lower() or "encrypted" in msg.lower() or "password" in msg.lower():
+                raise RuntimeError(
+                    f"PDF is encrypted or password-protected — cannot extract. "
+                    f"Decrypt the file and re-ingest. (Original: {msg})"
+                ) from exc
+            raise
+        MARKER_CACHE_PATH.mkdir(parents=True, exist_ok=True)
+        cache_file.write_text(raw, encoding='utf-8')
+        print(f"    cached → {cache_file.name}")
+
+    # Cleaning pipeline applied on top of the (possibly cached) raw markdown
+    text = re.sub(r'<span[^>]*>.*?</span>', '', raw, flags=re.DOTALL)
     text = _strip_ocr_artifacts(text)
     return _strip_page_artifacts(text)
 
@@ -476,21 +565,34 @@ def ingest_corpus(corpus_dir: Path = CORPUS_PATH, collection_name: str = "defaul
         print(f"No supported files found in '{corpus_dir}'.")
         return
 
-    new_count = changed_count = skipped_count = 0
+    new_count = changed_count = skipped_count = cached_count = 0
 
     for file in sorted(candidates):
         key = str(file.relative_to(REPO_ROOT))
         mtime = file.stat().st_mtime
+        db_current = key in manifest and manifest[key] >= mtime
 
-        if key not in manifest:
-            status = "new"
-            new_count += 1
-        elif manifest[key] < mtime:
-            status = "changed"
-            changed_count += 1
-        else:
+        if db_current:
+            # DB is up to date — but write the marker cache if it is missing
+            if _sniff_format(file) == 'pdf':
+                cache_file = _marker_cache_file(file)
+                if not cache_file.exists():
+                    print(f"  [cache] {file.name} ...", end=" ", flush=True)
+                    try:
+                        _extract_pdf(file)
+                        cached_count += 1
+                        print("cached.")
+                    except Exception as e:
+                        print(f"failed ({e})")
+                    continue
             skipped_count += 1
             continue
+
+        status = "new" if key not in manifest else "changed"
+        if status == "new":
+            new_count += 1
+        else:
+            changed_count += 1
 
         print(f"  [{status}] {file.name} ...", end=" ", flush=True)
         try:
@@ -501,9 +603,11 @@ def ingest_corpus(corpus_dir: Path = CORPUS_PATH, collection_name: str = "defaul
             print(f"failed ({e})")
 
     _save_manifest(manifest)
-    print(
-        f"\nDone. {new_count} new, {changed_count} updated, {skipped_count} skipped."
-    )
+    parts = [f"{new_count} new", f"{changed_count} updated",
+             f"{skipped_count} skipped"]
+    if cached_count:
+        parts.append(f"{cached_count} cache-only")
+    print(f"\nDone. {', '.join(parts)}.")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
