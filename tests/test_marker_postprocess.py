@@ -91,3 +91,13 @@ def test_strip_image_ref_case_insensitive():
 def test_strip_image_ref_no_false_positive():
     result = clean('![diagram](https://example.com/img.png)')
     assert result == '![diagram](https://example.com/img.png)'
+
+
+def test_strip_br_tag():
+    assert clean('cell one<br/>cell two') == 'cell one cell two'
+
+def test_strip_nonbreaking_space():
+    assert clean('word\xa0word') == 'word word'
+
+def test_strip_invisible_unicode():
+    assert clean('word\xadword') == 'wordword'

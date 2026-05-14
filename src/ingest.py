@@ -9,6 +9,7 @@ from pathlib import Path
 from chromadb.api.types import Metadata
 from db import client, embedding_fn, REPO_ROOT, DB_PATH
 import graph as kg
+from marker_postprocess import clean as _marker_clean
 
 _marker_converter = None
 
@@ -411,91 +412,6 @@ def _smart_chunk(text: str, max_words: int = 500, overlap: int = 2) -> list[tupl
     return result
 
 
-_PAGE_NUMBER_RE = re.compile(
-    r'^\s*(?:Page\s+)?\d{1,4}(?:\s+of\s+\d{1,4})?\s*$',
-    re.IGNORECASE,
-)
-
-
-def _strip_page_artifacts(text: str) -> str:
-    """
-    Remove page headers/footers from Marker-extracted PDF markdown.
-
-    Two passes:
-    1. Bare page-number lines — isolated digits (1-4) optionally preceded by
-       "Page " or followed by " of N".  BASIC line numbers are excluded because
-       _merge_code_runs handles them inside fenced blocks; here we only see lines
-       that survived as standalone paragraphs.
-    2. Running headers/footers — short lines (< 72 chars, no code/math markers)
-       that appear more than once per ~30 lines of document, i.e. suspiciously
-       periodic.  Threshold: max(3, total_lines // 30).
-    """
-    lines = text.splitlines()
-    total = len(lines)
-
-    # Pass 1: count occurrences of each short non-code line
-    from collections import Counter
-    freq: Counter[str] = Counter()
-    for line in lines:
-        s = line.strip()
-        if s and len(s) < 72 and not _CODE_LINE_RE.match(s):
-            freq[s] += 1
-
-    # Running-header threshold scales with document length
-    rh_threshold = max(3, total // 30)
-
-    running_headers: set[str] = set()
-    for line_text, count in freq.items():
-        if count >= rh_threshold:
-            # Exclude lines that look like code, math, or markdown tables
-            if re.search(r'[\\|`${}]', line_text):
-                continue
-            # Exclude section headings that legitimately repeat (short ALL-CAPS
-            # structural markers are fine to keep — they're usually unique)
-            running_headers.add(line_text)
-
-    cleaned: list[str] = []
-    for line in lines:
-        s = line.strip()
-        if _PAGE_NUMBER_RE.match(s):
-            continue
-        if s in running_headers:
-            continue
-        cleaned.append(line)
-
-    return "\n".join(cleaned)
-
-
-_BR_RE = re.compile(r'<br\s*/?>', re.IGNORECASE)
-# Marker emits <sup>N</sup> for footnote markers; Scherer PDFs double-encode as <sup>&lt;sup&gt;N&lt;/sup&gt;</sup>
-_SUP_RE = re.compile(r'<sup>(?:&lt;sup&gt;.*?&lt;/sup&gt;|.*?)</sup>', re.IGNORECASE | re.DOTALL)
-# Invisible Unicode that causes subtle word-boundary issues
-_INVISIBLE_RE = re.compile(
-    r'[\xad'           # soft hyphen U+00AD
-    r'​'          # zero-width space
-    r'‌'          # zero-width non-joiner
-    r'‍'          # zero-width joiner
-    r'﻿'          # BOM / zero-width no-break space
-    r']'
-)
-
-
-def _strip_ocr_artifacts(text: str) -> str:
-    """
-    Clean residual HTML and Unicode artifacts left by Marker after PDF extraction.
-
-    - <br> / <br/> inside table cells → single space (Marker emits these for
-      multi-line cell content, most visibly in table-of-contents tables)
-    - Soft hyphens, zero-width spaces, BOM, and other invisible Unicode → removed
-    - Non-breaking spaces → regular spaces
-    """
-    text = _SUP_RE.sub('', text)
-    text = _BR_RE.sub(' ', text)
-    text = _INVISIBLE_RE.sub('', text)
-    text = text.replace(' ', ' ')   # non-breaking space → regular space
-    return text
-
-
 def _verify_cache_content(pdf_path: Path, cache_file: Path, raw: str) -> None:
     """Warn if the cached markdown has no word overlap with the PDF filename stem.
 
@@ -558,10 +474,7 @@ def _extract_pdf(path: Path) -> str:
         _verify_cache_content(path, cache_file, raw)
         print(f"    cached → {cache_file.name}")
 
-    # Cleaning pipeline applied on top of the (possibly cached) raw markdown
-    text = re.sub(r'<span[^>]*>.*?</span>', '', raw, flags=re.DOTALL)
-    text = _strip_ocr_artifacts(text)
-    return _strip_page_artifacts(text)
+    return _marker_clean(raw)
 
 
 def _extract_csv(path: Path) -> str:
