@@ -23,6 +23,13 @@ _MATH_SUB_RE = re.compile(r'<sub>(?!\d+</sub>)([^<]{1,10})</sub>', re.IGNORECASE
 # Fixer 5: remaining footnote-number sups (digit-only, after fixer 4 ran)
 _FOOTNOTE_SUP_RE = re.compile(r'<sup>\d+</sup>', re.IGNORECASE)
 
+# Fixer 6: dangling Marker image refs — empty alt text, local _page_N_ path.
+# Only matches Marker-generated local paths; preserves real external image links.
+_MARKER_IMG_RE = re.compile(
+    r'!\[\]\(_page_\d+_[^)]+\.(?:jpe?g|png|gif|webp|svg|tiff?)\)',
+    re.IGNORECASE,
+)
+
 
 def _strip_spans(text: str) -> str:
     text = _SPAN_OPEN_RE.sub('', text)
@@ -48,6 +55,10 @@ def _strip_footnote_sups(text: str) -> str:
     return _FOOTNOTE_SUP_RE.sub('', text)
 
 
+def _strip_image_refs(text: str) -> str:
+    return _MARKER_IMG_RE.sub('', text)
+
+
 def clean(text: str) -> str:
     """Clean raw Marker markdown output. Returns cleaned markdown."""
     text = _strip_spans(text)
@@ -55,4 +66,5 @@ def clean(text: str) -> str:
     text = _fix_residual_lt_sup(text)
     text = _fix_math_sups(text)
     text = _strip_footnote_sups(text)
+    text = _strip_image_refs(text)
     return text

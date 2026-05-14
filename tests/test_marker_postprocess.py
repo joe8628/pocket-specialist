@@ -73,3 +73,21 @@ def test_strip_footnote_sup_two_digits():
 
 def test_strip_footnote_sup_preserves_surrounding_text():
     assert clean('before<sup>7</sup> after') == 'before after'
+
+
+def test_strip_image_ref_jpeg():
+    assert clean('![](_page_3_Figure_1.jpeg)') == ''
+
+def test_strip_image_ref_png():
+    assert clean('![](_page_5_Picture_0.png)') == ''
+
+def test_strip_image_ref_preserves_caption():
+    inp = '![](_page_27_Figure_1.jpeg)\nFig. 1.1 Normalized machine numbers.'
+    assert clean(inp) == '\nFig. 1.1 Normalized machine numbers.'
+
+def test_strip_image_ref_case_insensitive():
+    assert clean('![](_page_1_Figure_1.JPEG)') == ''
+
+def test_strip_image_ref_no_false_positive():
+    result = clean('![diagram](https://example.com/img.png)')
+    assert result == '![diagram](https://example.com/img.png)'
