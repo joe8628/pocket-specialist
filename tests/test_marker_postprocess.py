@@ -101,3 +101,40 @@ def test_strip_nonbreaking_space():
 
 def test_strip_invisible_unicode():
     assert clean('word\xadword') == 'wordword'
+
+
+def test_end_to_end_realistic_marker_output():
+    """Simulate a realistic Marker output chunk with all five artifact classes."""
+    raw = (
+        # span tag (fixer 1)
+        '<span class="bold">Introduction</span>\n\n'
+        # double-encoded footnote (fixers 2+3)
+        'See netbeans<sup>&</sup>lt;sup>1</sup>www.netbeans.org.\n\n'
+        # math-variable sup (fixer 4)
+        'The matrix *Q<sup>T</sup>* satisfies *Q<sub>i</sub>* = 1.\n\n'
+        # footnote-number sup (fixer 5)
+        'As shown elsewhere<sup>42</sup>, this holds.\n\n'
+        # image ref (fixer 6)
+        '![](_page_12_Figure_3.jpeg)\nFig. 2.1 Normalized machine numbers.\n\n'
+        # br tag (fixer 7a via _strip_ocr_artifacts)
+        'cell one<br/>cell two\n'
+    )
+    result = clean(raw)
+
+    assert '<span' not in result
+    assert 'Introduction' in result
+
+    assert 'lt;sup>' not in result
+    assert '<sup>&</sup>' not in result
+
+    assert '$^{T}$' in result
+    assert '$_{i}$' in result
+    assert '<sup>T</sup>' not in result
+
+    assert '<sup>42</sup>' not in result
+
+    assert '![](' not in result
+    assert 'Fig. 2.1 Normalized machine numbers.' in result
+
+    assert '<br' not in result
+    assert 'cell one cell two' in result
