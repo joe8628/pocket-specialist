@@ -39,3 +39,37 @@ def test_fix_residual_lt_sup():
 
 def test_fix_residual_lt_sup_no_false_positive():
     assert clean('the result lt x is valid') == 'the result lt x is valid'
+
+
+def test_fix_math_sup_letter():
+    assert clean('Q<sup>T</sup> Q') == 'Q$^{T}$ Q'
+
+def test_fix_math_sup_symbol():
+    assert clean('order *<sup>N</sup>*') == 'order *$^{N}$*'
+
+def test_fix_math_sup_minus():
+    assert clean('*p*(*x*) of order *<sup>−</sup> 1') == '*p*(*x*) of order *$^{−}$ 1'
+
+def test_fix_math_sub_letter():
+    assert clean('w<sub>i</sub>') == 'w$_{i}$'
+
+def test_fix_math_sup_skips_digits():
+    # Digit-only content is a footnote — handled by fixer 5, not fixer 4
+    inp = 'word<sup>2</sup>'
+    assert clean(inp) == 'word'  # fixer 5 strips it
+
+def test_fix_math_sup_multi_char():
+    assert clean('<sup>-1</sup>') == '$^{-1}$'
+
+def test_fix_math_sup_greek():
+    assert clean('<sup>λ</sup>') == '$^{λ}$'
+
+
+def test_strip_footnote_sup_single_digit():
+    assert clean('word<sup>1</sup>') == 'word'
+
+def test_strip_footnote_sup_two_digits():
+    assert clean('word<sup>42</sup>') == 'word'
+
+def test_strip_footnote_sup_preserves_surrounding_text():
+    assert clean('before<sup>7</sup> after') == 'before after'
