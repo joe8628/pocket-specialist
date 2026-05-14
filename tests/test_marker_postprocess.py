@@ -23,3 +23,19 @@ def test_strip_spans_multiline():
 
 def test_strip_spans_no_spans():
     assert clean('no spans here') == 'no spans here'
+
+
+def test_fix_double_sup_removes_marker():
+    inp = 'text<sup>&</sup>lt;sup>3</sup>more'
+    assert clean(inp) == 'textmore'
+
+def test_fix_double_sup_mid_sentence():
+    inp = 'See footnote<sup>&</sup>lt;sup>12</sup> for details.'
+    assert clean(inp) == 'See footnote for details.'
+
+def test_fix_residual_lt_sup():
+    inp = 'textlt;sup>5</sup>more'
+    assert clean(inp) == 'textmore'
+
+def test_fix_residual_lt_sup_no_false_positive():
+    assert clean('the result lt x is valid') == 'the result lt x is valid'
