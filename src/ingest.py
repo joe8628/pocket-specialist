@@ -68,10 +68,12 @@ def _ollama_ensure_loaded(model: str) -> None:
 def _surya_release(model_dict: dict) -> None:
     """Delete Surya model tensors entirely and free GPU cache.
 
-    Nulling the model references lets Python/CUDA reclaim VRAM immediately.
-    Preferred over .to('cpu') because it avoids silent CPU fallback if anything
-    tries to use the models before the next reload.
+    Nulling the model references alone is not sufficient — Python's GC is
+    non-deterministic, so CUDA tensors may remain allocated until gc.collect()
+    forces the reference-counted objects to be dropped. Without it,
+    empty_cache() sees no freed blocks and qwen OOMs on the same card.
     """
+    import gc
     import torch
     print("  [surya] Releasing models from VRAM...", end=" ", flush=True)
     for key in list(model_dict.keys()):
@@ -83,6 +85,7 @@ def _surya_release(model_dict: dict) -> None:
         if hasattr(predictor, "model"):
             predictor.model = None
         model_dict[key] = None
+    gc.collect()  # force CPython to drop tensor refs before CUDA reclaims VRAM
     torch.cuda.empty_cache()
     if torch.cuda.is_available():
         free_gb = torch.cuda.mem_get_info()[0] / 1e9
