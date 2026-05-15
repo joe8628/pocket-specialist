@@ -208,7 +208,7 @@ class _VramAwarePdfConverter:
             provider = cast(PdfProvider, provider_cls(path, conv.config))
             document = cast(Document, DocumentBuilder(conv.config)(provider, layout_builder, line_builder, ocr_builder))
             conv.page_count = len(document.pages)
-            StructureBuilder(conv.config)(document)
+            cast(Callable[[Document], Any], StructureBuilder(conv.config))(document)
 
             processors = conv.processor_list or []
             non_llm = [p for p in processors if not isinstance(p, BaseLLMProcessor)]
@@ -220,14 +220,14 @@ class _VramAwarePdfConverter:
 
             print(f"  [marker] Phase 1: {len(non_llm)} Surya processors...")
             for processor in non_llm:
-                processor(document)
+                cast(Callable[[Document], Any], processor)(document)
 
             if llm_procs:
                 print(f"  [marker] VRAM swap: Surya → {_OLLAMA_LLM_MODEL}")
                 self._on_surya_done()
                 print(f"  [marker] Phase 2: {len(llm_procs)} LLM processors...")
                 for processor in llm_procs:
-                    processor(document)
+                    cast(Callable[[Document], Any], processor)(document)
 
             renderer = cast(Callable[[Document], Any], conv.resolve_dependencies(conv.renderer))
             return renderer(document)
