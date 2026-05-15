@@ -1,0 +1,25 @@
+# Stage 0 — Rename corpus
+pypdf>=4.0.0
+
+# Stage 1 — Render
+PyMuPDF>=1.24.0
+
+# CLI
+typer>=0.12.0
+
+# Stage 2 — OCR (Surya, GPU via PyTorch)
+surya-ocr>=0.17.0
+
+# Stage 3 — Equations (Surya layout detection + Surya LaTeX OCR)
+# surya-ocr (already above) provides both layout and LaTeX OCR predictors
+# texify was archived Jan 2025; replaced by surya's RecognitionPredictor + TaskNames.block_without_boxes
+
+# Stage 4 — LLM correction
+# Build with CUDA support:
+#   CMAKE_ARGS="-DLLAMA_CUDA=on" pip install llama-cpp-python --no-binary llama-cpp-python
+llama-cpp-python>=0.2.0
+
+# Shared GPU utilities (pulled in by surya-ocr, listed explicitly for clarity)
+torch>=2.1.0
+torchvision>=0.16.0
+Pillow>=10.0.0
