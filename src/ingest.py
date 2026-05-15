@@ -5,25 +5,182 @@ import csv
 import io
 import json
 from pathlib import Path
+from typing import Callable
 
 from chromadb.api.types import Metadata
 from db import client, embedding_fn, REPO_ROOT, DB_PATH
 import graph as kg
 from marker_postprocess import clean as _marker_clean
 
+_OLLAMA_BASE = "http://localhost:11434"
+_OLLAMA_LLM_MODEL = "qwen2.5vl:7b"
+
+
+# ── Ollama VRAM management ────────────────────────────────────────────────────
+
+def _ollama_list_loaded() -> list[str]:
+    """Return names of models currently loaded in Ollama VRAM."""
+    try:
+        import requests
+        resp = requests.get(f"{_OLLAMA_BASE}/api/ps", timeout=5)
+        resp.raise_for_status()
+        return [m["name"] for m in resp.json().get("models", [])]
+    except Exception:
+        return []
+
+
+def _ollama_unload_all() -> None:
+    """Evict all Ollama models from VRAM (keep_alive=0)."""
+    try:
+        import requests
+    except ImportError:
+        return
+    loaded = _ollama_list_loaded()
+    for name in loaded:
+        print(f"  [ollama] Unloading {name} from VRAM...")
+        try:
+            requests.post(
+                f"{_OLLAMA_BASE}/api/generate",
+                json={"model": name, "keep_alive": 0},
+                timeout=15,
+            )
+        except Exception as e:
+            print(f"  [ollama] Warning: could not unload {name}: {e}")
+
+
+def _ollama_ensure_loaded(model: str) -> None:
+    """Warm up an Ollama model so it is resident in VRAM before inference."""
+    print(f"  [ollama] Loading {model} into VRAM...", end=" ", flush=True)
+    try:
+        import requests
+        requests.post(
+            f"{_OLLAMA_BASE}/api/generate",
+            json={"model": model, "prompt": "", "keep_alive": 3600},
+            timeout=120,
+        )
+        print("ready.")
+    except Exception as e:
+        print(f"failed ({e})")
+
+
+# ── Surya VRAM offload/restore ────────────────────────────────────────────────
+
+def _surya_release(model_dict: dict) -> None:
+    """Delete Surya model tensors entirely and free GPU cache.
+
+    Nulling the model references lets Python/CUDA reclaim VRAM immediately.
+    Preferred over .to('cpu') because it avoids silent CPU fallback if anything
+    tries to use the models before the next reload.
+    """
+    import torch
+    print("  [surya] Releasing models from VRAM...", end=" ", flush=True)
+    for key in list(model_dict.keys()):
+        predictor = model_dict[key]
+        if predictor is None:
+            continue
+        if hasattr(predictor, "foundation_predictor") and predictor.foundation_predictor:
+            predictor.foundation_predictor.model = None
+        if hasattr(predictor, "model"):
+            predictor.model = None
+        model_dict[key] = None
+    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        free_gb = torch.cuda.mem_get_info()[0] / 1e9
+        print(f"{free_gb:.1f} GB VRAM free.")
+    else:
+        print("done.")
+
+
+# ── Two-phase converter ───────────────────────────────────────────────────────
+
+class _VramAwarePdfConverter:
+    """
+    Wraps PdfConverter to split the pipeline into two VRAM phases:
+      Phase 1 — Surya (DocumentBuilder + non-LLM processors)
+      on_surya_done() callback — release Surya entirely, load qwen
+      Phase 2 — LLM processors
+
+    After each document the Surya models are fully released. The global
+    _marker_converter_llm is cleared so the next call reloads from disk,
+    ensuring no stale or partially-freed model state can cause silent failures.
+    """
+
+    def __init__(self, artifact_dict, config, llm_service_str: str, on_surya_done: Callable[[], None]):
+        from marker.converters.pdf import PdfConverter
+        from marker.processors.llm import BaseLLMProcessor
+
+        self._on_surya_done = on_surya_done
+        self._BaseLLMProcessor = BaseLLMProcessor
+
+        self._converter = PdfConverter(
+            artifact_dict=artifact_dict,
+            llm_service=llm_service_str,
+            config=config,
+        )
+
+    def __call__(self, filepath: str):
+        return self._converter_call(filepath)
+
+    def _converter_call(self, filepath: str):
+        from marker.providers.registry import provider_from_filepath
+        from marker.builders.document import DocumentBuilder
+        from marker.builders.line import LineBuilder
+        from marker.builders.ocr import OcrBuilder
+        from marker.builders.structure import StructureBuilder
+
+        conv = self._converter
+        BaseLLMProcessor = self._BaseLLMProcessor
+
+        with conv.filepath_to_str(filepath) as path:
+            provider_cls = provider_from_filepath(path)
+            layout_builder = conv.resolve_dependencies(conv.layout_builder_class)
+            line_builder = conv.resolve_dependencies(LineBuilder)
+            ocr_builder = conv.resolve_dependencies(OcrBuilder)
+            provider = provider_cls(path, conv.config)
+            document = DocumentBuilder(conv.config)(provider, layout_builder, line_builder, ocr_builder)
+            conv.page_count = len(document.pages)
+            StructureBuilder(conv.config)(document)
+
+            non_llm = [p for p in conv.processor_list if not isinstance(p, BaseLLMProcessor)]
+            llm_procs = [p for p in conv.processor_list if isinstance(p, BaseLLMProcessor)]
+
+            print(f"  [marker] Phase 1: {len(non_llm)} Surya processors...")
+            for processor in non_llm:
+                processor(document)
+
+            if llm_procs:
+                print(f"  [marker] VRAM swap: Surya → {_OLLAMA_LLM_MODEL}")
+                self._on_surya_done()
+                print(f"  [marker] Phase 2: {len(llm_procs)} LLM processors...")
+                for processor in llm_procs:
+                    processor(document)
+
+            renderer = conv.resolve_dependencies(conv.renderer)
+            return renderer(document)
+
+
 _marker_converter = None
+_marker_converter_llm = None
 
 
-def _get_marker_converter():
-    global _marker_converter
-    if _marker_converter is not None:
+def _get_marker_converter(use_llm: bool = False):
+    global _marker_converter, _marker_converter_llm
+
+    if use_llm and _marker_converter_llm is not None:
+        return _marker_converter_llm
+    if not use_llm and _marker_converter is not None:
         return _marker_converter
+
     import torch
     if not torch.cuda.is_available():
         raise RuntimeError(
             "Marker requires a CUDA-capable GPU. "
             "Check that your NVIDIA driver and PyTorch CUDA versions are compatible."
         )
+
+    # Evict any Ollama models before Surya loads so they don't compete for VRAM.
+    _ollama_unload_all()
+
     # Must be set before surya.foundation is imported: FoundationPredictor reads
     # settings.RECOGNITION_BATCH_SIZE as a class-level attribute at definition time.
     # Default of 256 pre-allocates a 3.56 GB KV cache; 32 keeps peak VRAM ~7 GB
@@ -34,14 +191,37 @@ def _get_marker_converter():
     # batch=24 needs 2.06 GB — still OOM (8.06 GB allocated + 2.06 GB > 10.55 GB).
     # batch=16 needs ~1.37 GB, leaving ~2.3 GB headroom — safe on RTX 2080 Ti.
     _surya_settings.DETECTOR_BATCH_SIZE = 16
+
     print(f"  Loading Marker models on {torch.cuda.get_device_name(0)} (first run only)...")
-    from marker.converters.pdf import PdfConverter
     from marker.models import create_model_dict
-    _marker_converter = PdfConverter(artifact_dict=create_model_dict())
-    return _marker_converter
+    model_dict = create_model_dict()
+
+    if use_llm:
+        from marker.processors.llm.llm_page_correction import LLMPageCorrectionProcessor
+
+        def _on_surya_done():
+            _surya_release(model_dict)
+            _ollama_ensure_loaded(_OLLAMA_LLM_MODEL)
+
+        _marker_converter_llm = _VramAwarePdfConverter(
+            artifact_dict=model_dict,
+            config={
+                "use_llm": True,
+                "ollama_model": _OLLAMA_LLM_MODEL,
+                "block_correction_prompt": LLMPageCorrectionProcessor.default_user_prompt,
+            },
+            llm_service_str="marker.services.ollama.OllamaService",
+            on_surya_done=_on_surya_done,
+        )
+        return _marker_converter_llm
+    else:
+        from marker.converters.pdf import PdfConverter
+        _marker_converter = PdfConverter(artifact_dict=model_dict)
+        return _marker_converter
 
 CORPUS_PATH = REPO_ROOT / "RAG-corpus"
 MARKER_CACHE_PATH = REPO_ROOT / "marker_cache"
+MARKER_CACHE_LLM_PATH = REPO_ROOT / "marker_cache_llm"
 MANIFEST_PATH = DB_PATH / ".manifest.json"
 SUPPORTED = {".pdf", ".txt", ".md", ".markdown", ".csv"}
 
@@ -432,25 +612,34 @@ def _verify_cache_content(pdf_path: Path, cache_file: Path, raw: str) -> None:
         )
 
 
-def _marker_cache_file(pdf_path: Path) -> Path:
-    """Return the cache path for a PDF's raw Marker output."""
+def _marker_cache_file(pdf_path: Path, use_llm: bool = False) -> Path:
+    """Return the cache path for a PDF's raw Marker output.
+
+    LLM and non-LLM outputs are kept in separate directories so a file cached
+    without LLM post-processing is never served to a --use-llm run.
+    """
     rel = pdf_path.relative_to(CORPUS_PATH)
     # Flatten subdirectory separators so the cache stays a flat directory
     name = str(rel.with_suffix('.md')).replace('/', '__').replace('\\', '__')
-    return MARKER_CACHE_PATH / name
+    cache_dir = MARKER_CACHE_LLM_PATH if use_llm else MARKER_CACHE_PATH
+    return cache_dir / name
 
 
-def _extract_pdf(path: Path) -> str:
+def _extract_pdf(path: Path, use_llm: bool = False) -> str:
     """Extract PDF as Markdown via Marker, caching the raw output to marker_cache/.
 
     Marker only runs when the PDF is newer than its cached markdown. The cache
     stores the unmodified Marker output — useful for inspecting OCR quality and
     tuning the cleaning/chunking pipeline without re-running the GPU.
 
+    When use_llm=True the pipeline runs in two VRAM phases: Surya extracts the
+    document, then Surya models are offloaded and qwen2.5vl:7b is loaded via
+    Ollama before the LLM post-processors refine tables, math, and headings.
+
     Raises RuntimeError for encrypted/password-protected PDFs so the caller can
     skip the file with a clear message rather than a cryptic PDFium traceback.
     """
-    cache_file = _marker_cache_file(path)
+    cache_file = _marker_cache_file(path, use_llm=use_llm)
     pdf_mtime = path.stat().st_mtime
 
     if cache_file.exists() and cache_file.stat().st_mtime >= pdf_mtime:
@@ -458,7 +647,7 @@ def _extract_pdf(path: Path) -> str:
         raw = cache_file.read_text(encoding='utf-8')
     else:
         try:
-            converter = _get_marker_converter()
+            converter = _get_marker_converter(use_llm=use_llm)
             rendered = converter(str(path))
             raw = rendered.markdown
         except Exception as exc:
@@ -469,7 +658,13 @@ def _extract_pdf(path: Path) -> str:
                     f"Decrypt the file and re-ingest. (Original: {msg})"
                 ) from exc
             raise
-        MARKER_CACHE_PATH.mkdir(parents=True, exist_ok=True)
+        finally:
+            if use_llm:
+                # Surya models were released mid-run; drop the cached converter
+                # so the next document gets a clean reload rather than a broken one.
+                global _marker_converter_llm
+                _marker_converter_llm = None
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
         cache_file.write_text(raw, encoding='utf-8')
         _verify_cache_content(path, cache_file, raw)
         print(f"    cached → {cache_file.name}")
@@ -634,11 +829,11 @@ def ingest_texts(
     return len(documents)
 
 
-def ingest_file(path: Path, collection_name: str = "default") -> int:
+def ingest_file(path: Path, collection_name: str = "default", use_llm: bool = False) -> int:
     fmt = _sniff_format(path)
 
     if fmt == 'pdf':
-        full_text = _extract_pdf(path)
+        full_text = _extract_pdf(path, use_llm=use_llm)
     elif fmt in ('text', 'markdown'):
         full_text = path.read_text(encoding='utf-8', errors='replace')
     elif fmt == 'csv':
@@ -668,7 +863,7 @@ def ingest_file(path: Path, collection_name: str = "default") -> int:
     return len(chunks)
 
 
-def ingest_corpus(corpus_dir: Path = CORPUS_PATH, collection_name: str = "default") -> None:
+def ingest_corpus(corpus_dir: Path = CORPUS_PATH, collection_name: str = "default", use_llm: bool = False) -> None:
     """Scan corpus_dir for new or changed files and ingest them."""
     if not corpus_dir.exists():
         print(f"Error: corpus folder not found: {corpus_dir}")
@@ -691,11 +886,11 @@ def ingest_corpus(corpus_dir: Path = CORPUS_PATH, collection_name: str = "defaul
         if db_current:
             # DB is up to date — but write the marker cache if it is missing
             if _sniff_format(file) == 'pdf':
-                cache_file = _marker_cache_file(file)
+                cache_file = _marker_cache_file(file, use_llm=use_llm)
                 if not cache_file.exists():
                     print(f"  [cache] {file.name} ...", end=" ", flush=True)
                     try:
-                        _extract_pdf(file)
+                        _extract_pdf(file, use_llm=use_llm)
                         cached_count += 1
                         print("cached.")
                     except Exception as e:
@@ -712,7 +907,7 @@ def ingest_corpus(corpus_dir: Path = CORPUS_PATH, collection_name: str = "defaul
 
         print(f"  [{status}] {file.name} ...", end=" ", flush=True)
         try:
-            n = ingest_file(file, collection_name)
+            n = ingest_file(file, collection_name, use_llm=use_llm)
             manifest[key] = mtime
             print(f"{n} chunks ingested.")
         except Exception as e:
@@ -729,22 +924,37 @@ def ingest_corpus(corpus_dir: Path = CORPUS_PATH, collection_name: str = "defaul
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # No args → scan RAG-corpus for new/changed files
-    if len(sys.argv) == 1:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Ingest documents into ChromaDB.")
+    parser.add_argument("file", nargs="?", help="Path to a single file to ingest (omit to scan RAG-corpus).")
+    parser.add_argument("collection", nargs="?", default="default", help="ChromaDB collection name (default: 'default').")
+    parser.add_argument("--no-llm", action="store_true", help=f"Disable LLM post-processing (runs Surya only, no {_OLLAMA_LLM_MODEL}).")
+
+    args = parser.parse_args()
+    use_llm: bool = not args.no_llm
+
+    if use_llm:
+        print(f"LLM post-processing enabled ({_OLLAMA_LLM_MODEL} via Ollama)\n")
+    else:
+        print("LLM post-processing disabled (Surya only)\n")
+
+    if args.file is None:
+        # No file provided → scan RAG-corpus for new/changed files
         print(f"Scanning '{CORPUS_PATH}' for new or changed files...\n")
-        ingest_corpus()
+        ingest_corpus(use_llm=use_llm)
         sys.exit(0)
 
     # Single file path provided
-    file_path = Path(sys.argv[1]).resolve()
-    collection_name = sys.argv[2] if len(sys.argv) > 2 else "default"
+    file_path = Path(args.file).resolve()
+    collection_name: str = args.collection
 
     if not file_path.exists():
         print(f"Error: file not found: {file_path}")
         sys.exit(1)
 
     try:
-        n = ingest_file(file_path, collection_name)
+        n = ingest_file(file_path, collection_name, use_llm=use_llm)
         manifest = _load_manifest()
         manifest[str(file_path.relative_to(REPO_ROOT))] = file_path.stat().st_mtime
         _save_manifest(manifest)
