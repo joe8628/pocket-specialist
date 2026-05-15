@@ -17,7 +17,16 @@ _OLLAMA_LLM_MODEL = "qwen2.5vl:7b"
 # qwen2.5vl defaults to 128K context in Ollama, requiring ~7 GB KV cache alone
 # on a 7B model (128K × 28L × 2KV × head_dim × bf16 ≈ 7 GB), which exceeds the
 # 11 GB card when added to model weights. 8192 tokens is ample for per-page work.
-_OLLAMA_NUM_CTX = 8192
+_OLLAMA_NUM_CTX = 6192
+
+# LLM processors to skip — tables/forms/images are expensive and low-value for
+# math-heavy documents; equation and mathblock processors are kept.
+_SKIP_LLM_PROCESSOR_NAMES = frozenset({
+    "LLMTableProcessor",
+    "LLMTableMergeProcessor",
+    "LLMFormProcessor",
+    "LLMHandwritingProcessor",
+})
 
 
 # ── Ollama VRAM management ────────────────────────────────────────────────────
@@ -199,7 +208,11 @@ class _VramAwarePdfConverter:
             StructureBuilder(conv.config)(document)
 
             non_llm = [p for p in conv.processor_list if not isinstance(p, BaseLLMProcessor)]
-            llm_procs = [p for p in conv.processor_list if isinstance(p, BaseLLMProcessor)]
+            llm_procs = [
+                p for p in conv.processor_list
+                if isinstance(p, BaseLLMProcessor)
+                and type(p).__name__ not in _SKIP_LLM_PROCESSOR_NAMES
+            ]
 
             print(f"  [marker] Phase 1: {len(non_llm)} Surya processors...")
             for processor in non_llm:
