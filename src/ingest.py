@@ -14,6 +14,10 @@ from marker_postprocess import clean as _marker_clean
 
 _OLLAMA_BASE = "http://localhost:11434"
 _OLLAMA_LLM_MODEL = "qwen2.5vl:7b"
+# qwen2.5vl defaults to 128K context in Ollama, requiring ~7 GB KV cache alone
+# on a 7B model (128K × 28L × 2KV × head_dim × bf16 ≈ 7 GB), which exceeds the
+# 11 GB card when added to model weights. 8192 tokens is ample for per-page work.
+_OLLAMA_NUM_CTX = 8192
 
 
 # ── Ollama VRAM management ────────────────────────────────────────────────────
@@ -61,6 +65,56 @@ def _ollama_ensure_loaded(model: str) -> None:
         print("ready.")
     except Exception as e:
         print(f"failed ({e})")
+
+
+# ── Ollama context-window cap ────────────────────────────────────────────────
+
+def _patch_ollama_num_ctx() -> None:
+    """Cap num_ctx on every OllamaService inference call to prevent VRAM OOM.
+
+    Applied once at the class level (idempotent); all instances — including
+    those already wired into Marker's processor list — pick up the patch
+    because Python resolves instance methods through the class at call time.
+    """
+    from marker.services.ollama import OllamaService
+    if getattr(OllamaService, "_num_ctx_patched", False):
+        return
+
+    import json
+    import requests as _rq
+
+    def _bounded_call(self, prompt, image, block, response_schema,
+                      max_retries=None, timeout=None):
+        url = f"{self.ollama_base_url}/api/generate"
+        schema = response_schema.model_json_schema()
+        payload = {
+            "model": self.ollama_model,
+            "prompt": prompt,
+            "stream": False,
+            "format": {
+                "type": "object",
+                "properties": schema["properties"],
+                "required": schema["required"],
+            },
+            "images": self.format_image_for_llm(image),
+            "options": {"num_ctx": _OLLAMA_NUM_CTX},
+        }
+        try:
+            resp = _rq.post(url, json=payload,
+                            headers={"Content-Type": "application/json"})
+            resp.raise_for_status()
+            data = resp.json()
+            total = data["prompt_eval_count"] + data["eval_count"]
+            if block:
+                block.update_metadata(llm_request_count=1, llm_tokens_used=total)
+            return json.loads(data["response"])
+        except Exception as e:
+            from marker.logger import get_logger
+            get_logger().warning(f"Ollama inference failed: {e}")
+        return {}
+
+    OllamaService.__call__ = _bounded_call
+    OllamaService._num_ctx_patched = True
 
 
 # ── Surya VRAM offload/restore ────────────────────────────────────────────────
@@ -201,6 +255,7 @@ def _get_marker_converter(use_llm: bool = False):
 
     if use_llm:
         from marker.processors.llm.llm_page_correction import LLMPageCorrectionProcessor
+        _patch_ollama_num_ctx()  # cap context before any OllamaService instance is built
 
         def _on_surya_done():
             _surya_release(model_dict)
