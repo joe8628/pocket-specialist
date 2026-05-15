@@ -122,8 +122,8 @@ def _patch_ollama_num_ctx() -> None:
             get_logger().warning(f"Ollama inference failed: {e}")
         return {}
 
-    OllamaService.__call__ = _bounded_call
-    OllamaService._num_ctx_patched = True
+    setattr(OllamaService, "__call__", _bounded_call)
+    setattr(OllamaService, "_num_ctx_patched", True)
 
 
 # ── Surya VRAM offload/restore ────────────────────────────────────────────────
