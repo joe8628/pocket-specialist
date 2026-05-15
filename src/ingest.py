@@ -207,9 +207,10 @@ class _VramAwarePdfConverter:
             conv.page_count = len(document.pages)
             StructureBuilder(conv.config)(document)
 
-            non_llm = [p for p in conv.processor_list if not isinstance(p, BaseLLMProcessor)]
+            processors = conv.processor_list or []
+            non_llm = [p for p in processors if not isinstance(p, BaseLLMProcessor)]
             llm_procs = [
-                p for p in conv.processor_list
+                p for p in processors
                 if isinstance(p, BaseLLMProcessor)
                 and type(p).__name__ not in _SKIP_LLM_PROCESSOR_NAMES
             ]
