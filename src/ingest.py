@@ -195,7 +195,7 @@ class _VramAwarePdfConverter:
         from marker.builders.structure import StructureBuilder
         from marker.providers.pdf import PdfProvider
         from marker.schema.document import Document
-        from typing import cast
+        from typing import cast, Callable, Any
 
         conv = self._converter
         BaseLLMProcessor = self._BaseLLMProcessor
@@ -229,7 +229,7 @@ class _VramAwarePdfConverter:
                 for processor in llm_procs:
                     processor(document)
 
-            renderer = conv.resolve_dependencies(conv.renderer)
+            renderer = cast(Callable[[Document], Any], conv.resolve_dependencies(conv.renderer))
             return renderer(document)
 
 
