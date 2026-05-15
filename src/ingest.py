@@ -194,6 +194,7 @@ class _VramAwarePdfConverter:
         from marker.builders.ocr import OcrBuilder
         from marker.builders.structure import StructureBuilder
         from marker.providers.pdf import PdfProvider
+        from marker.schema.document import Document
         from typing import cast
 
         conv = self._converter
@@ -205,7 +206,7 @@ class _VramAwarePdfConverter:
             line_builder = conv.resolve_dependencies(LineBuilder)
             ocr_builder = conv.resolve_dependencies(OcrBuilder)
             provider = cast(PdfProvider, provider_cls(path, conv.config))
-            document = DocumentBuilder(conv.config)(provider, layout_builder, line_builder, ocr_builder)
+            document = cast(Document, DocumentBuilder(conv.config)(provider, layout_builder, line_builder, ocr_builder))
             conv.page_count = len(document.pages)
             StructureBuilder(conv.config)(document)
 
