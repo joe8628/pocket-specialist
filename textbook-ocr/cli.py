@@ -161,12 +161,15 @@ def _run_pipeline(
     output_dir: Path | None = None,
 ) -> None:
     """Run stages 1–5 for a single PDF."""
+    import time
     from config import RENDER_DIR, OCR_DIR, EQUATIONS_DIR, CROPS_DIR, CORRECTION_DIR, OUTPUT_DIR
     from pipeline.render import render_pdf
     from pipeline.ocr import ocr_pages
     from pipeline.equations import process_equations
     from pipeline.correction import correct_pages
     from pipeline.assemble import assemble
+
+    t0 = time.monotonic()
 
     typer.echo(f"\n  Stage 1: Render  ({pdf_path.name})")
     render_pdf(pdf_path, start_page=start_page or 1, end_page=end_page, zoom=zoom)
@@ -197,6 +200,12 @@ def _run_pipeline(
         source_pdf=pdf_path,
         equations_dir=EQUATIONS_DIR,
     )
+
+    elapsed = time.monotonic() - t0
+    h, rem = divmod(int(elapsed), 3600)
+    m, s = divmod(rem, 60)
+    duration = f"{h}h {m}m {s}s" if h else f"{m}m {s}s" if m else f"{s}s"
+    typer.echo(f"\nTotal time: {duration}  ({pdf_path.name})")
 
 
 @app.command()
