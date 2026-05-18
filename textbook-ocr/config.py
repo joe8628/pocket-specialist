@@ -21,12 +21,6 @@ EQUATIONS_DIR         = CHECKPOINT_DIR / "equations"
 CROPS_DIR             = CHECKPOINT_DIR / "crops"
 EQUATION_CONF_THRESHOLD = 0.5
 
-# YOLO layout detection model — download from HuggingFace before Stage 3.
-# Recommended: YOLO trained on DocLayNet (has a 'formula' class).
-#   huggingface-cli download nickmuchi/yolos-base-finetuned-DocLayNet \
-#       --local-dir models/layout
-LAYOUT_MODEL_PATH = MODELS_DIR / "layout"
-
 # ── Stage 4: LLM Correction (Ollama) ─────────────────────────────────────────
 CORRECTION_DIR   = CHECKPOINT_DIR / "corrected"
 OLLAMA_MODEL     = "qwen2.5:7b"

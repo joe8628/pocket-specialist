@@ -134,11 +134,19 @@ def correct(
 
 @app.command()
 def assemble(
-    output_dir: Path = typer.Option(None, "--output-dir"),
+    pdf: Path = typer.Argument(..., help="Source PDF file (used to name outputs)."),
+    output_dir: Path = typer.Option(None, "--output-dir", help="Output directory (default: output/)."),
 ) -> None:
-    """Stage 5: Concatenate corrected pages into final .md and .json. (Not yet implemented)"""
-    typer.echo("Stage 5 (Assemble) is not yet implemented.", err=True)
-    raise typer.Exit(1)
+    """Stage 5: Concatenate corrected pages into final .md and .json."""
+    from config import CORRECTION_DIR, EQUATIONS_DIR, OUTPUT_DIR
+    from pipeline.assemble import assemble as _assemble
+
+    _assemble(
+        corrected_dir=CORRECTION_DIR,
+        output_dir=output_dir or OUTPUT_DIR,
+        source_pdf=pdf.resolve(),
+        equations_dir=EQUATIONS_DIR,
+    )
 
 
 # ── Full pipeline ─────────────────────────────────────────────────────────────
@@ -150,13 +158,15 @@ def _run_pipeline(
     zoom: float,
     ollama_model: str = "qwen2.5:7b",
     no_llm: bool = False,
+    output_dir: Path | None = None,
 ) -> None:
-    """Run stages 1–4 for a single PDF."""
-    from config import RENDER_DIR, OCR_DIR, EQUATIONS_DIR, CROPS_DIR, CORRECTION_DIR
+    """Run stages 1–5 for a single PDF."""
+    from config import RENDER_DIR, OCR_DIR, EQUATIONS_DIR, CROPS_DIR, CORRECTION_DIR, OUTPUT_DIR
     from pipeline.render import render_pdf
     from pipeline.ocr import ocr_pages
     from pipeline.equations import process_equations
     from pipeline.correction import correct_pages
+    from pipeline.assemble import assemble
 
     typer.echo(f"\n  Stage 1: Render  ({pdf_path.name})")
     render_pdf(pdf_path, start_page=start_page or 1, end_page=end_page, zoom=zoom)
@@ -180,6 +190,14 @@ def _run_pipeline(
             end_page=end_page,
         )
 
+    typer.echo(f"\n  Stage 5: Assemble  ({pdf_path.name})")
+    assemble(
+        corrected_dir=CORRECTION_DIR,
+        output_dir=output_dir or OUTPUT_DIR,
+        source_pdf=pdf_path,
+        equations_dir=EQUATIONS_DIR,
+    )
+
 
 @app.command()
 def run(
@@ -189,8 +207,9 @@ def run(
     zoom: float = typer.Option(2.0, "--zoom"),
     no_llm: bool = typer.Option(False, "--no-llm", help="Skip Stage 4 LLM correction."),
     ollama_model: str = typer.Option("qwen2.5:7b", "--ollama-model", help="Ollama model for Stage 4."),
+    output_dir: Path = typer.Option(None, "--output-dir", help="Output directory (default: output/)."),
 ) -> None:
-    """Run stages 1–4 on a single PDF (Stage 5 assembly not yet implemented)."""
+    """Run all pipeline stages (1–5) on a single PDF."""
     from config import CHECKPOINT_DIR
     from pipeline.rename import rename_corpus
 
@@ -199,8 +218,7 @@ def run(
     rename_corpus(pdf_path.parent, manifest_path=CHECKPOINT_DIR / "rename_manifest.json")
 
     _run_pipeline(pdf_path, start_page, end_page, zoom,
-                  ollama_model=ollama_model, no_llm=no_llm)
-    typer.echo("\nStage 5 (Assemble) not yet implemented.")
+                  ollama_model=ollama_model, no_llm=no_llm, output_dir=output_dir)
 
 
 @app.command(name="run-all")
@@ -211,8 +229,9 @@ def run_all(
     zoom: float = typer.Option(2.0, "--zoom"),
     no_llm: bool = typer.Option(False, "--no-llm", help="Skip Stage 4 LLM correction."),
     ollama_model: str = typer.Option("qwen2.5:7b", "--ollama-model", help="Ollama model for Stage 4."),
+    output_dir: Path = typer.Option(None, "--output-dir", help="Output directory (default: output/)."),
 ) -> None:
-    """Run stages 1–4 on every PDF in the corpus (Stage 5 assembly not yet implemented)."""
+    """Run all pipeline stages (1–5) on every PDF in the corpus."""
     from config import CHECKPOINT_DIR, CORPUS_DIR
     from pipeline.rename import rename_corpus
 
@@ -230,9 +249,9 @@ def run_all(
         typer.echo(f"  [{i}/{len(pdfs)}] {pdf_path.name}")
         typer.echo(f"{'─' * 60}")
         _run_pipeline(pdf_path, start_page, end_page, zoom,
-                      ollama_model=ollama_model, no_llm=no_llm)
+                      ollama_model=ollama_model, no_llm=no_llm, output_dir=output_dir)
 
-    typer.echo(f"\nDone. Processed {len(pdfs)} PDFs. Stage 5 (Assemble) not yet implemented.")
+    typer.echo(f"\nDone. Processed {len(pdfs)} PDFs.")
 
 
 # ── Status + Reset ────────────────────────────────────────────────────────────
