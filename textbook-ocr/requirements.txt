@@ -14,10 +14,10 @@ surya-ocr>=0.17.0
 # surya-ocr (already above) provides both layout and LaTeX OCR predictors
 # texify was archived Jan 2025; replaced by surya's RecognitionPredictor + TaskNames.block_without_boxes
 
-# Stage 4 — LLM correction
-# Build with CUDA support:
-#   CMAKE_ARGS="-DLLAMA_CUDA=on" pip install llama-cpp-python --no-binary llama-cpp-python
-llama-cpp-python>=0.2.0
+# Stage 4 — LLM correction (Ollama)
+# Requires Ollama running locally: https://ollama.com
+# Pull the model: ollama pull qwen2.5:7b
+requests>=2.31.0
 
 # Shared GPU utilities (pulled in by surya-ocr, listed explicitly for clarity)
 torch>=2.1.0

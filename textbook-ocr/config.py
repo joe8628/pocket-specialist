@@ -27,14 +27,10 @@ EQUATION_CONF_THRESHOLD = 0.5
 #       --local-dir models/layout
 LAYOUT_MODEL_PATH = MODELS_DIR / "layout"
 
-# ── Stage 4: LLM Correction ───────────────────────────────────────────────────
-CORRECTION_DIR  = CHECKPOINT_DIR / "corrected"
-# Download with:
-#   huggingface-cli download bartowski/Meta-Llama-3.1-8B-Instruct-GGUF \
-#       --include "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf" --local-dir models/
-LLM_MODEL_PATH    = MODELS_DIR / "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
-LLM_CONTEXT_TOKENS = 4096
-LLM_BATCH_SIZE    = 4      # pages per progress-flush cycle (not per-prompt)
+# ── Stage 4: LLM Correction (Ollama) ─────────────────────────────────────────
+CORRECTION_DIR   = CHECKPOINT_DIR / "corrected"
+OLLAMA_MODEL     = "qwen2.5:7b"
+OLLAMA_BASE      = "http://localhost:11434"
 
 # ── Shared ────────────────────────────────────────────────────────────────────
 MAX_RETRIES = 3

@@ -90,7 +90,7 @@ def equations(
     render_dir: Path = typer.Option(None, "--render-dir"),
     output_dir: Path = typer.Option(None, "--output-dir", help="Override equations JSON output directory."),
 ) -> None:
-    """Stage 3: Surya layout detection + Texify equation extraction."""
+    """Stage 3: Surya layout detection + Surya LaTeX OCR equation extraction."""
     from config import RENDER_DIR, OCR_DIR, EQUATIONS_DIR, CROPS_DIR
     from pipeline.equations import process_equations
 
@@ -111,15 +111,23 @@ def equations(
 
 @app.command()
 def correct(
-    start_page: int = typer.Option(1, "--start-page"),
+    start_page: int = typer.Option(None, "--start-page"),
     end_page: int = typer.Option(None, "--end-page"),
-    model: Path = typer.Option(None, "--model", help="Path to .gguf model file."),
-    ctx: int = typer.Option(4096, "--ctx", help="Per-page context token cap."),
-    batch_size: int = typer.Option(4, "--batch-size", help="Pages per progress-flush batch."),
+    ollama_model: str = typer.Option("qwen2.5:7b", "--ollama-model", help="Ollama model name."),
 ) -> None:
-    """Stage 4: LLM Markdown correction pass. (Not yet implemented)"""
-    typer.echo("Stage 4 (Correction) is not yet implemented.", err=True)
-    raise typer.Exit(1)
+    """Stage 4: Ollama LLM Markdown correction pass."""
+    from config import EQUATIONS_DIR, CORRECTION_DIR
+    from pipeline.correction import correct_pages
+
+    done, failed = correct_pages(
+        equations_dir=EQUATIONS_DIR,
+        correction_dir=CORRECTION_DIR,
+        model=ollama_model,
+        start_page=start_page,
+        end_page=end_page,
+    )
+    if failed:
+        raise typer.Exit(1)
 
 
 # ── Stage 5 ───────────────────────────────────────────────────────────────────
@@ -140,12 +148,15 @@ def _run_pipeline(
     start_page: int | None,
     end_page: int | None,
     zoom: float,
+    ollama_model: str = "qwen2.5:7b",
+    no_llm: bool = False,
 ) -> None:
-    """Run all implemented stages for a single PDF."""
-    from config import RENDER_DIR, OCR_DIR, EQUATIONS_DIR, CROPS_DIR
+    """Run stages 1–4 for a single PDF."""
+    from config import RENDER_DIR, OCR_DIR, EQUATIONS_DIR, CROPS_DIR, CORRECTION_DIR
     from pipeline.render import render_pdf
     from pipeline.ocr import ocr_pages
     from pipeline.equations import process_equations
+    from pipeline.correction import correct_pages
 
     typer.echo(f"\n  Stage 1: Render  ({pdf_path.name})")
     render_pdf(pdf_path, start_page=start_page or 1, end_page=end_page, zoom=zoom)
@@ -159,6 +170,16 @@ def _run_pipeline(
                       equations_dir=EQUATIONS_DIR, crops_dir=CROPS_DIR,
                       start_page=start_page, end_page=end_page)
 
+    if not no_llm:
+        typer.echo(f"\n  Stage 4: Correction  ({pdf_path.name})")
+        correct_pages(
+            equations_dir=EQUATIONS_DIR,
+            correction_dir=CORRECTION_DIR,
+            model=ollama_model,
+            start_page=start_page,
+            end_page=end_page,
+        )
+
 
 @app.command()
 def run(
@@ -167,9 +188,9 @@ def run(
     end_page: int = typer.Option(None, "--end-page", help="Last page inclusive (default: last)."),
     zoom: float = typer.Option(2.0, "--zoom"),
     no_llm: bool = typer.Option(False, "--no-llm", help="Skip Stage 4 LLM correction."),
-    model: Path = typer.Option(None, "--model"),
+    ollama_model: str = typer.Option("qwen2.5:7b", "--ollama-model", help="Ollama model for Stage 4."),
 ) -> None:
-    """Run all implemented stages on a single PDF."""
+    """Run stages 1–4 on a single PDF (Stage 5 assembly not yet implemented)."""
     from config import CHECKPOINT_DIR
     from pipeline.rename import rename_corpus
 
@@ -177,8 +198,9 @@ def run(
     typer.echo("=== Stage 0: Rename corpus ===")
     rename_corpus(pdf_path.parent, manifest_path=CHECKPOINT_DIR / "rename_manifest.json")
 
-    _run_pipeline(pdf_path, start_page, end_page, zoom)
-    typer.echo("\nStages 4–5 not yet implemented.")
+    _run_pipeline(pdf_path, start_page, end_page, zoom,
+                  ollama_model=ollama_model, no_llm=no_llm)
+    typer.echo("\nStage 5 (Assemble) not yet implemented.")
 
 
 @app.command(name="run-all")
@@ -188,9 +210,9 @@ def run_all(
     end_page: int = typer.Option(None, "--end-page", help="Last page per PDF (default: last)."),
     zoom: float = typer.Option(2.0, "--zoom"),
     no_llm: bool = typer.Option(False, "--no-llm", help="Skip Stage 4 LLM correction."),
-    model: Path = typer.Option(None, "--model"),
+    ollama_model: str = typer.Option("qwen2.5:7b", "--ollama-model", help="Ollama model for Stage 4."),
 ) -> None:
-    """Run all implemented stages on every PDF in the corpus."""
+    """Run stages 1–4 on every PDF in the corpus (Stage 5 assembly not yet implemented)."""
     from config import CHECKPOINT_DIR, CORPUS_DIR
     from pipeline.rename import rename_corpus
 
@@ -207,9 +229,10 @@ def run_all(
         typer.echo(f"\n{'─' * 60}")
         typer.echo(f"  [{i}/{len(pdfs)}] {pdf_path.name}")
         typer.echo(f"{'─' * 60}")
-        _run_pipeline(pdf_path, start_page, end_page, zoom)
+        _run_pipeline(pdf_path, start_page, end_page, zoom,
+                      ollama_model=ollama_model, no_llm=no_llm)
 
-    typer.echo(f"\nDone. Processed {len(pdfs)} PDFs. Stages 4–5 not yet implemented.")
+    typer.echo(f"\nDone. Processed {len(pdfs)} PDFs. Stage 5 (Assemble) not yet implemented.")
 
 
 # ── Status + Reset ────────────────────────────────────────────────────────────

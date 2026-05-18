@@ -17,6 +17,7 @@ Output: checkpoints/equations/page_{N:04d}.json (OCR JSON enriched with block_ty
 from __future__ import annotations
 import gc
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Optional
@@ -28,6 +29,8 @@ from config import CROPS_DIR, EQUATION_CONF_THRESHOLD, EQUATIONS_DIR, OCR_DIR, R
 from pipeline.checkpoint import get_status, init_db, set_status, should_process
 from pipeline.models import BlockType, TextBlock
 
+
+_RE_EQ_NUMBER = re.compile(r'^\s*\(\d+(?:\.\d+)*\)\s*$')
 
 _LAYOUT_TO_BLOCKTYPE: dict[str, BlockType] = {
     "Text":          BlockType.TEXT,
@@ -89,7 +92,37 @@ def _assign_block_types(blocks: list[TextBlock], layout_boxes: list) -> list[Tex
     return blocks
 
 
-def _crop_equation(image: Image.Image, block: TextBlock, pad: float = 0.05) -> Image.Image:
+def _strip_header_footer(blocks: list[TextBlock], page_height: float) -> list[TextBlock]:
+    """Drop running-header/page-number (top 8%) and publisher-footer (bottom 8%) blocks."""
+    top = page_height * 0.08
+    bot = page_height * 0.90
+    return [b for b in blocks if top < (b.bbox.y0 + b.bbox.y1) / 2 < bot]
+
+
+def _remove_eq_numbers(blocks: list[TextBlock]) -> list[TextBlock]:
+    """Drop standalone equation-number labels like (7.53) that are tagged as EQUATION."""
+    return [
+        b for b in blocks
+        if not (b.block_type == BlockType.EQUATION and _RE_EQ_NUMBER.match(b.raw_text))
+    ]
+
+
+def _consolidate_figures(blocks: list[TextBlock]) -> list[TextBlock]:
+    """Collapse consecutive FIGURE blocks (axis ticks, labels) into one placeholder."""
+    result: list[TextBlock] = []
+    in_run = False
+    for b in blocks:
+        if b.block_type == BlockType.FIGURE:
+            if not in_run:
+                result.append(b)
+                in_run = True
+        else:
+            in_run = False
+            result.append(b)
+    return result
+
+
+def _crop_equation(image: Image.Image, block: TextBlock, pad: float = 0.10) -> Image.Image:
     """Crop an equation region from the page image with proportional padding."""
     x0, y0, x1, y1 = block.bbox.x0, block.bbox.y0, block.bbox.x1, block.bbox.y1
     pw = max(1, int((x1 - x0) * pad))
@@ -190,6 +223,9 @@ def process_equations(
         raw = json.loads(jp.read_text())
         blocks = [TextBlock.from_dict(b) for b in raw["blocks"]]
         _assign_block_types(blocks, layout_by_page.get(pn, []))
+        blocks = _strip_header_footer(blocks, raw.get("image_height", 0))
+        blocks = _remove_eq_numbers(blocks)
+        blocks = _consolidate_figures(blocks)
 
         eq_indices: list[int] = []
         eq_crops:   list[Image.Image] = []
