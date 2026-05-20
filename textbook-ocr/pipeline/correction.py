@@ -25,6 +25,7 @@ _RE_HTML = re.compile(r"<[^>]+>")
 _RE_SECTION_NUM = re.compile(r'^(?:Chapter\s+)?\d+(?:\.\d+)*$', re.IGNORECASE)
 _RE_OUTER_FENCE = re.compile(r'^```\w*\n(.*)\n```$', re.DOTALL)
 _RE_DEEP_SECTION_NUM = re.compile(r'^\d+(?:\.\d+){3,}(?:\s|$)')
+_RE_ORDERED_ITEM = re.compile(r'^\d+\.\s')
 
 _SYSTEM_PROMPT = (
     "You are a precise technical document formatter. "
@@ -49,6 +50,7 @@ _SYSTEM_PROMPT = (
     "- [EQUATION]        → $$<latex verbatim>$$\n"
     "- [EQUATION_FAILED] → $$% OCR failed\\n<raw text, HTML stripped>$$\n"
     "- [LIST_ITEM]       → `- ...` (strip leading •, -, * characters)\n"
+    "- [ORDERED_ITEM]    → N. <text> (numeric list item, not bullet)\n"
     "- [FIGURE]          → `> [Figure]` on its own line\n"
     "- [FIGURE+CAPTION]  → `> [Figure]` on its own line, then caption as a plain paragraph on the next line\n"
     "- [CAPTION]         → caption as a plain paragraph on its own line\n"
@@ -227,7 +229,7 @@ def _fix_figure_format(markdown: str) -> str:
 
 
 _RE_BLOCK_TAG = re.compile(
-    r'^\[(?:TEXT|EQUATION|HEADING|FIGURE|CAPTION|TABLE|LIST_ITEM|FOOTNOTE|UNKNOWN)[^\]]*\]\s*',
+    r'^\[(?:TEXT|EQUATION|HEADING|FIGURE|CAPTION|TABLE|LIST_ITEM|ORDERED_ITEM|FOOTNOTE|UNKNOWN)[^\]]*\]\s*',
     re.MULTILINE,
 )
 
@@ -242,8 +244,11 @@ def _serialize_block(block: TextBlock) -> str:
     if block.block_type == BlockType.FIGURE:
         caption = _strip_html(block.raw_text).strip()
         return f"[FIGURE+CAPTION] {caption}" if caption else "[FIGURE]"
+    text = _strip_html(block.raw_text)
+    if block.block_type == BlockType.LIST_ITEM and _RE_ORDERED_ITEM.match(text):
+        return f"[ORDERED_ITEM] {text}"
     tag = block.block_type.value.upper()
-    return f"[{tag}] {_strip_html(block.raw_text)}"
+    return f"[{tag}] {text}"
 
 
 def build_prompt(blocks: list[TextBlock]) -> str:
