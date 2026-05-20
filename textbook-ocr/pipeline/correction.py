@@ -70,7 +70,12 @@ _SYSTEM_PROMPT = (
     "  (Caption is a plain paragraph immediately below. NEVER on the same line as > [Figure].)\n\n"
     "CRITICAL: NEVER emit block-type tags ([TEXT], [EQUATION], [HEADING], [FIGURE], "
     "[CAPTION], [TABLE], [LIST_ITEM], [FOOTNOTE], [UNKNOWN]) in your output. "
-    "These are INPUT annotations only."
+    "These are INPUT annotations only.\n\n"
+    "MATH DISPLAY RULES:\n"
+    "- $$...$$ (display) only for standalone equations on their own line.\n"
+    "- $...$ (inline) for all math embedded within a sentence or paragraph.\n"
+    "- If an expression is surrounded by prose on the same line in the input, it is inline.\n"
+    "- NEVER break a sentence with $$...$$."
 )
 
 
