@@ -50,8 +50,8 @@ _SYSTEM_PROMPT = (
     "- [EQUATION_FAILED] → $$% OCR failed\\n<raw text, HTML stripped>$$\n"
     "- [LIST_ITEM]       → `- ...` (strip leading •, -, * characters)\n"
     "- [FIGURE]          → `> [Figure]` on its own line\n"
-    "- [FIGURE+CAPTION]  → `> [Figure]` on its own line, then *caption text* on the next line\n"
-    "- [CAPTION]         → *<text>* on its own line\n"
+    "- [FIGURE+CAPTION]  → `> [Figure]` on its own line, then caption as a plain paragraph on the next line\n"
+    "- [CAPTION]         → caption as a plain paragraph on its own line\n"
     "- [TABLE]           → Markdown table if parseable, else fenced code block\n"
     "- [FOOTNOTE]        → [^1]: <text> (markdown footnote; number incrementally per page)\n"
     "- [UNKNOWN]         → apply in order:\n"
@@ -62,7 +62,12 @@ _SYSTEM_PROMPT = (
     "    d) Otherwise: plain paragraph\n\n"
     "Additional:\n"
     "- Strip all HTML tags from raw text before emitting.\n"
-    "- No preamble, no trailing notes."
+    "- No preamble, no trailing notes.\n\n"
+    "FIGURE FORMAT EXAMPLE (follow exactly):\n"
+    "  Input:  [FIGURE+CAPTION] Fig. 3.1. Electron density as a function of radius.\n"
+    "  Output: > [Figure]\n"
+    "          Fig. 3.1. Electron density as a function of radius.\n"
+    "  (Caption is a plain paragraph immediately below. NEVER on the same line as > [Figure].)"
 )
 
 
@@ -195,6 +200,24 @@ def _fix_leading_text_heading(markdown: str, input_blocks: list[TextBlock]) -> s
     return "\n".join(lines)
 
 
+def _fix_figure_format(markdown: str) -> str:
+    """Ensure > [Figure] is always followed by caption on the next line, not inline."""
+    lines = markdown.splitlines()
+    result = []
+    for line in lines:
+        m = re.match(r'^(>\s*\[Figure\])\s+(.+)$', line, re.IGNORECASE)
+        if m:
+            result.append(m.group(1))
+            result.append("")
+            result.append(m.group(2).strip("*"))
+        else:
+            if result and _RE_FIGURE_LINE.match(result[-1]) and re.match(r'^\*(.+)\*$', line):
+                result.append(line.strip("*"))
+            else:
+                result.append(line)
+    return "\n".join(result)
+
+
 def _serialize_block(block: TextBlock) -> str:
     if block.block_type == BlockType.EQUATION and block.latex:
         return f"[EQUATION] {block.latex}"
@@ -248,6 +271,7 @@ def correct_page(page_num: int, blocks: list[TextBlock], model: str = _OLLAMA_MO
     resp.raise_for_status()
     result = _strip_outer_fence(resp.json()["message"]["content"].strip())
     result = _fix_figure_hallucination(result, blocks)
+    result = _fix_figure_format(result)
     result = _fix_leading_text_heading(result, blocks)
     return result
 
