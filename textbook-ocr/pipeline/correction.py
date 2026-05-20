@@ -67,7 +67,10 @@ _SYSTEM_PROMPT = (
     "  Input:  [FIGURE+CAPTION] Fig. 3.1. Electron density as a function of radius.\n"
     "  Output: > [Figure]\n"
     "          Fig. 3.1. Electron density as a function of radius.\n"
-    "  (Caption is a plain paragraph immediately below. NEVER on the same line as > [Figure].)"
+    "  (Caption is a plain paragraph immediately below. NEVER on the same line as > [Figure].)\n\n"
+    "CRITICAL: NEVER emit block-type tags ([TEXT], [EQUATION], [HEADING], [FIGURE], "
+    "[CAPTION], [TABLE], [LIST_ITEM], [FOOTNOTE], [UNKNOWN]) in your output. "
+    "These are INPUT annotations only."
 )
 
 
@@ -218,6 +221,16 @@ def _fix_figure_format(markdown: str) -> str:
     return "\n".join(result)
 
 
+_RE_BLOCK_TAG = re.compile(
+    r'^\[(?:TEXT|EQUATION|HEADING|FIGURE|CAPTION|TABLE|LIST_ITEM|FOOTNOTE|UNKNOWN)[^\]]*\]\s*',
+    re.MULTILINE,
+)
+
+
+def _scrub_block_tags(markdown: str) -> str:
+    return _RE_BLOCK_TAG.sub("", markdown)
+
+
 def _serialize_block(block: TextBlock) -> str:
     if block.block_type == BlockType.EQUATION and block.latex:
         return f"[EQUATION] {block.latex}"
@@ -273,6 +286,7 @@ def correct_page(page_num: int, blocks: list[TextBlock], model: str = _OLLAMA_MO
     result = _fix_figure_hallucination(result, blocks)
     result = _fix_figure_format(result)
     result = _fix_leading_text_heading(result, blocks)
+    result = _scrub_block_tags(result)
     return result
 
 
