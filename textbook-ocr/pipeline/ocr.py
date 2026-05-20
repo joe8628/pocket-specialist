@@ -19,7 +19,6 @@ from PIL import Image
 
 from config import OCR_DIR, RENDER_DIR
 from pipeline.checkpoint import init_db, set_status, should_process, get_status
-from pipeline.layout import reorder_columns
 from pipeline.models import BlockType, BoundingBox, TextBlock
 
 
@@ -119,7 +118,7 @@ def ocr_pages(
             w, h = image.size
 
             blocks = _surya_ocr_page(image, det_predictor, rec_predictor)
-            ordered = reorder_columns(blocks, page_width=float(w))
+            ordered = sorted(blocks, key=lambda b: b.bbox.y0)
 
             record = {
                 "page_num":     pn,
