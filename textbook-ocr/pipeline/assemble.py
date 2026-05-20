@@ -27,6 +27,17 @@ def extract_latex_blocks(markdown_text: str) -> list[str]:
     return [m.strip() for m in _RE_LATEX_BLOCK.findall(markdown_text)]
 
 
+def _deduplicate(content: str) -> str:
+    seen: set[str] = set()
+    result: list[str] = []
+    for block in re.split(r'\n{2,}', content):
+        key = block.strip()
+        if key and key not in seen:
+            seen.add(key)
+            result.append(block)
+    return "\n\n".join(result)
+
+
 def _page_num(path: Path) -> int:
     return int(path.stem.split("_")[1])
 
@@ -81,11 +92,11 @@ def _collect_pages(
     result: list[tuple[int, str | None]] = []
     for pn in all_nums:
         if pn in md_by_page:
-            result.append((pn, md_by_page[pn]))
+            result.append((pn, _deduplicate(md_by_page[pn])))
         elif pn in json_by_page:
             raw = json.loads(json_by_page[pn].read_text())
             blocks = [TextBlock.from_dict(b) for b in raw["blocks"]]
-            result.append((pn, _format_blocks_as_markdown(blocks)))
+            result.append((pn, _deduplicate(_format_blocks_as_markdown(blocks))))
         else:
             result.append((pn, None))
     return result
