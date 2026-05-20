@@ -38,6 +38,22 @@ def _deduplicate(content: str) -> str:
     return "\n\n".join(result)
 
 
+def _unwrap_spurious_containers(markdown: str) -> str:
+    lines = markdown.splitlines()
+    result = []
+    for line in lines:
+        if re.match(r'^>\s', line) and not re.search(r'\[Figure\]', line, re.IGNORECASE):
+            result.append(line[2:])
+        else:
+            result.append(line)
+    content = "\n".join(result)
+    content = re.sub(
+        r'```\w*\n((?:[^`]|\n)*?\$\$(?:[^`]|\n)*?)```',
+        r'\1', content
+    )
+    return content
+
+
 def _page_num(path: Path) -> int:
     return int(path.stem.split("_")[1])
 
@@ -92,11 +108,11 @@ def _collect_pages(
     result: list[tuple[int, str | None]] = []
     for pn in all_nums:
         if pn in md_by_page:
-            result.append((pn, _deduplicate(md_by_page[pn])))
+            result.append((pn, _deduplicate(_unwrap_spurious_containers(md_by_page[pn]))))
         elif pn in json_by_page:
             raw = json.loads(json_by_page[pn].read_text())
             blocks = [TextBlock.from_dict(b) for b in raw["blocks"]]
-            result.append((pn, _deduplicate(_format_blocks_as_markdown(blocks))))
+            result.append((pn, _deduplicate(_unwrap_spurious_containers(_format_blocks_as_markdown(blocks)))))
         else:
             result.append((pn, None))
     return result
