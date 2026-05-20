@@ -24,6 +24,7 @@ _OLLAMA_NUM_CTX = 8192
 _RE_HTML = re.compile(r"<[^>]+>")
 _RE_SECTION_NUM = re.compile(r'^(?:Chapter\s+)?\d+(?:\.\d+)*$', re.IGNORECASE)
 _RE_OUTER_FENCE = re.compile(r'^```\w*\n(.*)\n```$', re.DOTALL)
+_RE_DEEP_SECTION_NUM = re.compile(r'^\d+(?:\.\d+){3,}(?:\s|$)')
 
 _SYSTEM_PROMPT = (
     "You are a precise technical document formatter. "
@@ -36,8 +37,13 @@ _SYSTEM_PROMPT = (
     "3. [EQUATION]: emit the LaTeX VERBATIM inside $$...$$. "
     "Do NOT add rows, terms, symbols, or close unclosed environments.\n\n"
     "Block-type rules:\n"
-    "- [HEADING]         → heading level by depth: "
-    "'Chapter N' or single number → ##; 'N.M' → ##; 'N.M.P' → ###\n"
+    "- [HEADING]         → heading level by depth:\n"
+    "    'Chapter N' or single integer → ##\n"
+    "    'N.M' (one dot) → ##\n"
+    "    'N.M.P' (two dots) → ###\n"
+    "    'N.M.P.Q' or deeper (three+ dots) → ####\n"
+    "    No number, or bold phrase not matching the above → plain paragraph (**not** a heading)\n"
+    "    NEVER promote a [TEXT] block to a heading regardless of its content.\n"
     "- [TEXT]            → plain paragraph. "
     "NEVER a heading, even as the first or only block on the page.\n"
     "- [EQUATION]        → $$<latex verbatim>$$\n"
@@ -168,16 +174,24 @@ def _fix_figure_hallucination(markdown: str, input_blocks: list[TextBlock]) -> s
 
 def _fix_leading_text_heading(markdown: str, input_blocks: list[TextBlock]) -> str:
     """Strip accidental heading markers from the first output line when the first
-    input block is TEXT (qwen2.5:7b sometimes promotes it to a heading anyway)."""
-    if not input_blocks or input_blocks[0].block_type != BlockType.TEXT:
-        return markdown
+    input block is TEXT. Also normalizes headings deeper than #### to ####."""
     lines = markdown.splitlines()
+
+    if input_blocks and input_blocks[0].block_type == BlockType.TEXT:
+        for idx, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped:
+                if stripped.startswith("#"):
+                    lines[idx] = stripped.lstrip("#").strip()
+                break
+
+    # Normalize any #### or deeper heading whose text starts with a 3+ dot section
+    # number (e.g. 7.3.2.1) to exactly ####; catches LLM over-nesting.
     for idx, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped:
-            if stripped.startswith("#"):
-                lines[idx] = stripped.lstrip("#").strip()
-            break
+        m = re.match(r'^(#{4,})\s+(.*)', line)
+        if m and _RE_DEEP_SECTION_NUM.match(m.group(2).strip()):
+            lines[idx] = f"#### {m.group(2).strip()}"
+
     return "\n".join(lines)
 
 
