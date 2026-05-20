@@ -17,9 +17,11 @@ OCR_DIR  = CHECKPOINT_DIR / "ocr"
 OCR_LANG = "en"
 
 # ── Stage 3: Equations ────────────────────────────────────────────────────────
-EQUATIONS_DIR         = CHECKPOINT_DIR / "equations"
-CROPS_DIR             = CHECKPOINT_DIR / "crops"
+EQUATIONS_DIR           = CHECKPOINT_DIR / "equations"
+CROPS_DIR               = CHECKPOINT_DIR / "crops"
 EQUATION_CONF_THRESHOLD = 0.5
+HEADER_STRIP_RATIO      = 0.10   # top N% of page height stripped as running header
+FOOTER_STRIP_RATIO      = 0.90   # bottom N% threshold (content below this is stripped)
 
 # ── Stage 4: LLM Correction (Ollama) ─────────────────────────────────────────
 CORRECTION_DIR   = CHECKPOINT_DIR / "corrected"

@@ -25,7 +25,7 @@ from typing import Optional
 import torch
 from PIL import Image
 
-from config import CROPS_DIR, EQUATION_CONF_THRESHOLD, EQUATIONS_DIR, OCR_DIR, RENDER_DIR
+from config import CROPS_DIR, EQUATION_CONF_THRESHOLD, EQUATIONS_DIR, FOOTER_STRIP_RATIO, HEADER_STRIP_RATIO, OCR_DIR, RENDER_DIR
 from pipeline.checkpoint import get_status, init_db, set_status, should_process
 from pipeline.models import BlockType, TextBlock
 
@@ -126,9 +126,9 @@ def _assign_block_types(blocks: list[TextBlock], layout_boxes: list) -> list[Tex
 
 
 def _strip_header_footer(blocks: list[TextBlock], page_height: float) -> list[TextBlock]:
-    """Drop running-header/page-number (top 8%) and publisher-footer (bottom 8%) blocks."""
-    top = page_height * 0.08
-    bot = page_height * 0.90
+    """Drop running-header/page-number (top HEADER_STRIP_RATIO) and footer blocks."""
+    top = page_height * HEADER_STRIP_RATIO
+    bot = page_height * FOOTER_STRIP_RATIO
     return [b for b in blocks if top < (b.bbox.y0 + b.bbox.y1) / 2 < bot]
 
 
