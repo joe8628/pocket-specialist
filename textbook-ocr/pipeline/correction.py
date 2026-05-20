@@ -268,26 +268,70 @@ def _check_ollama(model: str) -> None:
         sys.exit(1)
 
 
-def correct_page(page_num: int, blocks: list[TextBlock], model: str = _OLLAMA_MODEL) -> str:
-    """Run Ollama correction on one page. Returns corrected Markdown string."""
+def _coverage_ok(blocks: list[TextBlock], markdown: str, min_ratio: float = 0.50) -> bool:
+    input_words = sum(
+        len(b.raw_text.split())
+        for b in blocks
+        if b.block_type in (BlockType.TEXT, BlockType.HEADING, BlockType.LIST_ITEM)
+    )
+    output_words = len(markdown.split())
+    return input_words == 0 or (output_words / input_words) >= min_ratio
+
+
+def _post_process(markdown: str, blocks: list[TextBlock]) -> str:
+    markdown = _strip_outer_fence(markdown)
+    markdown = _fix_figure_hallucination(markdown, blocks)
+    markdown = _fix_figure_format(markdown)
+    markdown = _fix_leading_text_heading(markdown, blocks)
+    markdown = _scrub_block_tags(markdown)
+    return markdown
+
+
+def correct_page(
+    page_num: int, blocks: list[TextBlock], model: str = _OLLAMA_MODEL
+) -> tuple[str, bool]:
+    """Run Ollama correction on one page.
+
+    Returns (markdown, truncated) where truncated=True if the output failed
+    coverage after one retry.
+    """
     user_content = build_prompt(blocks)
+    messages: list[dict] = [
+        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "user",   "content": user_content},
+    ]
     payload = {
         "model": model,
-        "messages": [
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user",   "content": user_content},
-        ],
+        "messages": messages,
         "options": {"num_ctx": _OLLAMA_NUM_CTX},
         "stream": False,
     }
     resp = requests.post(f"{_OLLAMA_BASE}/api/chat", json=payload, timeout=120)
     resp.raise_for_status()
-    result = _strip_outer_fence(resp.json()["message"]["content"].strip())
-    result = _fix_figure_hallucination(result, blocks)
-    result = _fix_figure_format(result)
-    result = _fix_leading_text_heading(result, blocks)
-    result = _scrub_block_tags(result)
-    return result
+    result = _post_process(resp.json()["message"]["content"].strip(), blocks)
+
+    if _coverage_ok(blocks, result):
+        return result, False
+
+    # Retry once with an explicit coverage nudge
+    messages = messages + [
+        {"role": "assistant", "content": result},
+        {
+            "role": "user",
+            "content": (
+                "WARNING: your previous output was missing content. "
+                "Reproduce ALL blocks from the input."
+            ),
+        },
+    ]
+    payload["messages"] = messages
+    resp2 = requests.post(f"{_OLLAMA_BASE}/api/chat", json=payload, timeout=120)
+    resp2.raise_for_status()
+    result2 = _post_process(resp2.json()["message"]["content"].strip(), blocks)
+    truncated = not _coverage_ok(blocks, result2)
+    if truncated:
+        print(f"  [correction] page {page_num}: coverage still low after retry — flagging as truncated.", file=sys.stderr)
+    return result2, truncated
 
 
 def correct_pages(
@@ -342,9 +386,11 @@ def correct_pages(
         try:
             raw = json.loads(jp.read_text())
             blocks = [TextBlock.from_dict(b) for b in raw["blocks"]]
-            markdown = correct_page(pn, blocks, model)
+            markdown, truncated = correct_page(pn, blocks, model)
             if not markdown:
                 raise ValueError("Ollama returned empty output")
+            if truncated:
+                markdown = f"<!-- WARNING: page {pn} may be truncated -->\n\n{markdown}"
             out_path = correction_dir / f"page_{pn:04d}.md"
             out_path.write_text(markdown, encoding="utf-8")
             set_status("correction", pn, "done", str(out_path))
