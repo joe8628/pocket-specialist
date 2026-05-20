@@ -10,9 +10,21 @@ typer>=0.12.0
 # Stage 2 — OCR (Surya, GPU via PyTorch)
 surya-ocr>=0.17.0
 
-# Stage 3 — Equations (Surya layout detection + Surya LaTeX OCR)
-# surya-ocr (already above) provides both layout and LaTeX OCR predictors
-# texify was archived Jan 2025; replaced by surya's RecognitionPredictor + TaskNames.block_without_boxes
+# Stage 3 — Equations (Surya layout detection + UniMERNet LaTeX OCR)
+# surya-ocr provides layout and reading-order predictors (Phase 1).
+# UniMERNet replaces Surya's general-purpose LaTeX OCR for equation crops (Phase 2).
+#
+# INSTALL ORDER MATTERS: install surya-ocr before unimernet.
+# unimernet pins transformers==4.42.4 but surya-ocr requires >=4.56.1.
+# Installing surya-ocr first satisfies >=4.56.1; unimernet's pin is then ignored
+# (pip keeps the newer version already present).
+# Remaining unimernet deps that are intentionally newer than its pins:
+#   webdataset>=1.0 (unimernet wants <0.3), timm>=0.5 (unimernet wants >=0.9.16)
+# Both work fine at the versions already pulled in by other packages.
+unimernet==0.2.3
+fairscale>=0.4.13
+evaluate>=0.4.1
+webdataset>=0.2.86
 
 # Stage 4 — LLM correction (Ollama)
 # Requires Ollama running locally: https://ollama.com

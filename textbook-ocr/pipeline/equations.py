@@ -1,12 +1,11 @@
-"""Stage 3: Surya layout detection + Surya LaTeX OCR on equation regions.
+"""Stage 3: Surya layout detection + UniMERNet LaTeX OCR on equation regions.
 
 Two phases within one stage — single VRAM budget, sequential model loads:
 
   Phase 1 (Surya Layout):   identifies Equation / Text / Heading / Figure / Table regions
                             across all pages in a single model load, then unloads.
-  Phase 2 (Surya LaTeX OCR): crops each equation region, converts to LaTeX using
-                            RecognitionPredictor with TaskNames.block_without_boxes,
-                            then unloads. No separate texify model needed.
+  Phase 2 (UniMERNet):      crops each equation region, converts to LaTeX using
+                            UniMERNet (wanderkid/unimernet_base), then unloads.
 
 Input:  checkpoints/rendered/page_{N:04d}.png   (from Stage 1)
         checkpoints/ocr/page_{N:04d}.json       (from Stage 2)
@@ -58,16 +57,47 @@ def _load_layout():
     return LayoutPredictor(foundation), foundation
 
 
-def _load_latex_ocr():
+def _load_unimernet(device: torch.device) -> tuple:
+    # Backfill three helpers that moved from modeling_utils → pytorch_utils in transformers >4.42
+    import transformers.modeling_utils as _mu
+    if not hasattr(_mu, "apply_chunking_to_forward"):
+        from transformers.pytorch_utils import (
+            apply_chunking_to_forward,
+            find_pruneable_heads_and_indices,
+            prune_linear_layer,
+        )
+        _mu.apply_chunking_to_forward = apply_chunking_to_forward
+        _mu.find_pruneable_heads_and_indices = find_pruneable_heads_and_indices
+        _mu.prune_linear_layer = prune_linear_layer
+
     try:
-        from surya.foundation import FoundationPredictor
-        from surya.recognition import RecognitionPredictor
-        from surya.settings import settings
+        from huggingface_hub import snapshot_download
+        from omegaconf import OmegaConf
+        import unimernet.models  # trigger registry population
+        from unimernet.models.unimernet.unimernet import UniMERModel
+        from unimernet.processors.formula_processor import FormulaImageEvalProcessor
     except ImportError:
-        print("Error: surya-ocr is not installed. Run: pip install surya-ocr", file=sys.stderr)
+        print("Error: unimernet is not installed. See textbook-ocr/requirements.txt.", file=sys.stderr)
         sys.exit(1)
-    foundation = FoundationPredictor(checkpoint=settings.RECOGNITION_MODEL_CHECKPOINT)
-    return RecognitionPredictor(foundation), foundation
+
+    model_dir = snapshot_download("wanderkid/unimernet_base")
+    model_cfg = OmegaConf.create({
+        "arch": "unimernet",
+        "model_type": "unimernet",
+        "load_finetuned": False,
+        "load_pretrained": True,
+        "pretrained": str(Path(model_dir) / "pytorch_model.pth"),
+        "tokenizer_name": "nougat",
+        "tokenizer_config": {"path": model_dir},
+        "model_name": model_dir,
+        "model_config": {"max_seq_len": 384},
+    })
+    model = UniMERModel.from_config(model_cfg).to(device)
+    model.eval()
+
+    vis_cfg = OmegaConf.create({"name": "formula_image_eval", "image_size": [192, 672]})
+    vis_processor = FormulaImageEvalProcessor.from_config(vis_cfg)
+    return model, vis_processor
 
 
 def _load_order():
@@ -269,13 +299,13 @@ def process_equations(
         torch.cuda.empty_cache()
     print("  Surya Layout and Order predictors unloaded from GPU.")
 
-    # ── Phase 2: Surya LaTeX OCR on equation crops ───────────────────────────
-    print("Loading Surya LaTeX OCR (GPU)...")
-    latex_predictor, latex_foundation = _load_latex_ocr()
-    from surya.common.surya.schema import TaskNames
-    print("Surya LaTeX OCR loaded.")
+    # ── Phase 2: UniMERNet LaTeX OCR on equation crops ───────────────────────
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Loading UniMERNet (wanderkid/unimernet_base, GPU)...")
+    uni_model, vis_processor = _load_unimernet(device)
+    print("UniMERNet loaded.")
 
-    # Collect all crops across all pages first, then run one batched inference.
+    # Collect all crops across all pages first, then run batched inference.
     page_data: list[tuple[int, dict, list[TextBlock], list[int], list[Image.Image], list[tuple[int, str]]]] = []
     all_crops: list[Image.Image] = []
 
@@ -306,23 +336,22 @@ def process_equations(
         page_data.append((pn, raw, blocks, eq_indices, eq_crops, pending_tags))
         all_crops.extend(eq_crops)
 
-    # Batch inference over all crops at once
+    # Batched inference — UniMERNet processes fixed-size [1, 192, 672] tensors
+    _BATCH = 32
+    latex_list: list[str] = []
     if all_crops:
-        tasks  = [TaskNames.block_without_boxes] * len(all_crops)
-        bboxes = [[[0, 0, c.width, c.height]] for c in all_crops]
-        results = latex_predictor(all_crops, tasks, bboxes=bboxes)
-        latex_list = [
-            r.text_lines[0].text.strip() if r.text_lines else ""
-            for r in results
-        ]
-    else:
-        latex_list = []
+        for i in range(0, len(all_crops), _BATCH):
+            batch = all_crops[i : i + _BATCH]
+            images = torch.stack([vis_processor(c) for c in batch]).to(device)
+            with torch.no_grad():
+                output = uni_model.generate({"image": images})
+            latex_list.extend(output["pred_str"])
 
-    del latex_predictor, latex_foundation
+    del uni_model, vis_processor
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    print("  Surya LaTeX OCR unloaded from GPU.")
+    print("  UniMERNet unloaded from GPU.")
 
     # Write output JSONs
     done = failed = 0
