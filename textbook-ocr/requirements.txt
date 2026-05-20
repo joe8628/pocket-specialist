@@ -28,7 +28,7 @@ webdataset>=0.2.86
 
 # Stage 4 — LLM correction (Ollama)
 # Requires Ollama running locally: https://ollama.com
-# Pull the model: ollama pull qwen2.5:7b
+# Pull the model: ollama pull qwen2.5vl:7b
 requests>=2.31.0
 
 # Shared GPU utilities (pulled in by surya-ocr, listed explicitly for clarity)

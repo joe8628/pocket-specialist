@@ -13,13 +13,12 @@ from typing import Optional
 
 import requests
 
-from config import CORRECTION_DIR, EQUATIONS_DIR, RENDER_DIR
+from config import CORRECTION_DIR, EQUATIONS_DIR, OLLAMA_MODEL, RENDER_DIR
 from pipeline.checkpoint import get_status, init_db, set_status, should_process
 from pipeline.models import BlockType, TextBlock
 
 
 _OLLAMA_BASE = "http://localhost:11434"
-_OLLAMA_MODEL = "qwen2.5vl:7b"
 _OLLAMA_NUM_CTX = 8192
 
 _RE_HTML = re.compile(r"<[^>]+>")
@@ -305,7 +304,7 @@ def _post_process(markdown: str, blocks: list[TextBlock]) -> str:
 def correct_page(
     page_num: int,
     blocks: list[TextBlock],
-    model: str = _OLLAMA_MODEL,
+    model: str = OLLAMA_MODEL,
     image_path: Optional[Path] = None,
 ) -> tuple[str, bool]:
     """Run Ollama correction on one page.
@@ -360,7 +359,7 @@ def correct_page(
 def correct_pages(
     equations_dir: Path = EQUATIONS_DIR,
     correction_dir: Path = CORRECTION_DIR,
-    model: str = _OLLAMA_MODEL,
+    model: str = OLLAMA_MODEL,
     start_page: Optional[int] = None,
     end_page: Optional[int] = None,
 ) -> tuple[int, int]:

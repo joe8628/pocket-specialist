@@ -5,6 +5,8 @@ from pathlib import Path
 
 import typer
 
+from config import OLLAMA_MODEL
+
 app = typer.Typer(
     help="TextbookOCR: GPU-accelerated PDF → structured Markdown pipeline.",
     no_args_is_help=True,
@@ -113,7 +115,7 @@ def equations(
 def correct(
     start_page: int = typer.Option(None, "--start-page"),
     end_page: int = typer.Option(None, "--end-page"),
-    ollama_model: str = typer.Option("qwen2.5:7b", "--ollama-model", help="Ollama model name."),
+    ollama_model: str = typer.Option(OLLAMA_MODEL, "--ollama-model", help="Ollama model name."),
 ) -> None:
     """Stage 4: Ollama LLM Markdown correction pass."""
     from config import EQUATIONS_DIR, CORRECTION_DIR
@@ -156,7 +158,7 @@ def _run_pipeline(
     start_page: int | None,
     end_page: int | None,
     zoom: float,
-    ollama_model: str = "qwen2.5:7b",
+    ollama_model: str = OLLAMA_MODEL,
     no_llm: bool = False,
     output_dir: Path | None = None,
 ) -> None:
@@ -215,7 +217,7 @@ def run(
     end_page: int = typer.Option(None, "--end-page", help="Last page inclusive (default: last)."),
     zoom: float = typer.Option(2.0, "--zoom"),
     no_llm: bool = typer.Option(False, "--no-llm", help="Skip Stage 4 LLM correction."),
-    ollama_model: str = typer.Option("qwen2.5:7b", "--ollama-model", help="Ollama model for Stage 4."),
+    ollama_model: str = typer.Option(OLLAMA_MODEL, "--ollama-model", help="Ollama model for Stage 4."),
     output_dir: Path = typer.Option(None, "--output-dir", help="Output directory (default: output/)."),
 ) -> None:
     """Run all pipeline stages (1–5) on a single PDF."""
@@ -237,7 +239,7 @@ def run_all(
     end_page: int = typer.Option(None, "--end-page", help="Last page per PDF (default: last)."),
     zoom: float = typer.Option(2.0, "--zoom"),
     no_llm: bool = typer.Option(False, "--no-llm", help="Skip Stage 4 LLM correction."),
-    ollama_model: str = typer.Option("qwen2.5:7b", "--ollama-model", help="Ollama model for Stage 4."),
+    ollama_model: str = typer.Option(OLLAMA_MODEL, "--ollama-model", help="Ollama model for Stage 4."),
     output_dir: Path = typer.Option(None, "--output-dir", help="Output directory (default: output/)."),
 ) -> None:
     """Run all pipeline stages (1–5) on every PDF in the corpus."""
