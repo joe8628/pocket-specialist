@@ -353,9 +353,22 @@ def process_equations(
         torch.cuda.empty_cache()
     print("  UniMERNet unloaded from GPU.")
 
+    # ── Phase 2b: TATR table structure recognition ────────────────────────────
+    from pipeline.table_structure import extract_table_markdown, load_tatr, release_tatr
+
+    _table_pages = {pn for pn, _, blocks, _, _, _ in page_data
+                    if any(b.block_type == BlockType.TABLE for b in blocks)}
+
+    tatr_model = tatr_proc = None
+    if _table_pages:
+        print("Loading TATR for table structure recognition (GPU)...")
+        tatr_model, tatr_proc = load_tatr()
+        print("TATR loaded.")
+
     # Write output JSONs
     done = failed = 0
     crop_offset = 0
+    prev_table_headers: list[str] = []
     for pn, raw, blocks, eq_indices, eq_crops, pending_tags in page_data:
         try:
             for i, idx in enumerate(eq_indices):
@@ -368,18 +381,41 @@ def process_equations(
             crop_offset += len(eq_crops)
             _apply_eq_tags(blocks, pending_tags)
 
+            # Table structure: run TATR on each TABLE block
+            if tatr_model and pn in _table_pages:
+                png = render_dir / f"page_{pn:04d}.png"
+                if png.exists():
+                    page_image = Image.open(png).convert("RGB")
+                    for b in blocks:
+                        if b.block_type != BlockType.TABLE:
+                            continue
+                        crop = _crop_equation(page_image, b, pad=0.02)
+                        md, prev_table_headers = extract_table_markdown(
+                            tatr_model, tatr_proc, crop, b.bbox, blocks,
+                            prev_headers=prev_table_headers or None,
+                        )
+                        if md:
+                            b.raw_text = md
+            elif pn not in _table_pages:
+                prev_table_headers = []
+
             out = dict(raw, blocks=[b.to_dict() for b in blocks])
             out_path = equations_dir / f"page_{pn:04d}.json"
             out_path.write_text(json.dumps(out, indent=2, ensure_ascii=False))
 
             set_status("equations", pn, "done", str(out_path))
             done += 1
-            print(f"  [equations] page {pn} → {out_path.name}  ({len(eq_crops)} equations extracted)")
+            tbl_count = sum(1 for b in blocks if b.block_type == BlockType.TABLE)
+            print(f"  [equations] page {pn} → {out_path.name}  ({len(eq_crops)} equations, {tbl_count} tables)")
 
         except Exception as exc:
             set_status("equations", pn, "failed")
             failed += 1
             print(f"  [equations] page {pn}: FAILED — {exc}")
+
+    if tatr_model:
+        release_tatr(tatr_model)
+        print("  TATR unloaded from GPU.")
 
     total_eq = sum(len(eq_crops) for _, _, _, _, eq_crops, _ in page_data)
     print(f"\nEquations complete: {done} done, {skipped} skipped, {failed + pre_failed} failed. ({total_eq} equation crops total)")
