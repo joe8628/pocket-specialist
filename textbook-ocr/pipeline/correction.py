@@ -4,6 +4,7 @@ Input:  checkpoints/equations/page_{N:04d}.json  (from Stage 3)
 Output: checkpoints/corrected/page_{N:04d}.md    (clean Markdown per page)
 """
 from __future__ import annotations
+import base64
 import json
 import re
 import sys
@@ -12,13 +13,13 @@ from typing import Optional
 
 import requests
 
-from config import CORRECTION_DIR, EQUATIONS_DIR
+from config import CORRECTION_DIR, EQUATIONS_DIR, RENDER_DIR
 from pipeline.checkpoint import get_status, init_db, set_status, should_process
 from pipeline.models import BlockType, TextBlock
 
 
 _OLLAMA_BASE = "http://localhost:11434"
-_OLLAMA_MODEL = "qwen2.5:7b"
+_OLLAMA_MODEL = "qwen2.5vl:7b"
 _OLLAMA_NUM_CTX = 8192
 
 _RE_HTML = re.compile(r"<[^>]+>")
@@ -79,6 +80,10 @@ _SYSTEM_PROMPT = (
     "- If an expression is surrounded by prose on the same line in the input, it is inline.\n"
     "- NEVER break a sentence with $$...$$."
 )
+
+
+def _encode_image(png_path: Path) -> str:
+    return base64.b64encode(png_path.read_bytes()).decode()
 
 
 def _strip_html(text: str) -> str:
@@ -298,17 +303,25 @@ def _post_process(markdown: str, blocks: list[TextBlock]) -> str:
 
 
 def correct_page(
-    page_num: int, blocks: list[TextBlock], model: str = _OLLAMA_MODEL
+    page_num: int,
+    blocks: list[TextBlock],
+    model: str = _OLLAMA_MODEL,
+    image_path: Optional[Path] = None,
 ) -> tuple[str, bool]:
     """Run Ollama correction on one page.
 
     Returns (markdown, truncated) where truncated=True if the output failed
     coverage after one retry.
     """
-    user_content = build_prompt(blocks)
+    user_parts: list[dict] = [{"type": "text", "text": build_prompt(blocks)}]
+    if image_path and image_path.exists():
+        user_parts.insert(0, {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{_encode_image(image_path)}"},
+        })
     messages: list[dict] = [
         {"role": "system", "content": _SYSTEM_PROMPT},
-        {"role": "user",   "content": user_content},
+        {"role": "user",   "content": user_parts},
     ]
     payload = {
         "model": model,
@@ -396,7 +409,8 @@ def correct_pages(
         try:
             raw = json.loads(jp.read_text())
             blocks = [TextBlock.from_dict(b) for b in raw["blocks"]]
-            markdown, truncated = correct_page(pn, blocks, model)
+            image_path = RENDER_DIR / f"page_{pn:04d}.png"
+            markdown, truncated = correct_page(pn, blocks, model, image_path)
             if not markdown:
                 raise ValueError("Ollama returned empty output")
             if truncated:
