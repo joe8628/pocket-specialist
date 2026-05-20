@@ -47,6 +47,7 @@ _SYSTEM_PROMPT = (
     "- [FIGURE+CAPTION]  → `> [Figure]` on its own line, then *caption text* on the next line\n"
     "- [CAPTION]         → *<text>* on its own line\n"
     "- [TABLE]           → Markdown table if parseable, else fenced code block\n"
+    "- [FOOTNOTE]        → [^1]: <text> (markdown footnote; number incrementally per page)\n"
     "- [UNKNOWN]         → apply in order:\n"
     "    a) Starts with a digit immediately followed by a letter (e.g. '2There...', '1Also...') — OCR footnote: emit as plain paragraph\n"
     "    b) Matches exactly a section-number pattern (digits/dots, e.g. '7.3.2'): heading\n"

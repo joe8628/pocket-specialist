@@ -10,6 +10,7 @@ class BlockType(str, Enum):
     HEADING   = "heading"
     EQUATION  = "equation"
     EQUATION_FAILED = "equation_failed"
+    FOOTNOTE  = "footnote"
     FIGURE    = "figure"
     CAPTION   = "caption"
     TABLE     = "table"

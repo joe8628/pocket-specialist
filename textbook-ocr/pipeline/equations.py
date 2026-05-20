@@ -40,6 +40,7 @@ _LAYOUT_TO_BLOCKTYPE: dict[str, BlockType] = {
     "Caption":       BlockType.CAPTION,
     "Table":         BlockType.TABLE,
     "ListItem":      BlockType.LIST_ITEM,
+    "Footnote":      BlockType.FOOTNOTE,
 }
 
 
