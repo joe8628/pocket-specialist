@@ -99,12 +99,33 @@ def _strip_header_footer(blocks: list[TextBlock], page_height: float) -> list[Te
     return [b for b in blocks if top < (b.bbox.y0 + b.bbox.y1) / 2 < bot]
 
 
-def _remove_eq_numbers(blocks: list[TextBlock]) -> list[TextBlock]:
-    """Drop standalone equation-number labels like (7.53) that are tagged as EQUATION."""
-    return [
-        b for b in blocks
-        if not (b.block_type == BlockType.EQUATION and _RE_EQ_NUMBER.match(b.raw_text))
-    ]
+def _extract_eq_numbers(blocks: list[TextBlock]) -> tuple[list[TextBlock], list[tuple[int, str]]]:
+    """Remove standalone eq-number labels from OCR pass; return filtered blocks + pending tags.
+
+    Each pending tag is (index_in_filtered_blocks, tag_string) so _apply_eq_tags can attach
+    it after LaTeX OCR populates block.latex.
+    """
+    result: list[TextBlock] = []
+    pending: list[tuple[int, str]] = []
+    for b in blocks:
+        if b.block_type == BlockType.EQUATION and _RE_EQ_NUMBER.match(b.raw_text):
+            tag = b.raw_text.strip().strip("()")
+            for i in reversed(range(len(result))):
+                if result[i].block_type == BlockType.EQUATION:
+                    pending.append((i, tag))
+                    break
+        else:
+            result.append(b)
+    return result, pending
+
+
+def _apply_eq_tags(blocks: list[TextBlock], pending: list[tuple[int, str]]) -> None:
+    """Attach \\tag{} labels to equation blocks after LaTeX OCR has populated block.latex."""
+    for idx, tag in pending:
+        if idx < len(blocks) and blocks[idx].latex:
+            suffix = f"\\tag{{{tag}}}"
+            if not blocks[idx].latex.endswith(suffix):
+                blocks[idx].latex = blocks[idx].latex.rstrip() + f"\n{suffix}"
 
 
 def _consolidate_figures(blocks: list[TextBlock]) -> list[TextBlock]:
@@ -214,7 +235,7 @@ def process_equations(
     print("Surya LaTeX OCR loaded.")
 
     # Collect all crops across all pages first, then run one batched inference.
-    page_data: list[tuple[int, dict, list[TextBlock], list[int], list[Image.Image]]] = []
+    page_data: list[tuple[int, dict, list[TextBlock], list[int], list[Image.Image], list[tuple[int, str]]]] = []
     all_crops: list[Image.Image] = []
 
     for jp in to_process:
@@ -224,7 +245,7 @@ def process_equations(
         blocks = [TextBlock.from_dict(b) for b in raw["blocks"]]
         _assign_block_types(blocks, layout_by_page.get(pn, []))
         blocks = _strip_header_footer(blocks, raw.get("image_height", 0))
-        blocks = _remove_eq_numbers(blocks)
+        blocks, pending_tags = _extract_eq_numbers(blocks)
         blocks = _consolidate_figures(blocks)
 
         eq_indices: list[int] = []
@@ -240,7 +261,7 @@ def process_equations(
                     eq_crops.append(crop)
                     eq_indices.append(idx)
 
-        page_data.append((pn, raw, blocks, eq_indices, eq_crops))
+        page_data.append((pn, raw, blocks, eq_indices, eq_crops, pending_tags))
         all_crops.extend(eq_crops)
 
     # Batch inference over all crops at once
@@ -264,7 +285,7 @@ def process_equations(
     # Write output JSONs
     done = failed = 0
     crop_offset = 0
-    for pn, raw, blocks, eq_indices, eq_crops in page_data:
+    for pn, raw, blocks, eq_indices, eq_crops, pending_tags in page_data:
         try:
             for i, idx in enumerate(eq_indices):
                 latex = latex_list[crop_offset + i]
@@ -274,6 +295,7 @@ def process_equations(
                 else:
                     blocks[idx].block_type = BlockType.EQUATION_FAILED
             crop_offset += len(eq_crops)
+            _apply_eq_tags(blocks, pending_tags)
 
             out = dict(raw, blocks=[b.to_dict() for b in blocks])
             out_path = equations_dir / f"page_{pn:04d}.json"
@@ -288,6 +310,6 @@ def process_equations(
             failed += 1
             print(f"  [equations] page {pn}: FAILED — {exc}")
 
-    total_eq = sum(len(eq_crops) for _, _, _, _, eq_crops in page_data)
+    total_eq = sum(len(eq_crops) for _, _, _, _, eq_crops, _ in page_data)
     print(f"\nEquations complete: {done} done, {skipped} skipped, {failed + pre_failed} failed. ({total_eq} equation crops total)")
     return done, failed + pre_failed
