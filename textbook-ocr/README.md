@@ -9,7 +9,7 @@ GPU-accelerated pipeline that converts physics textbook PDFs into clean, structu
 | S0 — Rename corpus | `rename-corpus` | — |
 | S1 — Render pages | `render` | PyMuPDF |
 | S2 — OCR | `ocr` | Surya (detection + recognition) |
-| S3 — Layout + equations + tables | `equations` | Surya layout/order → UniMERNet (`wanderkid/unimernet_base`) → TATR (`microsoft/table-transformer-structure-recognition-v1.1-all`) |
+| S3 — Layout + equations + tables | `equations` | Surya layout → UniMERNet (`wanderkid/unimernet_base`) → TATR (`microsoft/table-transformer-structure-recognition-v1.1-all`) |
 | S4 — LLM correction | `correct` | `qwen2.5vl:7b` via Ollama |
 | S5 — Assemble | `assemble` | — |
 

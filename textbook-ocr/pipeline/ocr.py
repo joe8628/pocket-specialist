@@ -28,8 +28,8 @@ def _load_surya():
         from surya.foundation import FoundationPredictor
         from surya.recognition import RecognitionPredictor
         from surya.settings import settings
-    except ImportError:
-        print("Error: surya-ocr is not installed. Run: pip install surya-ocr", file=sys.stderr)
+    except ImportError as exc:
+        print(f"Error: failed to import surya-ocr modules: {exc}", file=sys.stderr)
         sys.exit(1)
 
     print("  loading detection model...")

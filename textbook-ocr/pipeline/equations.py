@@ -4,6 +4,8 @@ Two phases within one stage — single VRAM budget, sequential model loads:
 
   Phase 1 (Surya Layout):   identifies Equation / Text / Heading / Figure / Table regions
                             across all pages in a single model load, then unloads.
+                            Reading order within a page falls back to y-coordinate sort
+                            (surya.ordering was removed in surya-ocr 0.17).
   Phase 2 (UniMERNet):      crops each equation region, converts to LaTeX using
                             UniMERNet (wanderkid/unimernet_base), then unloads.
 
@@ -50,8 +52,8 @@ def _load_layout():
         from surya.foundation import FoundationPredictor
         from surya.layout import LayoutPredictor
         from surya.settings import settings
-    except ImportError:
-        print("Error: surya-ocr is not installed. Run: pip install surya-ocr", file=sys.stderr)
+    except ImportError as exc:
+        print(f"Error: failed to import surya-ocr layout modules: {exc}", file=sys.stderr)
         sys.exit(1)
     foundation = FoundationPredictor(checkpoint=settings.LAYOUT_MODEL_CHECKPOINT)
     return LayoutPredictor(foundation), foundation
@@ -99,14 +101,6 @@ def _load_unimernet(device: torch.device) -> tuple:
     vis_processor = FormulaImageEvalProcessor.from_config(vis_cfg)
     return model, vis_processor
 
-
-def _load_order():
-    try:
-        from surya.ordering import OrderPredictor
-    except ImportError:
-        print("Error: surya-ocr is not installed. Run: pip install surya-ocr", file=sys.stderr)
-        sys.exit(1)
-    return OrderPredictor()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -267,15 +261,12 @@ def process_equations(
     crops_dir.mkdir(parents=True, exist_ok=True)
     init_db()
 
-    # ── Phase 1: Surya layout detection + reading order across all pages ─────────
+    # ── Phase 1: Surya layout detection across all pages ─────────────────────────
     print("Loading Surya Layout Predictor (GPU)...")
     layout_predictor, layout_foundation = _load_layout()
-    print("Loading Surya Order Predictor (GPU)...")
-    order_predictor = _load_order()
-    print("Surya Layout and Order predictors loaded.")
+    print("Surya Layout Predictor loaded.")
 
     layout_by_page: dict[int, list] = {}
-    order_by_page:  dict[int, list] = {}
     for jp in to_process:
         pn = _pnum(jp)
         png = render_dir / f"page_{pn:04d}.png"
@@ -288,16 +279,12 @@ def process_equations(
         layout_by_page[pn] = lboxes
         eq_count = sum(1 for b in lboxes if b.label == "Equation")
         print(f"  [layout] page {pn}: {len(lboxes)} regions, {eq_count} equations")
-        if lboxes:
-            box_coords = [b.bbox for b in lboxes]
-            order_results = order_predictor([image], [box_coords])
-            order_by_page[pn] = order_results[0].bboxes
 
-    del layout_predictor, layout_foundation, order_predictor
+    del layout_predictor, layout_foundation
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    print("  Surya Layout and Order predictors unloaded from GPU.")
+    print("  Surya Layout Predictor unloaded from GPU.")
 
     # ── Phase 2: UniMERNet LaTeX OCR on equation crops ───────────────────────
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -314,7 +301,7 @@ def process_equations(
         png = render_dir / f"page_{pn:04d}.png"
         raw = json.loads(jp.read_text())
         blocks = [TextBlock.from_dict(b) for b in raw["blocks"]]
-        blocks = _reorder_by_reading_order(blocks, order_by_page.get(pn, []))
+        blocks = _reorder_by_reading_order(blocks, [])
         _assign_block_types(blocks, layout_by_page.get(pn, []))
         blocks = _strip_header_footer(blocks, raw.get("image_height", 0))
         blocks, pending_tags = _extract_eq_numbers(blocks)
