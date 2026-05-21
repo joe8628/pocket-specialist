@@ -92,9 +92,21 @@ def _load_unimernet(device: torch.device) -> tuple:
         "tokenizer_name": "nougat",
         "tokenizer_config": {"path": model_dir},
         "model_name": model_dir,
-        "model_config": {"max_seq_len": 384},
+        "model_config": {"max_seq_len": 384, "model_name": model_dir},
     })
-    model = UniMERModel.from_config(model_cfg).to(device)
+    # unimernet 0.2.3's CustomMBartDecoder doesn't declare _supports_sdpa, but
+    # transformers >=4.43 defaults to SDPA and raises if the model doesn't support it.
+    # Force eager attention on the decoder config before the model is built.
+    from unimernet.models.unimernet import encoder_decoder as _ed
+    _orig_mbart_init = _ed.CustomMBartDecoder.__init__
+    def _mbart_eager_init(self, config):
+        config._attn_implementation = "eager"
+        _orig_mbart_init(self, config)
+    _ed.CustomMBartDecoder.__init__ = _mbart_eager_init
+    try:
+        model = UniMERModel.from_config(model_cfg).to(device)
+    finally:
+        _ed.CustomMBartDecoder.__init__ = _orig_mbart_init
     model.eval()
 
     vis_cfg = OmegaConf.create({"name": "formula_image_eval", "image_size": [192, 672]})
