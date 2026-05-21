@@ -110,26 +110,24 @@ def _load_unimernet(device: torch.device) -> tuple:
     model.eval()
 
     # CustomMBartDecoder.forward uses past_key_values[0][0].shape[2] (legacy tuple API).
-    # Transformers >=4.46 passes EncoderDecoderCache where [0][0] returns None.
-    # _supports_cache_class=False is ignored at this transformers version, so we patch
-    # forward directly to convert EncoderDecoderCache → legacy tuple-of-tuples on entry.
+    # Transformers >=4.46 passes EncoderDecoderCache; [0][0] on a fresh cache returns None.
+    # Patch forward() to convert EncoderDecoderCache → legacy tuple on every entry.
+    # DynamicCache no longer exposes .key_cache/.value_cache in transformers 4.57+;
+    # use the stable .to_legacy_cache() API instead.
     _orig_decode_fwd = _ed.CustomMBartDecoder.forward
     def _legacy_cache_fwd(self, *args, **kwargs):
         pkv = kwargs.get("past_key_values")
         if pkv is not None and not isinstance(pkv, tuple):
             try:
-                sa = pkv.self_attention_cache
-                ca = pkv.cross_attention_cache
-                n = len(sa.key_cache)
-                kwargs["past_key_values"] = (
-                    tuple(
-                        (sa.key_cache[i], sa.value_cache[i],
-                         ca.key_cache[i], ca.value_cache[i])
-                        for i in range(n)
-                    ) if n else None
-                )
-            except Exception:
-                pass
+                legacy = pkv.to_legacy_cache()
+                # Fresh EncoderDecoderCache has pre-allocated layers with None tensors.
+                # The legacy code checks `if past_key_values is not None`, so pass None
+                # when there are no stored tokens yet (first decode step).
+                if legacy and legacy[0][0] is None:
+                    legacy = None
+                kwargs["past_key_values"] = legacy
+            except Exception as _e:
+                print(f"  [unimernet shim] cache conversion failed: {_e}", file=sys.stderr)
         return _orig_decode_fwd(self, *args, **kwargs)
     _ed.CustomMBartDecoder.forward = _legacy_cache_fwd
 
