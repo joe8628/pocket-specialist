@@ -109,10 +109,29 @@ def _load_unimernet(device: torch.device) -> tuple:
         _ed.CustomMBartDecoder.__init__ = _orig_mbart_init
     model.eval()
 
-    # CustomMBartDecoder.forward uses past_key_values[0][0].shape[2] (old tuple-of-tuples API).
-    # Transformers >=4.46 passes EncoderDecoderCache where that indexing returns None.
-    # Disabling _supports_cache_class forces the legacy format during generate().
-    _ed.CustomVisionEncoderDecoderModel._supports_cache_class = False
+    # CustomMBartDecoder.forward uses past_key_values[0][0].shape[2] (legacy tuple API).
+    # Transformers >=4.46 passes EncoderDecoderCache where [0][0] returns None.
+    # _supports_cache_class=False is ignored at this transformers version, so we patch
+    # forward directly to convert EncoderDecoderCache → legacy tuple-of-tuples on entry.
+    _orig_decode_fwd = _ed.CustomMBartDecoder.forward
+    def _legacy_cache_fwd(self, *args, **kwargs):
+        pkv = kwargs.get("past_key_values")
+        if pkv is not None and not isinstance(pkv, tuple):
+            try:
+                sa = pkv.self_attention_cache
+                ca = pkv.cross_attention_cache
+                n = len(sa.key_cache)
+                kwargs["past_key_values"] = (
+                    tuple(
+                        (sa.key_cache[i], sa.value_cache[i],
+                         ca.key_cache[i], ca.value_cache[i])
+                        for i in range(n)
+                    ) if n else None
+                )
+            except Exception:
+                pass
+        return _orig_decode_fwd(self, *args, **kwargs)
+    _ed.CustomMBartDecoder.forward = _legacy_cache_fwd
 
     vis_cfg = OmegaConf.create({"name": "formula_image_eval", "image_size": [192, 672]})
     vis_processor = FormulaImageEvalProcessor.from_config(vis_cfg)
