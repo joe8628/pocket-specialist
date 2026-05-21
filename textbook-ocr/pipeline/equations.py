@@ -109,6 +109,11 @@ def _load_unimernet(device: torch.device) -> tuple:
         _ed.CustomMBartDecoder.__init__ = _orig_mbart_init
     model.eval()
 
+    # CustomMBartDecoder.forward uses past_key_values[0][0].shape[2] (old tuple-of-tuples API).
+    # Transformers >=4.46 passes EncoderDecoderCache where that indexing returns None.
+    # Disabling _supports_cache_class forces the legacy format during generate().
+    _ed.CustomVisionEncoderDecoderModel._supports_cache_class = False
+
     vis_cfg = OmegaConf.create({"name": "formula_image_eval", "image_size": [192, 672]})
     vis_processor = FormulaImageEvalProcessor.from_config(vis_cfg)
     return model, vis_processor
