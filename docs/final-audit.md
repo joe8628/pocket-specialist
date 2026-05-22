@@ -9,7 +9,7 @@ Derived from a systematic page-by-page visual audit of the Scherer textbook (640
 | S1 | `pipeline/render.py` | PDF → PNG at 2× zoom (PyMuPDF) |
 | S2 | `pipeline/ocr.py` | Surya OCR → per-page JSON (all blocks typed UNKNOWN) |
 | S3 | `pipeline/equations.py` | Surya layout detection + Surya LaTeX OCR on equation crops → typed blocks JSON |
-| S4 | `pipeline/correction.py` | Ollama `qwen2.5vl:7b` converts typed block list → clean Markdown per page |
+| S4 | `pipeline/correction.py` | Ollama `qwen2.5vl:3b` converts typed block list → clean Markdown per page |
 | S5 | `pipeline/assemble.py` | Concatenates per-page Markdown → final `.md` + `.json` manifest |
 
 ---
@@ -597,9 +597,9 @@ For multi-page tables, pass the column headers detected on the first table page 
 ### Tier 6 — Upgrade Stage 4 to a vision-language model (fixes P2, P4, P7, P8, P9)
 
 **Stage:** S4 (`pipeline/correction.py`)  
-**Root cause:** `qwen2.5vl:7b` is a text-only LLM. It cannot verify its markdown output against the source page. This enables hallucination, content drops, and heading misidentification that a model with visual grounding would catch.
+**Root cause:** `qwen2.5vl:3b` is a text-only LLM. It cannot verify its markdown output against the source page. This enables hallucination, content drops, and heading misidentification that a model with visual grounding would catch.
 
-**Fix:** Switch to `qwen2.5vl:7b` (already used in the main `ingest.py` pipeline) and pass both the page image AND the block list to the model. The image provides ground truth that prevents the model from inventing headings or dropping equations.
+**Fix:** Switch to `qwen2.5vl:3b` (already used in the main `ingest.py` pipeline) and pass both the page image AND the block list to the model. The image provides ground truth that prevents the model from inventing headings or dropping equations.
 
 ```python
 # pipeline/correction.py
@@ -608,7 +608,7 @@ import base64
 def _encode_image(png_path: Path) -> str:
     return base64.b64encode(png_path.read_bytes()).decode()
 
-def correct_page(page_num, blocks, model="qwen2.5vl:7b", image_path=None):
+def correct_page(page_num, blocks, model="qwen2.5vl:3b", image_path=None):
     messages = [{"role": "system", "content": _SYSTEM_PROMPT}]
     user_parts = [{"type": "text", "text": build_prompt(blocks)}]
     if image_path and image_path.exists():

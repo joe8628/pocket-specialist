@@ -16,12 +16,20 @@ import requests
 
 from config import CORRECTION_DIR, CROPS_DIR, EQUATIONS_DIR
 from pipeline.checkpoint import get_status, init_db, set_status, should_process
+from pipeline.assemble import _deduplicate, _format_blocks_as_markdown, _unwrap_spurious_containers
 from pipeline.models import BlockType, TextBlock
 
 
 _OLLAMA_BASE = "http://localhost:11434"
-_OLLAMA_MODEL = "qwen2.5vl:7b"
+_OLLAMA_MODEL = "qwen2.5vl:3b"
 _OLLAMA_NUM_CTX = 6192
+_EQUATION_RETRIES = 3
+
+_EQUATION_SYSTEM_PROMPT = (
+    "You are verifying a single OCR-extracted textbook equation against one attached equation crop image. "
+    "Output only the corrected LaTeX for that single equation. "
+    "Do not explain, do not add prose, and do not wrap the answer in $$ delimiters."
+)
 
 _RE_HTML = re.compile(r"<[^>]+>")
 _RE_SECTION_NUM = re.compile(r'^(?:Chapter\s+)?\d+(?:\.\d+)*$', re.IGNORECASE)
@@ -321,6 +329,59 @@ def _encode_image(path: Path) -> str:
     return base64.b64encode(path.read_bytes()).decode("ascii")
 
 
+def _normalize_latex(text: str) -> str:
+    cleaned = text.strip()
+    cleaned = _strip_outer_fence(cleaned)
+    cleaned = cleaned.strip()
+    if cleaned.startswith("$$") and cleaned.endswith("$$"):
+        cleaned = cleaned[2:-2].strip()
+    cleaned = re.sub(r'^\$\s*', '', cleaned)
+    cleaned = re.sub(r'\s*\$$', '', cleaned)
+    return cleaned.strip()
+
+
+def correct_equation_latex(
+    page_num: int,
+    ref_name: str,
+    crop_path: Path,
+    candidate_latex: str,
+    model: str = _OLLAMA_MODEL,
+) -> str:
+    user_content = (
+        f"Equation reference: {ref_name}\n"
+        "Candidate LaTeX from OCR follows. Correct it to match the attached equation crop exactly, "
+        "preserving symbols, superscripts, subscripts, matrices, delimiters, and alignment cues where representable in LaTeX.\n\n"
+        f"Candidate LaTeX:\n{candidate_latex}"
+    )
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": _EQUATION_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content, "images": [_encode_image(crop_path)]},
+        ],
+        "options": {"num_ctx": min(_OLLAMA_NUM_CTX, 2048)},
+        "keep_alive": 0,
+        "stream": False,
+    }
+    last_exc: Exception | None = None
+    for attempt in range(1, _EQUATION_RETRIES + 1):
+        try:
+            resp = requests.post(f"{_OLLAMA_BASE}/api/chat", json=payload, timeout=120)
+            resp.raise_for_status()
+            result = _normalize_latex(resp.json()["message"]["content"])
+            if not result:
+                raise ValueError(f"Empty LaTeX correction for {ref_name} on page {page_num}")
+            return result
+        except Exception as exc:
+            last_exc = exc
+            if attempt < _EQUATION_RETRIES:
+                print(
+                    f"  [correction] page {page_num} {ref_name}: retry {attempt}/{_EQUATION_RETRIES - 1} after error — {exc}"
+                )
+    assert last_exc is not None
+    raise last_exc
+
+
 def correct_page(
     page_num: int,
     blocks: list[TextBlock],
@@ -386,11 +447,31 @@ def _correct_page_job(jp: Path, model: str, crops_dir: Path) -> tuple[int, str]:
     equation_refs, crop_paths = _equation_ref_map(pn, blocks, crops_dir)
     if not crop_paths:
         raise ValueError(f"No equation crops found for page {pn}")
-    markdown, truncated = correct_page(pn, blocks, model, image_paths=crop_paths, equation_refs=equation_refs)
-    if not markdown:
-        raise ValueError("Ollama returned empty output")
-    if truncated:
-        markdown = f"<!-- WARNING: page {pn} may be truncated -->\n\n{markdown}"
+
+    ref_to_index = {ref: idx for idx, ref in equation_refs.items()}
+    equation_failures: list[str] = []
+    for crop_idx, crop_path in enumerate(crop_paths):
+        ref_name = f"eq_{crop_idx:02d}"
+        block_idx = ref_to_index.get(ref_name)
+        if block_idx is None:
+            continue
+        block = blocks[block_idx]
+        candidate = (block.latex or _strip_html(block.raw_text)).strip()
+        if not candidate:
+            continue
+        try:
+            corrected = correct_equation_latex(pn, ref_name, crop_path, candidate, model=model)
+            block.latex = corrected
+            block.latex_confidence = 1.0
+            block.block_type = BlockType.EQUATION
+        except Exception as exc:
+            equation_failures.append(f"{ref_name}: {exc}")
+            print(f"  [correction] page {pn} {ref_name}: kept original OCR — {exc}")
+
+    markdown = _deduplicate(_unwrap_spurious_containers(_format_blocks_as_markdown(blocks)))
+    if equation_failures:
+        warning = "<!-- WARNING: equation crop corrections failed for " + ", ".join(equation_failures) + " -->"
+        markdown = warning + "\n\n" + markdown
     return pn, markdown
 
 

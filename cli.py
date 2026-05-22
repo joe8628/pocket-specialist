@@ -113,7 +113,7 @@ def equations(
 def correct(
     start_page: int = typer.Option(None, "--start-page"),
     end_page: int = typer.Option(None, "--end-page"),
-    ollama_model: str = typer.Option("qwen2.5vl:7b", "--ollama-model", help="Ollama model name."),
+    ollama_model: str = typer.Option("qwen2.5vl:3b", "--ollama-model", help="Ollama model name."),
     parallel_pages: int = typer.Option(2, "--parallel-pages", min=1, help="Max Stage 4 pages to process concurrently."),
     crops_dir: Path = typer.Option(None, "--crops-dir", help="Override equation crop PNG directory for multimodal Stage 4."),
 ) -> None:
@@ -160,7 +160,7 @@ def _run_pipeline(
     start_page: int | None,
     end_page: int | None,
     zoom: float,
-    ollama_model: str = "qwen2.5vl:7b",
+    ollama_model: str = "qwen2.5vl:3b",
     no_llm: bool = False,
     output_dir: Path | None = None,
     parallel_pages: int = 2,
@@ -222,7 +222,7 @@ def run(
     end_page: int = typer.Option(None, "--end-page", help="Last page inclusive (default: last)."),
     zoom: float = typer.Option(2.0, "--zoom"),
     no_llm: bool = typer.Option(False, "--no-llm", help="Skip Stage 4 LLM correction."),
-    ollama_model: str = typer.Option("qwen2.5vl:7b", "--ollama-model", help="Ollama model for Stage 4."),
+    ollama_model: str = typer.Option("qwen2.5vl:3b", "--ollama-model", help="Ollama model for Stage 4."),
     output_dir: Path = typer.Option(None, "--output-dir", help="Output directory (default: output/)."),
     parallel_pages: int = typer.Option(2, "--parallel-pages", min=1, help="Max Stage 4 pages to process concurrently."),
 ) -> None:
@@ -253,7 +253,7 @@ def run_all(
     end_page: int = typer.Option(None, "--end-page", help="Last page per PDF (default: last)."),
     zoom: float = typer.Option(2.0, "--zoom"),
     no_llm: bool = typer.Option(False, "--no-llm", help="Skip Stage 4 LLM correction."),
-    ollama_model: str = typer.Option("qwen2.5vl:7b", "--ollama-model", help="Ollama model for Stage 4."),
+    ollama_model: str = typer.Option("qwen2.5vl:3b", "--ollama-model", help="Ollama model for Stage 4."),
     output_dir: Path = typer.Option(None, "--output-dir", help="Output directory (default: output/)."),
     parallel_pages: int = typer.Option(2, "--parallel-pages", min=1, help="Max Stage 4 pages to process concurrently."),
 ) -> None:

@@ -25,7 +25,7 @@ FOOTER_STRIP_RATIO      = 0.90   # bottom N% threshold (content below this is st
 
 # ── Stage 4: LLM Correction (Ollama) ─────────────────────────────────────────
 CORRECTION_DIR   = CHECKPOINT_DIR / "corrected"
-OLLAMA_MODEL     = "qwen2.5vl:7b"
+OLLAMA_MODEL     = "qwen2.5vl:3b"
 OLLAMA_BASE      = "http://localhost:11434"
 
 # ── Shared ────────────────────────────────────────────────────────────────────
