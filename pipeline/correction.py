@@ -18,8 +18,8 @@ from pipeline.models import BlockType, TextBlock
 
 
 _OLLAMA_BASE = "http://localhost:11434"
-_OLLAMA_MODEL = "qwen2.5:7b"
-_OLLAMA_NUM_CTX = 8192
+_OLLAMA_MODEL = "qwen2.5vl:7b"
+_OLLAMA_NUM_CTX = 6192
 
 _RE_HTML = re.compile(r"<[^>]+>")
 _RE_SECTION_NUM = re.compile(r'^(?:Chapter\s+)?\d+(?:\.\d+)*$', re.IGNORECASE)

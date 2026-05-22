@@ -281,9 +281,11 @@ def rename_corpus(
     # 'unchanged' when the renamed file is confirmed present on disk.
     records: list[dict] = []
     for r in existing_by_original.values():
+        # Ignore stale manifest entries for files that no longer exist on disk.
+        if not (corpus_dir / r['new_name']).exists():
+            continue
         updated = dict(r)
-        if (corpus_dir / r['new_name']).exists():
-            updated['status'] = 'unchanged'
+        updated['status'] = 'unchanged'
         records.append(updated)
 
     for path in candidates:

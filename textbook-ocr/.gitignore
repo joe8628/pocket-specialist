@@ -1,7 +1,0 @@
-models/
-output/
-checkpoints/
-__pycache__/
-*.pyc
-*.pyo
-.venv/

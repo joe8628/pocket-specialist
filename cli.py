@@ -113,7 +113,7 @@ def equations(
 def correct(
     start_page: int = typer.Option(None, "--start-page"),
     end_page: int = typer.Option(None, "--end-page"),
-    ollama_model: str = typer.Option("qwen2.5:7b", "--ollama-model", help="Ollama model name."),
+    ollama_model: str = typer.Option("qwen2.5vl:7b", "--ollama-model", help="Ollama model name."),
 ) -> None:
     """Stage 4: Ollama LLM Markdown correction pass."""
     from config import EQUATIONS_DIR, CORRECTION_DIR
@@ -156,7 +156,7 @@ def _run_pipeline(
     start_page: int | None,
     end_page: int | None,
     zoom: float,
-    ollama_model: str = "qwen2.5:7b",
+    ollama_model: str = "qwen2.5vl:7b",
     no_llm: bool = False,
     output_dir: Path | None = None,
 ) -> None:
@@ -215,7 +215,7 @@ def run(
     end_page: int = typer.Option(None, "--end-page", help="Last page inclusive (default: last)."),
     zoom: float = typer.Option(2.0, "--zoom"),
     no_llm: bool = typer.Option(False, "--no-llm", help="Skip Stage 4 LLM correction."),
-    ollama_model: str = typer.Option("qwen2.5:7b", "--ollama-model", help="Ollama model for Stage 4."),
+    ollama_model: str = typer.Option("qwen2.5vl:7b", "--ollama-model", help="Ollama model for Stage 4."),
     output_dir: Path = typer.Option(None, "--output-dir", help="Output directory (default: output/)."),
 ) -> None:
     """Run all pipeline stages (1–5) on a single PDF."""
@@ -224,7 +224,14 @@ def run(
 
     pdf_path = pdf.resolve()
     typer.echo("=== Stage 0: Rename corpus ===")
-    rename_corpus(pdf_path.parent, manifest_path=CHECKPOINT_DIR / "rename_manifest.json")
+    records = rename_corpus(pdf_path.parent, manifest_path=CHECKPOINT_DIR / "rename_manifest.json")
+
+    if not pdf_path.exists():
+        remapped = next((r for r in records if r.get("original") == pdf_path.name), None)
+        if remapped:
+            candidate = pdf_path.parent / remapped["new_name"]
+            if candidate.exists():
+                pdf_path = candidate
 
     _run_pipeline(pdf_path, start_page, end_page, zoom,
                   ollama_model=ollama_model, no_llm=no_llm, output_dir=output_dir)
@@ -237,7 +244,7 @@ def run_all(
     end_page: int = typer.Option(None, "--end-page", help="Last page per PDF (default: last)."),
     zoom: float = typer.Option(2.0, "--zoom"),
     no_llm: bool = typer.Option(False, "--no-llm", help="Skip Stage 4 LLM correction."),
-    ollama_model: str = typer.Option("qwen2.5:7b", "--ollama-model", help="Ollama model for Stage 4."),
+    ollama_model: str = typer.Option("qwen2.5vl:7b", "--ollama-model", help="Ollama model for Stage 4."),
     output_dir: Path = typer.Option(None, "--output-dir", help="Output directory (default: output/)."),
 ) -> None:
     """Run all pipeline stages (1–5) on every PDF in the corpus."""
@@ -252,6 +259,9 @@ def run_all(
 
     typer.echo(f"=== Stage 0: Rename corpus ({len(pdfs)} files) ===")
     rename_corpus(target, manifest_path=CHECKPOINT_DIR / "rename_manifest.json")
+
+    # Re-scan after renaming so we only process files that currently exist.
+    pdfs = sorted(p for p in target.glob("*.pdf") if p.exists())
 
     for i, pdf_path in enumerate(pdfs, 1):
         typer.echo(f"\n{'─' * 60}")

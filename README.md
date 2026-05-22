@@ -1,154 +1,143 @@
-# Pocket Specialist
+# textbook-ocr
 
-A local RAG (Retrieval-Augmented Generation) pipeline for scientific and technical documents. Ingests PDFs, plain text, Markdown, and CSV files into a ChromaDB vector store with an optional knowledge graph layer for concept-expanded search.
+GPU-accelerated pipeline that converts physics textbook PDFs into clean, structured Markdown with properly rendered equations.
 
----
+## Pipeline overview
 
-## Architecture
+| Stage | Command | Model(s) |
+|-------|---------|----------|
+| S0 — Rename corpus | `rename-corpus` | — |
+| S1 — Render pages | `render` | PyMuPDF |
+| S2 — OCR | `ocr` | Surya (detection + recognition) |
+| S3 — Layout + equations | `equations` | Surya layout + Surya LaTeX OCR |
+| S4 — LLM correction | `correct` | `qwen2.5vl:7b` via Ollama |
+| S5 — Assemble | `assemble` | — |
 
-```
-RAG-corpus/          ← drop documents here
-    └─ *.pdf / *.txt / *.md / *.csv
+## Requirements
 
-src/
-    db.py            ← shared ChromaDB client + BAAI/bge-large-en-v1.5 embeddings
-    ingest.py        ← Stage 1 pipeline: detect → extract → clean → chunk → embed
-    graph.py         ← spaCy entity extraction + NetworkX knowledge graph
-    search.py        ← vector search + graph-expanded search CLI
-
-chroma_db/           ← persistent vector store (ChromaDB)
-knowledge_graph/     ← persisted entity co-occurrence graph (JSON)
-```
-
----
-
-## Installation
+- Python 3.10+
+- CUDA-capable GPU (tuned for RTX 2080 Ti, 11 GB VRAM)
+- [Ollama](https://ollama.com) running locally
 
 ```bash
+# Install Python deps (order matters — see requirements.txt comments)
 pip install -r requirements.txt
-python -m spacy download en_core_web_sm
+
+# Pull the LLM
+ollama pull qwen2.5vl:7b
 ```
 
-GPU required for PDF ingestion (Marker uses CUDA). Search and non-PDF ingestion run on CPU.
+Surya model weights are downloaded automatically on first run.
 
----
+## Usage
 
-## Ingestion
+### Full pipeline (recommended)
 
 ```bash
-# Ingest all new/changed files in RAG-corpus/
-python src/ingest.py
-
-# Ingest a single file
-python src/ingest.py path/to/document.pdf
-
-# Ingest into a named collection
-python src/ingest.py path/to/document.pdf my-collection
+python3 cli.py run <pdf>
 ```
 
-The manifest (`chroma_db/.manifest.json`) tracks mtimes so unchanged files are skipped on re-runs.
+Options:
 
-To reset the database and re-ingest from scratch:
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--start-page N` | 1 | First page (1-indexed) |
+| `--end-page N` | last | Last page inclusive |
+| `--zoom FLOAT` | 2.0 | Render scale (2.0 ≈ 150 DPI) |
+| `--no-llm` | off | Skip Stage 4 LLM correction |
+| `--ollama-model NAME` | `qwen2.5vl:7b` | Ollama model for Stage 4 |
+| `--output-dir PATH` | `output/` | Final output directory |
+
+Examples:
 
 ```bash
-rm -rf chroma_db
-python src/ingest.py
+# Full book
+python3 cli.py run RAG-corpus/scherer.pdf
+
+# Pages 50–59 only
+python3 cli.py run RAG-corpus/scherer.pdf --start-page 50 --end-page 59
+
+# Single page
+python3 cli.py run RAG-corpus/scherer.pdf --start-page 42 --end-page 42
+
+# Skip LLM correction (faster, Surya-only output)
+python3 cli.py run RAG-corpus/scherer.pdf --no-llm
+
+# Ten non-consecutive pages (run once per page; checkpoints accumulate)
+for p in 12 34 56 78 100 123 145 167 200 220; do
+  python3 cli.py run RAG-corpus/scherer.pdf --start-page $p --end-page $p
+done
 ```
 
----
-
-## Search
+### Run all PDFs in corpus
 
 ```bash
-# Vector similarity search (default)
-python src/search.py "Hamiltonian eigenvalue quantum mechanics"
-
-# Graph-expanded search (spaCy entities → concept expansion → similarity)
-python src/search.py --mode graph "Fourier transform convolution"
-
-# Show concept map for a query
-python src/search.py --mode map "Navier-Stokes turbulence"
-
-# Control result count and graph traversal depth
-python src/search.py --n 10 --hops 3 "Boltzmann entropy"
+python3 cli.py run-all
+python3 cli.py run-all RAG-corpus/ --start-page 1 --end-page 100
 ```
 
----
+### Per-stage commands
 
-## Stage 1 Pipeline — Intake & Normalization
+Run individual stages when you need to re-process or debug a specific step.
 
-### Format Detection (`_sniff_format`)
+```bash
+# Stage 0: normalize filenames
+python3 cli.py rename-corpus RAG-corpus/
 
-Content-based detection that ignores file extensions:
+# Stage 1: render PDF pages to PNG
+python3 cli.py render RAG-corpus/scherer.pdf --start-page 1 --end-page 50
 
-- **PDF** — magic bytes (`%PDF`)
-- **Markdown** — ATX headings (`# ...`) in first 40 lines
-- **CSV** — consistent column count via `csv.Sniffer`
-- **Plain text** — fallback after binary and UTF-8/Latin-1 checks
-- **Binary/unsupported** — null-byte detection, skipped with a warning
+# Stage 2: Surya OCR
+python3 cli.py ocr --start-page 1 --end-page 50
 
-### Extraction
+# Stage 3: layout detection + equation OCR
+python3 cli.py equations --start-page 1 --end-page 50
 
-| Format | Method |
-|---|---|
-| PDF | [Marker](https://github.com/VikParuchuri/marker) — layout-aware neural OCR on GPU, preserves LaTeX equations as `$$...$$` |
-| Markdown / Text | Direct `read_text` with UTF-8 → Latin-1 fallback |
-| CSV | `csv.Sniffer` dialect detection, header inference, rows serialized as `Header: value \| ...` prose |
+# Stage 4: LLM correction
+python3 cli.py correct --start-page 1 --end-page 50
 
-### Cleaning
+# Stage 5: assemble corrected pages into final .md and .json
+python3 cli.py assemble RAG-corpus/scherer.pdf
+```
 
-Applied to PDF output after Marker extraction, in order:
+### Checkpoint management
 
-1. **HTML span tags** — Marker injects `<span>` anchors for page references; stripped via regex
-2. **`<br>` tags** — Marker emits `<br>` inside table cells (common in TOC tables); replaced with spaces
-3. **Invisible Unicode** — soft hyphens (U+00AD), zero-width spaces (U+200B/200C/200D), BOM (U+FEFF), non-breaking spaces (U+00A0) removed or normalized
-4. **Page headers/footers** (`_strip_page_artifacts`):
-   - *Bare page numbers* — lines matching `[Page ]N[ of M]` are dropped
-   - *Running headers* — short lines (< 72 chars, no code/math markers) appearing more than `max(3, total_lines // 30)` times are treated as repeating headers/footers and removed
+Each stage records its progress in `checkpoints/pipeline.db`. Re-running a stage skips already-completed pages.
 
-### Segmentation (`_smart_chunk`)
+```bash
+# Show per-stage progress
+python3 cli.py status
 
-Structure-aware chunking in two tiers:
+# Reset one stage (forces re-run)
+python3 cli.py reset --stage correction
 
-- **Tier 1** — section headings act as hard breaks; detected patterns: numbered headings (`1.3 Methods`), Markdown ATX (`## ...`), ALL-CAPS titles, algorithm/theorem/lemma markers, and plain section-name lines (`References`, `Acknowledgments`, `Abstract`, etc.)
-- **Tier 2** — within each section, paragraphs are merged into ≤500-word chunks at sentence boundaries with 2-sentence overlap
-- **Code block merging** — consecutive BASIC/Fortran line-numbered lines (e.g. `1234 PRINT X`) are collapsed into a single fenced ` ``` ` block instead of being split into per-line fragments
-- **Boilerplate section filter** — sections whose heading matches a boilerplate pattern (`References`, `Bibliography`, `Acknowledgments`, `Further Reading`, `Index`) are dropped entirely before chunking
-- **Noise filter** — chunks are discarded when:
-  - More than 50% of lines are markdown pipe-table rows (table-of-contents artifacts)
-  - Fewer than 25 prose words outside fenced code blocks, with no meaningful LaTeX (`\frac`, `\int`, `$$`, etc.) — bare code snippets and one-liner comments no longer survive as standalone chunks
+# Reset all stages
+python3 cli.py reset --yes
+```
 
-### Metadata Capture
+## Configuration
 
-Each chunk is stored in ChromaDB with structured metadata:
+All tuneable constants live in `config.py`:
 
-| Field | Description |
-|---|---|
-| `source` | Relative path from repo root |
-| `filename` | Bare filename |
-| `doc_type` | `pdf`, `text`, `markdown`, or `csv` |
-| `mtime` | File modification timestamp (float) |
-| `title` | From PDF metadata, or filename stem |
-| `author` | From PDF metadata |
-| `page_count` | PDF page count (0 for non-PDF) |
-| `creation_date` | PDF creation date as `YYYY-MM-DD` |
-| `heading` | Section heading the chunk falls under |
-| `chunk_index` | Position of chunk within the document |
+| Constant | Default | Description |
+|----------|---------|-------------|
+| `OLLAMA_MODEL` | `qwen2.5vl:7b` | LLM used in Stage 4 |
+| `RENDER_ZOOM` | `2.0` | PNG render scale |
+| `EQUATION_CONF_THRESHOLD` | `0.5` | Min confidence for equation detection |
+| `HEADER_STRIP_RATIO` | `0.10` | Top fraction stripped as running header |
+| `FOOTER_STRIP_RATIO` | `0.90` | Bottom fraction threshold |
 
----
+## Outputs
 
-## Knowledge Graph
+```
+checkpoints/
+  rendered/       page_NNNN.png        Stage 1 output
+  ocr/            page_NNNN.json       Stage 2 output
+  equations/      page_NNNN.json       Stage 3 output
+  corrected/      page_NNNN.md         Stage 4 output
+  pipeline.db                          checkpoint state
 
-Built incrementally during ingestion using spaCy (`en_core_web_sm`):
-
-- Named entities and noun phrases extracted from each chunk
-- Co-occurring entities within a chunk are connected with weighted edges
-- Graph persisted as `knowledge_graph/graph.json` (NetworkX node-link format)
-- `search --mode graph` expands a query by walking N hops from matched entities before running vector search
-- `search --mode map` prints the concept neighbourhood for a query term
-
----
-
-## Embedding Model
-
-`BAAI/bge-large-en-v1.5` via `sentence-transformers`. Downloaded automatically on first run; cached in `~/.cache/huggingface/hub/`.
+output/
+  <bookname>.md                        final assembled Markdown
+  <bookname>.json                      page manifest with metadata
+```

@@ -1,23 +1,7 @@
-# ChromaDB persistent store — data lives here, not in git
-chroma_db/
-
-# Marker raw OCR cache — large text files, derived from corpus
-marker_cache/
-
-# Knowledge graph — derived from corpus, not committed
-knowledge_graph/graph.json
-
-# RAG corpus — track the folder but not large binary files
-RAG-corpus/*.pdf
-RAG-corpus/*.PDF
-
-# Python
+models/
+output/
+checkpoints/
 __pycache__/
-*.py[cod]
-*.egg-info/
+*.pyc
+*.pyo
 .venv/
-dist/
-build/
-
-# Environment
-.env
