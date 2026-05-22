@@ -70,23 +70,16 @@ def _load_latex_ocr():
     return RecognitionPredictor(foundation), foundation
 
 
-def _load_order():
-    try:
-        from surya.ordering import OrderPredictor
-    except ImportError:
-        print("Error: surya-ocr is not installed. Run: pip install surya-ocr", file=sys.stderr)
-        sys.exit(1)
-    return OrderPredictor()
-
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _reorder_by_reading_order(blocks: list[TextBlock], order_bboxes: list) -> list[TextBlock]:
-    """Sort OCR blocks by reading order from OrderPredictor results.
+    """Sort OCR blocks by reading order using ordered layout regions.
 
-    Each order_bbox has .position (int, reading order rank) and .bbox ([x0,y0,x1,y1]).
-    Blocks whose centroid falls inside a known region are ranked by that region's position;
-    unassigned blocks are appended after, sorted by y-coordinate.
+    Surya 0.17 emits layout boxes with a `position` field but no standalone
+    `surya.ordering` predictor. Blocks whose centroid falls inside a known
+    layout region inherit that region order; unassigned blocks are appended
+    after, sorted by y-coordinate.
     """
     if not order_bboxes:
         return sorted(blocks, key=lambda b: b.bbox.y0)
@@ -240,12 +233,9 @@ def process_equations(
     # ── Phase 1: Surya layout detection + reading order across all pages ─────────
     print("Loading Surya Layout Predictor (GPU)...")
     layout_predictor, layout_foundation = _load_layout()
-    print("Loading Surya Order Predictor (GPU)...")
-    order_predictor = _load_order()
-    print("Surya Layout and Order predictors loaded.")
+    print("Surya Layout predictor loaded.")
 
     layout_by_page: dict[int, list] = {}
-    order_by_page:  dict[int, list] = {}
     for jp in to_process:
         pn = _pnum(jp)
         png = render_dir / f"page_{pn:04d}.png"
@@ -258,16 +248,12 @@ def process_equations(
         layout_by_page[pn] = lboxes
         eq_count = sum(1 for b in lboxes if b.label == "Equation")
         print(f"  [layout] page {pn}: {len(lboxes)} regions, {eq_count} equations")
-        if lboxes:
-            box_coords = [b.bbox for b in lboxes]
-            order_results = order_predictor([image], [box_coords])
-            order_by_page[pn] = order_results[0].bboxes
 
-    del layout_predictor, layout_foundation, order_predictor
+    del layout_predictor, layout_foundation
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    print("  Surya Layout and Order predictors unloaded from GPU.")
+    print("  Surya Layout predictor unloaded from GPU.")
 
     # ── Phase 2: Surya LaTeX OCR on equation crops ───────────────────────────
     print("Loading Surya LaTeX OCR (GPU)...")
@@ -284,7 +270,7 @@ def process_equations(
         png = render_dir / f"page_{pn:04d}.png"
         raw = json.loads(jp.read_text())
         blocks = [TextBlock.from_dict(b) for b in raw["blocks"]]
-        blocks = _reorder_by_reading_order(blocks, order_by_page.get(pn, []))
+        blocks = _reorder_by_reading_order(blocks, layout_by_page.get(pn, []))
         _assign_block_types(blocks, layout_by_page.get(pn, []))
         blocks = _strip_header_footer(blocks, raw.get("image_height", 0))
         blocks, pending_tags = _extract_eq_numbers(blocks)
