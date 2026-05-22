@@ -4,15 +4,17 @@ Input:  checkpoints/equations/page_{N:04d}.json  (from Stage 3)
 Output: checkpoints/corrected/page_{N:04d}.md    (clean Markdown per page)
 """
 from __future__ import annotations
+import base64
 import json
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
 import requests
 
-from config import CORRECTION_DIR, EQUATIONS_DIR
+from config import CORRECTION_DIR, CROPS_DIR, EQUATIONS_DIR
 from pipeline.checkpoint import get_status, init_db, set_status, should_process
 from pipeline.models import BlockType, TextBlock
 
@@ -29,13 +31,15 @@ _RE_ORDERED_ITEM = re.compile(r'^\d+\.\s')
 
 _SYSTEM_PROMPT = (
     "You are a precise technical document formatter. "
-    "You receive OCR-extracted blocks from a physics textbook page; "
+    "You receive a rendered textbook page image plus OCR-extracted blocks from that same page; "
     "each line is prefixed with its semantic block type.\n\n"
+    "Use the attached equation crop images to visually verify superscripts/subscripts, matrices, delimiters, alignment, and whether extracted equation text is malformed. "
+    "Use the typed blocks as the canonical content source: do not invent text that is not supported by the blocks.\n\n"
     "HARD CONSTRAINTS — no exceptions:\n"
     "1. Output ONLY valid Markdown. NEVER wrap the entire response in a code fence.\n"
     "2. NEVER add, invent, complete, or paraphrase any content. "
     "Reproduce only what is given.\n"
-    "3. [EQUATION]: emit the LaTeX VERBATIM inside $$...$$. "
+    "3. [EQUATION] or [EQUATION eq_XX]: emit the LaTeX VERBATIM inside $$...$$. "
     "Do NOT add rows, terms, symbols, or close unclosed environments.\n\n"
     "Block-type rules:\n"
     "- [HEADING]         → heading level by depth:\n"
@@ -72,7 +76,7 @@ _SYSTEM_PROMPT = (
     "  (Caption is a plain paragraph immediately below. NEVER on the same line as > [Figure].)\n\n"
     "CRITICAL: NEVER emit block-type tags ([TEXT], [EQUATION], [HEADING], [FIGURE], "
     "[CAPTION], [TABLE], [LIST_ITEM], [FOOTNOTE], [UNKNOWN]) in your output. "
-    "These are INPUT annotations only.\n\n"
+    "These are INPUT annotations only. If an equation block includes an eq_XX suffix, it refers to the matching attached crop image in the same order. NEVER emit the eq_XX suffix in output.\n\n"
     "MATH DISPLAY RULES:\n"
     "- $$...$$ (display) only for standalone equations on their own line.\n"
     "- $...$ (inline) for all math embedded within a sentence or paragraph.\n"
@@ -238,9 +242,10 @@ def _scrub_block_tags(markdown: str) -> str:
     return _RE_BLOCK_TAG.sub("", markdown)
 
 
-def _serialize_block(block: TextBlock) -> str:
+def _serialize_block(block: TextBlock, equation_ref: str | None = None) -> str:
+    eq_suffix = f" {equation_ref}" if equation_ref else ""
     if block.block_type == BlockType.EQUATION and block.latex:
-        return f"[EQUATION] {block.latex}"
+        return f"[EQUATION{eq_suffix}] {block.latex}"
     if block.block_type == BlockType.FIGURE:
         caption = _strip_html(block.raw_text).strip()
         return f"[FIGURE+CAPTION] {caption}" if caption else "[FIGURE]"
@@ -248,17 +253,17 @@ def _serialize_block(block: TextBlock) -> str:
     if block.block_type == BlockType.LIST_ITEM and _RE_ORDERED_ITEM.match(text):
         return f"[ORDERED_ITEM] {text}"
     tag = block.block_type.value.upper()
-    return f"[{tag}] {text}"
+    return f"[{tag}{eq_suffix}] {text}"
 
 
-def build_prompt(blocks: list[TextBlock]) -> str:
+def build_prompt(blocks: list[TextBlock], equation_refs: dict[int, str] | None = None) -> str:
     blocks = _merge_headings(blocks)
     blocks = _merge_figure_captions(blocks)
     lines = []
-    for b in blocks:
+    for idx, b in enumerate(blocks):
         if not b.raw_text.strip() and b.block_type != BlockType.FIGURE:
             continue
-        lines.append(_serialize_block(b))
+        lines.append(_serialize_block(b, equation_refs.get(idx) if equation_refs else None))
     return "\n".join(lines)
 
 
@@ -297,18 +302,48 @@ def _post_process(markdown: str, blocks: list[TextBlock]) -> str:
     return markdown
 
 
+def _equation_ref_map(page_num: int, blocks: list[TextBlock], crops_dir: Path) -> tuple[dict[int, str], list[Path]]:
+    crop_paths = sorted(crops_dir.glob(f"page_{page_num:04d}_eq_*.png"))
+    if not crop_paths:
+        return {}, []
+
+    eq_block_indexes = [
+        idx for idx, block in enumerate(blocks)
+        if block.block_type in (BlockType.EQUATION, BlockType.EQUATION_FAILED)
+    ]
+    refs: dict[int, str] = {}
+    for crop_idx, block_idx in enumerate(eq_block_indexes[:len(crop_paths)]):
+        refs[block_idx] = f"eq_{crop_idx:02d}"
+    return refs, crop_paths
+
+
+def _encode_image(path: Path) -> str:
+    return base64.b64encode(path.read_bytes()).decode("ascii")
+
+
 def correct_page(
-    page_num: int, blocks: list[TextBlock], model: str = _OLLAMA_MODEL
+    page_num: int,
+    blocks: list[TextBlock],
+    model: str = _OLLAMA_MODEL,
+    image_paths: list[Path] | None = None,
+    equation_refs: dict[int, str] | None = None,
 ) -> tuple[str, bool]:
     """Run Ollama correction on one page.
 
     Returns (markdown, truncated) where truncated=True if the output failed
     coverage after one retry.
     """
-    user_content = build_prompt(blocks)
-    messages: list[dict] = [
+    user_content = build_prompt(blocks, equation_refs=equation_refs)
+    if image_paths:
+        ref_line = "Attached equation crop images, in order: " + ", ".join(f"eq_{i:02d}" for i in range(len(image_paths)))
+        user_content = ref_line + "\n\n" + user_content
+    user_message: dict[str, object] = {"role": "user", "content": user_content}
+    if image_paths:
+        user_message["images"] = [_encode_image(path) for path in image_paths]
+
+    messages: list[dict[str, object]] = [
         {"role": "system", "content": _SYSTEM_PROMPT},
-        {"role": "user",   "content": user_content},
+        user_message,
     ]
     payload = {
         "model": model,
@@ -344,12 +379,29 @@ def correct_page(
     return result2, truncated
 
 
+def _correct_page_job(jp: Path, model: str, crops_dir: Path) -> tuple[int, str]:
+    pn = int(jp.stem.split("_")[1])
+    raw = json.loads(jp.read_text())
+    blocks = [TextBlock.from_dict(b) for b in raw["blocks"]]
+    equation_refs, crop_paths = _equation_ref_map(pn, blocks, crops_dir)
+    if not crop_paths:
+        raise ValueError(f"No equation crops found for page {pn}")
+    markdown, truncated = correct_page(pn, blocks, model, image_paths=crop_paths, equation_refs=equation_refs)
+    if not markdown:
+        raise ValueError("Ollama returned empty output")
+    if truncated:
+        markdown = f"<!-- WARNING: page {pn} may be truncated -->\n\n{markdown}"
+    return pn, markdown
+
+
 def correct_pages(
     equations_dir: Path = EQUATIONS_DIR,
     correction_dir: Path = CORRECTION_DIR,
     model: str = _OLLAMA_MODEL,
     start_page: Optional[int] = None,
     end_page: Optional[int] = None,
+    max_parallel: int = 2,
+    crops_dir: Path = CROPS_DIR,
 ) -> tuple[int, int]:
     """Correct all pages via Ollama; write .md files. Returns (done, failed)."""
 
@@ -367,9 +419,13 @@ def correct_pages(
         eq_jsons = [p for p in eq_jsons if lo <= _pnum(p) <= hi]
 
     to_process: list[Path] = []
-    skipped = pre_failed = 0
+    skipped = skipped_no_crops = pre_failed = 0
     for jp in eq_jsons:
         pn = _pnum(jp)
+        if not list(crops_dir.glob(f"page_{pn:04d}_eq_*.png")):
+            print(f"  [correction] page {pn}: no equation crops, skipping.")
+            skipped_no_crops += 1
+            continue
         if not should_process("correction", pn):
             status, _ = get_status("correction", pn)
             if status == "done":
@@ -381,36 +437,67 @@ def correct_pages(
             to_process.append(jp)
 
     if not to_process:
-        print(f"Correction: all pages already processed ({skipped} done).")
+        parts = []
+        if skipped:
+            parts.append(f"{skipped} already done")
+        if skipped_no_crops:
+            parts.append(f"{skipped_no_crops} without equation crops")
+        summary = ", ".join(parts) if parts else "0 pages eligible"
+        print(f"Correction: no pages eligible ({summary}).")
         return 0, pre_failed
 
     _check_ollama(model)
     correction_dir.mkdir(parents=True, exist_ok=True)
+    crops_dir = crops_dir.resolve()
     init_db()
 
-    print(f"Running correction via Ollama ({model}) on {len(to_process)} pages...")
+    max_parallel = max(1, int(max_parallel))
+    print(
+        f"Running correction via Ollama ({model}) on {len(to_process)} pages "
+        f"with up to {max_parallel} parallel request(s)..."
+    )
 
     done = failed = 0
-    for jp in to_process:
-        pn = _pnum(jp)
-        try:
-            raw = json.loads(jp.read_text())
-            blocks = [TextBlock.from_dict(b) for b in raw["blocks"]]
-            markdown, truncated = correct_page(pn, blocks, model)
-            if not markdown:
-                raise ValueError("Ollama returned empty output")
-            if truncated:
-                markdown = f"<!-- WARNING: page {pn} may be truncated -->\n\n{markdown}"
-            out_path = correction_dir / f"page_{pn:04d}.md"
-            out_path.write_text(markdown, encoding="utf-8")
-            set_status("correction", pn, "done", str(out_path))
-            done += 1
-            lines = markdown.count("\n") + 1
-            print(f"  [correction] page {pn} → {out_path.name}  ({lines} lines)")
-        except Exception as exc:
-            set_status("correction", pn, "failed")
-            failed += 1
-            print(f"  [correction] page {pn}: FAILED — {exc}")
 
-    print(f"\nCorrection complete: {done} done, {skipped} skipped, {failed + pre_failed} failed.")
+    def _commit_success(pn: int, markdown: str) -> None:
+        nonlocal done
+        out_path = correction_dir / f"page_{pn:04d}.md"
+        out_path.write_text(markdown, encoding="utf-8")
+        set_status("correction", pn, "done", str(out_path))
+        done += 1
+        lines = markdown.count("\n") + 1
+        print(f"  [correction] page {pn} → {out_path.name}  ({lines} lines)")
+
+    def _commit_failure(pn: int, exc: Exception) -> None:
+        nonlocal failed
+        set_status("correction", pn, "failed")
+        failed += 1
+        print(f"  [correction] page {pn}: FAILED — {exc}")
+
+    if max_parallel == 1:
+        for jp in to_process:
+            pn = _pnum(jp)
+            try:
+                result_pn, markdown = _correct_page_job(jp, model, crops_dir)
+                _commit_success(result_pn, markdown)
+            except Exception as exc:
+                _commit_failure(pn, exc)
+    else:
+        with ThreadPoolExecutor(max_workers=max_parallel) as executor:
+            future_to_page = {executor.submit(_correct_page_job, jp, model, crops_dir): _pnum(jp) for jp in to_process}
+            for future in as_completed(future_to_page):
+                pn = future_to_page[future]
+                try:
+                    result_pn, markdown = future.result()
+                    _commit_success(result_pn, markdown)
+                except Exception as exc:
+                    _commit_failure(pn, exc)
+
+    skip_parts = []
+    if skipped:
+        skip_parts.append(f"{skipped} already done")
+    if skipped_no_crops:
+        skip_parts.append(f"{skipped_no_crops} without equation crops")
+    skipped_summary = ", ".join(skip_parts) if skip_parts else "0 skipped"
+    print(f"\nCorrection complete: {done} done, {skipped_summary}, {failed + pre_failed} failed.")
     return done, failed + pre_failed

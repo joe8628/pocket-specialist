@@ -114,9 +114,11 @@ def correct(
     start_page: int = typer.Option(None, "--start-page"),
     end_page: int = typer.Option(None, "--end-page"),
     ollama_model: str = typer.Option("qwen2.5vl:7b", "--ollama-model", help="Ollama model name."),
+    parallel_pages: int = typer.Option(2, "--parallel-pages", min=1, help="Max Stage 4 pages to process concurrently."),
+    crops_dir: Path = typer.Option(None, "--crops-dir", help="Override equation crop PNG directory for multimodal Stage 4."),
 ) -> None:
     """Stage 4: Ollama LLM Markdown correction pass."""
-    from config import EQUATIONS_DIR, CORRECTION_DIR
+    from config import CROPS_DIR, EQUATIONS_DIR, CORRECTION_DIR
     from pipeline.correction import correct_pages
 
     done, failed = correct_pages(
@@ -125,6 +127,8 @@ def correct(
         model=ollama_model,
         start_page=start_page,
         end_page=end_page,
+        max_parallel=parallel_pages,
+        crops_dir=crops_dir or CROPS_DIR,
     )
     if failed:
         raise typer.Exit(1)
@@ -159,6 +163,7 @@ def _run_pipeline(
     ollama_model: str = "qwen2.5vl:7b",
     no_llm: bool = False,
     output_dir: Path | None = None,
+    parallel_pages: int = 2,
 ) -> None:
     """Run stages 1–5 for a single PDF."""
     import time
@@ -191,6 +196,8 @@ def _run_pipeline(
             model=ollama_model,
             start_page=start_page,
             end_page=end_page,
+            max_parallel=parallel_pages,
+            crops_dir=CROPS_DIR,
         )
 
     typer.echo(f"\n  Stage 5: Assemble  ({pdf_path.name})")
@@ -217,6 +224,7 @@ def run(
     no_llm: bool = typer.Option(False, "--no-llm", help="Skip Stage 4 LLM correction."),
     ollama_model: str = typer.Option("qwen2.5vl:7b", "--ollama-model", help="Ollama model for Stage 4."),
     output_dir: Path = typer.Option(None, "--output-dir", help="Output directory (default: output/)."),
+    parallel_pages: int = typer.Option(2, "--parallel-pages", min=1, help="Max Stage 4 pages to process concurrently."),
 ) -> None:
     """Run all pipeline stages (1–5) on a single PDF."""
     from config import CHECKPOINT_DIR
@@ -234,7 +242,8 @@ def run(
                 pdf_path = candidate
 
     _run_pipeline(pdf_path, start_page, end_page, zoom,
-                  ollama_model=ollama_model, no_llm=no_llm, output_dir=output_dir)
+                  ollama_model=ollama_model, no_llm=no_llm, output_dir=output_dir,
+                  parallel_pages=parallel_pages)
 
 
 @app.command(name="run-all")
@@ -246,6 +255,7 @@ def run_all(
     no_llm: bool = typer.Option(False, "--no-llm", help="Skip Stage 4 LLM correction."),
     ollama_model: str = typer.Option("qwen2.5vl:7b", "--ollama-model", help="Ollama model for Stage 4."),
     output_dir: Path = typer.Option(None, "--output-dir", help="Output directory (default: output/)."),
+    parallel_pages: int = typer.Option(2, "--parallel-pages", min=1, help="Max Stage 4 pages to process concurrently."),
 ) -> None:
     """Run all pipeline stages (1–5) on every PDF in the corpus."""
     from config import CHECKPOINT_DIR, CORPUS_DIR
@@ -268,7 +278,8 @@ def run_all(
         typer.echo(f"  [{i}/{len(pdfs)}] {pdf_path.name}")
         typer.echo(f"{'─' * 60}")
         _run_pipeline(pdf_path, start_page, end_page, zoom,
-                      ollama_model=ollama_model, no_llm=no_llm, output_dir=output_dir)
+                      ollama_model=ollama_model, no_llm=no_llm, output_dir=output_dir,
+                      parallel_pages=parallel_pages)
 
     typer.echo(f"\nDone. Processed {len(pdfs)} PDFs.")
 
@@ -313,26 +324,48 @@ def reset(
     ),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt."),
 ) -> None:
-    """Reset checkpoint records (forces a re-run of the chosen stage)."""
+    """Reset stage outputs and checkpoint records for the selected stage and downstream stages."""
+    from config import CORRECTION_DIR, CROPS_DIR, EQUATIONS_DIR, OCR_DIR, RENDER_DIR
     from pipeline.checkpoint import init_db, reset_stage, STAGES
 
-    valid   = set(STAGES)
-    targets = [stage] if stage else list(STAGES)
+    stage_order = list(STAGES)
+    stage_dirs = {
+        "render": [RENDER_DIR],
+        "ocr": [OCR_DIR],
+        "equations": [EQUATIONS_DIR, CROPS_DIR],
+        "correction": [CORRECTION_DIR],
+    }
 
+    def _clear_dir(path: Path) -> int:
+        if not path.exists():
+            return 0
+        removed = 0
+        for child in path.iterdir():
+            if child.is_file() or child.is_symlink():
+                child.unlink()
+                removed += 1
+        return removed
+
+    valid = set(stage_order)
     if stage and stage not in valid:
         typer.echo(f"Unknown stage '{stage}'. Choose from: {', '.join(sorted(valid))}.", err=True)
         raise typer.Exit(1)
 
+    targets = stage_order if stage is None else stage_order[stage_order.index(stage):]
+
     if not yes:
         typer.confirm(
-            f"Reset checkpoints for: {', '.join(targets)}? This cannot be undone.",
+            f"Reset outputs and checkpoints for: {', '.join(targets)}? This cannot be undone.",
             abort=True,
         )
 
     init_db()
     for s in targets:
+        removed = 0
+        for out_dir in stage_dirs.get(s, []):
+            removed += _clear_dir(out_dir)
         reset_stage(s)
-        typer.echo(f"  Reset: {s}")
+        typer.echo(f"  Reset: {s}  ({removed} files removed)")
 
 
 if __name__ == "__main__":
