@@ -4,16 +4,18 @@ from __future__ import annotations
 import sqlite3
 import time
 
-from config import DB_PATH, MAX_RETRIES
+from pocket_specialist.core.config import DB_PATH, MAX_RETRIES
 
-STAGES = ("render", "ocr", "equations", "correction")
+STAGES = ("render", "ocr", "layout", "equations", "correction", "structured")
 _STAGES = STAGES  # backward-compat alias
 
 _PATH_COL: dict[str, str] = {
     "render": "png_path",
     "ocr": "json_path",
+    "layout": "json_path",
     "equations": "json_path",
     "correction": "md_path",
+    "structured": "json_path",
 }
 
 

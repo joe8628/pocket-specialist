@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pipeline.foundation.cif import CanonicalIntermediateFormat
-from pipeline.foundation.config import PipelineSettings
-from pipeline.foundation.gpu import GPUScheduler
-from pipeline.foundation.validation import OutputValidationError, OutputValidator
-from pipeline.models import BlockType, BoundingBox, TextBlock
+from pocket_specialist.core.cif import CanonicalIntermediateFormat
+from pocket_specialist.core.config import PipelineSettings
+from pocket_specialist.core.gpu import GPUScheduler
+from pocket_specialist.core.validation import OutputValidationError, OutputValidator
+from pocket_specialist.core.models import BlockType, BoundingBox, TextBlock
 
 
 def test_pipeline_settings_from_env_uses_project_root(tmp_path, monkeypatch):

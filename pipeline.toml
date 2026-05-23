@@ -1,0 +1,36 @@
+[pipeline]
+version = "0.5.1-beta"
+
+[ocr]
+provider = "glm-ocr"
+fallback_provider = "deepseek-ocr"
+ollama_base_url = "http://localhost:11434"
+timeout_seconds = 60
+batch_size = 4
+
+[layout]
+provider = "pp-doclayout-v3"
+enabled = true
+
+[formula]
+enabled = true
+base_url = "http://localhost:8001"
+model_size = "base"
+fallback_to_ocr = true
+
+[embedding]
+provider = "nomic-embed-text"
+ollama_base_url = "http://localhost:11434"
+
+[gpu]
+serialized_execution = true
+max_gpu_workers = 1
+
+[chunking]
+max_tokens = 512
+overlap_tokens = 64
+
+[storage]
+sqlite_path = "./data/pipeline.db"
+artifact_path = "./data/artifacts"
+chroma_path = "./data/chroma"

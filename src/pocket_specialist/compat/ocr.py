@@ -16,11 +16,11 @@ from typing import Optional
 
 from PIL import Image
 
-from config import ocr_dir_for, render_dir_for
-from pipeline.checkpoint import get_status, init_db, set_status, should_process
-from pipeline.foundation.gpu import gpu_scheduler
-from pipeline.foundation.ocr import SuryaOCRProvider
-from pipeline.models import TextBlock
+from pocket_specialist.core.config import ocr_dir_for, render_dir_for
+from pocket_specialist.storage.checkpoint import get_status, init_db, set_status, should_process
+from pocket_specialist.core.gpu import gpu_scheduler
+from pocket_specialist.ocr.providers import SuryaOCRProvider
+from pocket_specialist.core.models import TextBlock
 
 
 def _pnum(path: Path) -> int:

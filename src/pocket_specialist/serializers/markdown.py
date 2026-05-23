@@ -12,7 +12,7 @@ import re
 import sys
 from pathlib import Path
 
-from pipeline.models import BlockType, OutputManifest, OutputRecord, TextBlock
+from pocket_specialist.core.models import BlockType, OutputManifest, OutputRecord, TextBlock
 
 
 _RE_HEADING = re.compile(r'^#{1,6}\s+(.+)$', re.MULTILINE)

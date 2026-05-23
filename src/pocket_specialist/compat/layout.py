@@ -4,7 +4,7 @@ Used by OCR and enrichment workflows to linearize multi-column pages into correc
 before writing per-page JSON.
 """
 from __future__ import annotations
-from pipeline.models import TextBlock, BoundingBox
+from pocket_specialist.core.models import TextBlock, BoundingBox
 
 
 def _x_center(block: TextBlock) -> float:

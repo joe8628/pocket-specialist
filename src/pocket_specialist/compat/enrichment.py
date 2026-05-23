@@ -22,9 +22,9 @@ from typing import Optional
 import torch
 from PIL import Image
 
-from config import EQUATION_CONF_THRESHOLD, FOOTER_STRIP_RATIO, HEADER_STRIP_RATIO, crops_dir_for, equations_dir_for, ocr_dir_for, render_dir_for
-from pipeline.checkpoint import get_status, init_db, set_status, should_process
-from pipeline.models import BlockType, TextBlock
+from pocket_specialist.core.config import EQUATION_CONF_THRESHOLD, FOOTER_STRIP_RATIO, HEADER_STRIP_RATIO, crops_dir_for, equations_dir_for, ocr_dir_for, render_dir_for
+from pocket_specialist.storage.checkpoint import get_status, init_db, set_status, should_process
+from pocket_specialist.core.models import BlockType, TextBlock
 
 
 _RE_EQ_NUMBER = re.compile(r'^\s*\(\d+(?:\.\d+)*\)\s*$')

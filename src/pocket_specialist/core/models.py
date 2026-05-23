@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
-from pipeline.foundation.cif import ProvenanceRecord, SourceCoords, StructuredBlock
+from pocket_specialist.core.cif import ProvenanceRecord, SourceCoords, StructuredBlock
 
 
 class BlockType(str, Enum):

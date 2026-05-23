@@ -7,8 +7,8 @@ from typing import cast
 
 import fitz  # PyMuPDF
 
-from config import RENDER_ZOOM, document_slug, render_dir_for
-from pipeline.checkpoint import get_status, init_db, set_status, should_process
+from pocket_specialist.core.config import RENDER_ZOOM, document_slug, render_dir_for
+from pocket_specialist.storage.checkpoint import get_status, init_db, set_status, should_process
 
 
 def render_page(doc: fitz.Document, page_num: int, output_dir: Path, zoom: float) -> Path:

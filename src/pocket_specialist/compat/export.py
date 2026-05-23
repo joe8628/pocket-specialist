@@ -14,10 +14,10 @@ from typing import Optional
 
 import requests
 
-from config import OLLAMA_BASE, OLLAMA_MODEL, correction_dir_for, crops_dir_for, equations_dir_for
-from pipeline.checkpoint import get_status, init_db, set_status, should_process
-from pipeline.serialization import _deduplicate, _format_blocks_as_markdown, _unwrap_spurious_containers
-from pipeline.models import BlockType, TextBlock
+from pocket_specialist.core.config import OLLAMA_BASE, OLLAMA_MODEL, correction_dir_for, crops_dir_for, equations_dir_for
+from pocket_specialist.storage.checkpoint import get_status, init_db, set_status, should_process
+from pocket_specialist.serializers.markdown import _deduplicate, _format_blocks_as_markdown, _unwrap_spurious_containers
+from pocket_specialist.core.models import BlockType, TextBlock
 
 
 _OLLAMA_BASE = OLLAMA_BASE

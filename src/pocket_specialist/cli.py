@@ -13,16 +13,16 @@ app = typer.Typer(
 
 
 def _doc_slug(pdf_path: Path) -> str:
-    from config import document_slug
+    from pocket_specialist.core.config import document_slug
 
     return document_slug(pdf_path.resolve())
 
 
 def _known_documents() -> list[str]:
-    from config import CHECKPOINT_DIR
-    from pipeline.checkpoint import get_documents, init_db
+    from pocket_specialist.core.config import CHECKPOINT_DIR
+    from pocket_specialist.storage.checkpoint import get_documents, init_db
 
-    reserved_roots = {"rendered", "ocr", "equations", "crops", "corrected", "__pycache__"}
+    reserved_roots = {"rendered", "ocr", "layout", "equations", "crops", "corrected", "structured", "__pycache__"}
     docs = set()
     if CHECKPOINT_DIR.exists():
         for path in CHECKPOINT_DIR.iterdir():
@@ -45,7 +45,7 @@ def _resolve_document(pdf: Path | None = None, doc: str | None = None) -> str:
 
 
 def _resume_state(document: str) -> tuple[str | None, int | None]:
-    from pipeline.checkpoint import STAGES, get_done_pages, init_db
+    from pocket_specialist.storage.checkpoint import STAGES, get_done_pages, init_db
 
     init_db()
     for stage in reversed(STAGES):
@@ -64,8 +64,8 @@ def rename_corpus_cmd(
     manifest: Path = typer.Option(None, "--manifest", help="Override manifest output path."),
 ) -> None:
     """Normalize corpus filenames and write a metadata manifest."""
-    from config import CHECKPOINT_DIR, CORPUS_DIR
-    from pipeline.rename import rename_corpus
+    from pocket_specialist.core.config import CHECKPOINT_DIR, CORPUS_DIR
+    from pocket_specialist.compat.rename import rename_corpus
 
     target = (corpus_dir or CORPUS_DIR).resolve()
     manifest_path = manifest or CHECKPOINT_DIR / "rename_manifest.json"
@@ -94,8 +94,8 @@ def render(
     output_dir: Path = typer.Option(None, "--output-dir", help="Override document-scoped PNG output directory."),
 ) -> None:
     """Render PDF pages to document-scoped PNG images."""
-    from config import render_dir_for
-    from pipeline.render import render_pdf
+    from pocket_specialist.core.config import render_dir_for
+    from pocket_specialist.compat.render import render_pdf
 
     pdf_path = pdf.resolve()
     out = output_dir or render_dir_for(_doc_slug(pdf_path))
@@ -113,8 +113,8 @@ def ocr(
     output_dir: Path = typer.Option(None, "--output-dir", help="Override document-scoped OCR JSON output directory."),
 ) -> None:
     """Extract OCR blocks from rendered page images into structured JSON."""
-    from config import ocr_dir_for, render_dir_for
-    from pipeline.ocr import ocr_pages
+    from pocket_specialist.core.config import ocr_dir_for, render_dir_for
+    from pocket_specialist.compat.ocr import ocr_pages
 
     pdf_path = pdf.resolve()
     document = _doc_slug(pdf_path)
@@ -124,6 +124,51 @@ def ocr(
         ocr_dir=output_dir or ocr_dir_for(document),
         start_page=start_page,
         end_page=end_page,
+    )
+    if failed:
+        raise typer.Exit(1)
+
+
+@app.command(name="layout")
+def layout_detect(
+    pdf: Path = typer.Argument(..., help="Source PDF file."),
+    output_dir: Path = typer.Option(None, "--output-dir", help="Override document-scoped layout JSON output directory."),
+) -> None:
+    """Detect page layout regions and write per-page layout JSON."""
+    from pocket_specialist.core.config import layout_dir_for
+    from pocket_specialist.phases.extract import detect_layout_document
+
+    pdf_path = pdf.resolve()
+    document = _doc_slug(pdf_path)
+    done, failed, _ = detect_layout_document(pdf_path, layout_output_dir=output_dir or layout_dir_for(document))
+    typer.echo(f"Layout detection complete: {done} done, {failed} failed.")
+    if failed:
+        raise typer.Exit(1)
+
+
+@app.command(name="extract-structured")
+def extract_structured(
+    source: Path = typer.Argument(..., help="Source document. Supports PDF and HTML."),
+    output_dir: Path = typer.Option(None, "--output-dir", help="Override document-scoped structured JSON output directory."),
+    layout_output_dir: Path = typer.Option(None, "--layout-output-dir", help="Override document-scoped layout JSON output directory."),
+) -> None:
+    """Run the Phase B structured extraction path for PDF or HTML input."""
+    from pocket_specialist.core.config import layout_dir_for, structured_dir_for
+    from pocket_specialist.handlers.intake import classify_document
+    from pocket_specialist.phases.extract import extract_structured_document
+
+    source_path = source.resolve()
+    profile = classify_document(source_path)
+    structured_target = output_dir or structured_dir_for(profile.doc_id)
+    layout_target = layout_output_dir or layout_dir_for(profile.doc_id)
+    done, failed, cif = extract_structured_document(
+        source_path,
+        structured_output_dir=structured_target,
+        layout_output_dir=layout_target,
+    )
+    typer.echo(
+        f"Structured extraction complete: {done} done, {failed} failed. "
+        f"Blocks: {len(cif.blocks)}. Output: {structured_target / 'document.json'}"
     )
     if failed:
         raise typer.Exit(1)
@@ -142,8 +187,8 @@ def equations(
     crops_dir: Path = typer.Option(None, "--crops-dir", help="Override document-scoped equation crop directory."),
 ) -> None:
     """Enrich OCR pages with layout classes, equation crops, and LaTeX extraction."""
-    from config import crops_dir_for, equations_dir_for, ocr_dir_for, render_dir_for
-    from pipeline.enrichment import enrich_document
+    from pocket_specialist.core.config import crops_dir_for, equations_dir_for, ocr_dir_for, render_dir_for
+    from pocket_specialist.compat.enrichment import enrich_document
 
     pdf_path = pdf.resolve()
     document = _doc_slug(pdf_path)
@@ -175,8 +220,8 @@ def correct(
     output_dir: Path = typer.Option(None, "--output-dir", help="Override document-scoped correction export directory."),
 ) -> None:
     """Run the optional LLM-backed correction/export pass."""
-    from config import correction_dir_for, crops_dir_for, equations_dir_for
-    from pipeline.export import correct_pages
+    from pocket_specialist.core.config import correction_dir_for, crops_dir_for, equations_dir_for
+    from pocket_specialist.compat.export import correct_pages
 
     pdf_path = pdf.resolve()
     document = _doc_slug(pdf_path)
@@ -202,8 +247,8 @@ def assemble(
     output_dir: Path = typer.Option(None, "--output-dir", help="Output directory (default: output/<doc>/)."),
 ) -> None:
     """Assemble per-page exports into final document outputs."""
-    from config import correction_dir_for, equations_dir_for, output_dir_for
-    from pipeline.serialization import assemble_document as _assemble
+    from pocket_specialist.core.config import correction_dir_for, equations_dir_for, output_dir_for
+    from pocket_specialist.serializers.markdown import assemble_document as _assemble
 
     pdf_path = pdf.resolve()
     document = _doc_slug(pdf_path)
@@ -230,12 +275,12 @@ def _run_pipeline(
     """Run the current compatibility pipeline for a single PDF."""
     import time
 
-    from config import correction_dir_for, crops_dir_for, equations_dir_for, ocr_dir_for, output_dir_for, render_dir_for
-    from pipeline.serialization import assemble_document
-    from pipeline.export import correct_pages
-    from pipeline.enrichment import enrich_document
-    from pipeline.ocr import ocr_pages
-    from pipeline.render import render_pdf
+    from pocket_specialist.core.config import correction_dir_for, crops_dir_for, equations_dir_for, ocr_dir_for, output_dir_for, render_dir_for
+    from pocket_specialist.serializers.markdown import assemble_document
+    from pocket_specialist.compat.export import correct_pages
+    from pocket_specialist.compat.enrichment import enrich_document
+    from pocket_specialist.compat.ocr import ocr_pages
+    from pocket_specialist.compat.render import render_pdf
 
     document = _doc_slug(pdf_path)
     render_dir = render_dir_for(document)
@@ -308,8 +353,8 @@ def run(
     parallel_pages: int = typer.Option(1, "--parallel-pages", min=1, help="Max pages to process concurrently in correction/export."),
 ) -> None:
     """Run the current end-to-end compatibility pipeline on a single PDF."""
-    from config import CHECKPOINT_DIR
-    from pipeline.rename import rename_corpus
+    from pocket_specialist.core.config import CHECKPOINT_DIR
+    from pocket_specialist.compat.rename import rename_corpus
 
     pdf_path = pdf.resolve()
     typer.echo("=== Corpus intake: normalize filenames ===")
@@ -346,8 +391,8 @@ def run_all(
     parallel_pages: int = typer.Option(1, "--parallel-pages", min=1, help="Max pages to process concurrently in correction/export."),
 ) -> None:
     """Run the current end-to-end compatibility pipeline on every PDF in the corpus."""
-    from config import CHECKPOINT_DIR, CORPUS_DIR
-    from pipeline.rename import rename_corpus
+    from pocket_specialist.core.config import CHECKPOINT_DIR, CORPUS_DIR
+    from pocket_specialist.compat.rename import rename_corpus
 
     target = (corpus_dir or CORPUS_DIR).resolve()
     pdfs = sorted(target.glob("*.pdf"))
@@ -386,7 +431,7 @@ def status(
     doc: str = typer.Option(None, "--doc", help="Show status for one document slug."),
 ) -> None:
     """Show per-step progress from the checkpoint database."""
-    from pipeline.checkpoint import STAGES, get_failed_pages, get_summary, init_db
+    from pocket_specialist.storage.checkpoint import STAGES, get_failed_pages, get_summary, init_db
 
     init_db()
     documents = [_resolve_document(pdf, doc)] if (pdf or doc) else _known_documents()
@@ -422,15 +467,15 @@ def reset(
     stage: str = typer.Option(
         None,
         "--stage",
-        help="Pipeline step to reset: render, ocr, equations, correction. Omit to reset all.",
+        help="Pipeline step to reset: render, ocr, layout, equations, correction, structured. Omit to reset all.",
     ),
     pdf: Path = typer.Option(None, "--pdf", help="Reset one source PDF's checkpoint/output state."),
     doc: str = typer.Option(None, "--doc", help="Reset one document slug's checkpoint/output state."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt."),
 ) -> None:
     """Reset document-scoped pipeline outputs and checkpoint records."""
-    from config import correction_dir_for, crops_dir_for, document_checkpoint_dir, equations_dir_for, ocr_dir_for, render_dir_for
-    from pipeline.checkpoint import STAGES, init_db, reset_stage
+    from pocket_specialist.core.config import correction_dir_for, crops_dir_for, document_checkpoint_dir, equations_dir_for, layout_dir_for, ocr_dir_for, render_dir_for, structured_dir_for
+    from pocket_specialist.storage.checkpoint import STAGES, init_db, reset_stage
 
     stage_order = list(STAGES)
 
@@ -438,8 +483,10 @@ def reset(
         return {
             "render": [render_dir_for(document)],
             "ocr": [ocr_dir_for(document)],
+            "layout": [layout_dir_for(document)],
             "equations": [equations_dir_for(document), crops_dir_for(document)],
             "correction": [correction_dir_for(document)],
+            "structured": [structured_dir_for(document)],
         }
 
     def _clear_dir(path: Path) -> int:
@@ -487,5 +534,9 @@ def reset(
             doc_dir.rmdir()
 
 
-if __name__ == "__main__":
+def main() -> None:
     app()
+
+
+if __name__ == "__main__":
+    main()
