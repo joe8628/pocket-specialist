@@ -143,11 +143,11 @@ def equations(
 ) -> None:
     """Enrich OCR pages with layout classes, equation crops, and LaTeX extraction."""
     from config import crops_dir_for, equations_dir_for, ocr_dir_for, render_dir_for
-    from pipeline.equations import process_equations
+    from pipeline.enrichment import enrich_document
 
     pdf_path = pdf.resolve()
     document = _doc_slug(pdf_path)
-    done, failed = process_equations(
+    done, failed = enrich_document(
         document=document,
         render_dir=render_dir or render_dir_for(document),
         ocr_dir=ocr_dir_for(document),
@@ -176,7 +176,7 @@ def correct(
 ) -> None:
     """Run the optional LLM-backed correction/export pass."""
     from config import correction_dir_for, crops_dir_for, equations_dir_for
-    from pipeline.correction import correct_pages
+    from pipeline.export import correct_pages
 
     pdf_path = pdf.resolve()
     document = _doc_slug(pdf_path)
@@ -203,7 +203,7 @@ def assemble(
 ) -> None:
     """Assemble per-page exports into final document outputs."""
     from config import correction_dir_for, equations_dir_for, output_dir_for
-    from pipeline.assemble import assemble as _assemble
+    from pipeline.serialization import assemble_document as _assemble
 
     pdf_path = pdf.resolve()
     document = _doc_slug(pdf_path)
@@ -231,9 +231,9 @@ def _run_pipeline(
     import time
 
     from config import correction_dir_for, crops_dir_for, equations_dir_for, ocr_dir_for, output_dir_for, render_dir_for
-    from pipeline.assemble import assemble
-    from pipeline.correction import correct_pages
-    from pipeline.equations import process_equations
+    from pipeline.serialization import assemble_document
+    from pipeline.export import correct_pages
+    from pipeline.enrichment import enrich_document
     from pipeline.ocr import ocr_pages
     from pipeline.render import render_pdf
 
@@ -258,7 +258,7 @@ def _run_pipeline(
     ocr_pages(document=document, render_dir=render_dir, ocr_dir=ocr_dir, start_page=start_page, end_page=end_page)
 
     typer.echo(f"\n  Enrichment: layout + formulas  ({pdf_path.name})")
-    process_equations(
+    enrich_document(
         document=document,
         render_dir=render_dir,
         ocr_dir=ocr_dir,
@@ -282,7 +282,7 @@ def _run_pipeline(
         )
 
     typer.echo(f"\n  Assemble: final outputs  ({pdf_path.name})")
-    assemble(
+    assemble_document(
         corrected_dir=correction_dir,
         output_dir=final_output_dir,
         source_pdf=pdf_path,

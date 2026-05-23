@@ -1,4 +1,4 @@
-"""Optional LLM-backed correction/export pass for enriched OCR blocks.
+"""Optional export-normalization pass for enriched OCR blocks.
 
 Input:  checkpoints/equations/page_{N:04d}.json
 Output: checkpoints/corrected/page_{N:04d}.md
@@ -16,7 +16,7 @@ import requests
 
 from config import OLLAMA_BASE, OLLAMA_MODEL, correction_dir_for, crops_dir_for, equations_dir_for
 from pipeline.checkpoint import get_status, init_db, set_status, should_process
-from pipeline.assemble import _deduplicate, _format_blocks_as_markdown, _unwrap_spurious_containers
+from pipeline.serialization import _deduplicate, _format_blocks_as_markdown, _unwrap_spurious_containers
 from pipeline.models import BlockType, TextBlock
 
 

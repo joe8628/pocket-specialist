@@ -1,4 +1,4 @@
-"""Layout- and formula-enrichment utilities for OCR outputs.
+"""Document enrichment utilities for layout classification and formula extraction.
 
 This module currently couples Surya layout detection and LaTeX extraction under
 a shared GPU lifecycle. It enriches rendered-page OCR JSON with semantic block
@@ -182,7 +182,7 @@ def _crop_equation(image: Image.Image, block: TextBlock, pad: float = 0.10) -> I
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def process_equations(
+def enrich_document(
     document: str,
     render_dir: Path | None = None,
     ocr_dir: Path | None = None,

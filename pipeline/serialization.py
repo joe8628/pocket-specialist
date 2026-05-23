@@ -1,4 +1,4 @@
-"""Assemble per-page exports into final document outputs.
+"""Serialization and final export assembly utilities.
 
 Input:  checkpoints/corrected/page_{N:04d}.md
         checkpoints/equations/page_{N:04d}.json
@@ -189,7 +189,7 @@ def assemble_manifest(
     return succeeded
 
 
-def assemble(
+def assemble_document(
     corrected_dir: Path,
     output_dir: Path,
     source_pdf: Path,
