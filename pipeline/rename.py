@@ -1,4 +1,4 @@
-"""Stage 0: Standardize RAG-corpus filenames and write a metadata manifest.
+"""Corpus intake helpers for standardizing filenames and writing a metadata manifest.
 
 Naming convention produced: {lastname}_{year}_{title_slug}.pdf
 

@@ -1,6 +1,6 @@
 """Layout utilities: column-order detection and block reordering.
 
-Used by Stage 2 (OCR) to linearize multi-column pages into correct reading order
+Used by OCR and enrichment workflows to linearize multi-column pages into correct reading order
 before writing per-page JSON.
 """
 from __future__ import annotations

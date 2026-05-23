@@ -1,7 +1,7 @@
-"""Stage 4: Ollama LLM correction pass — structured OCR blocks → clean Markdown.
+"""Optional LLM-backed correction/export pass for enriched OCR blocks.
 
-Input:  checkpoints/equations/page_{N:04d}.json  (from Stage 3)
-Output: checkpoints/corrected/page_{N:04d}.md    (clean Markdown per page)
+Input:  checkpoints/equations/page_{N:04d}.json
+Output: checkpoints/corrected/page_{N:04d}.md
 """
 from __future__ import annotations
 import base64
@@ -14,16 +14,17 @@ from typing import Optional
 
 import requests
 
-from config import CORRECTION_DIR, CROPS_DIR, EQUATIONS_DIR
+from config import OLLAMA_BASE, OLLAMA_MODEL, correction_dir_for, crops_dir_for, equations_dir_for
 from pipeline.checkpoint import get_status, init_db, set_status, should_process
 from pipeline.assemble import _deduplicate, _format_blocks_as_markdown, _unwrap_spurious_containers
 from pipeline.models import BlockType, TextBlock
 
 
-_OLLAMA_BASE = "http://localhost:11434"
-_OLLAMA_MODEL = "qwen2.5vl:3b"
+_OLLAMA_BASE = OLLAMA_BASE
+_OLLAMA_MODEL = OLLAMA_MODEL
 _OLLAMA_NUM_CTX = 6192
-_EQUATION_RETRIES = 3
+_EQUATION_RETRIES = 2
+_EQUATION_TIMEOUT_SECS = 45
 
 _EQUATION_SYSTEM_PROMPT = (
     "You are verifying a single OCR-extracted textbook equation against one attached equation crop image. "
@@ -366,12 +367,25 @@ def correct_equation_latex(
     last_exc: Exception | None = None
     for attempt in range(1, _EQUATION_RETRIES + 1):
         try:
-            resp = requests.post(f"{_OLLAMA_BASE}/api/chat", json=payload, timeout=120)
+            resp = requests.post(
+                f"{_OLLAMA_BASE}/api/chat",
+                json=payload,
+                timeout=_EQUATION_TIMEOUT_SECS,
+            )
             resp.raise_for_status()
             result = _normalize_latex(resp.json()["message"]["content"])
             if not result:
                 raise ValueError(f"Empty LaTeX correction for {ref_name} on page {page_num}")
             return result
+        except requests.HTTPError as exc:
+            last_exc = exc
+            status_code = exc.response.status_code if exc.response is not None else None
+            if status_code and 500 <= status_code < 600:
+                raise exc
+            if attempt < _EQUATION_RETRIES:
+                print(
+                    f"  [correction] page {page_num} {ref_name}: retry {attempt}/{_EQUATION_RETRIES - 1} after error — {exc}"
+                )
         except Exception as exc:
             last_exc = exc
             if attempt < _EQUATION_RETRIES:
@@ -476,22 +490,27 @@ def _correct_page_job(jp: Path, model: str, crops_dir: Path) -> tuple[int, str]:
 
 
 def correct_pages(
-    equations_dir: Path = EQUATIONS_DIR,
-    correction_dir: Path = CORRECTION_DIR,
+    document: str,
+    equations_dir: Path | None = None,
+    correction_dir: Path | None = None,
     model: str = _OLLAMA_MODEL,
     start_page: Optional[int] = None,
     end_page: Optional[int] = None,
     max_parallel: int = 2,
-    crops_dir: Path = CROPS_DIR,
+    crops_dir: Path | None = None,
 ) -> tuple[int, int]:
     """Correct all pages via Ollama; write .md files. Returns (done, failed)."""
 
     def _pnum(p: Path) -> int:
         return int(p.stem.split("_")[1])
 
+    equations_dir = equations_dir or equations_dir_for(document)
+    correction_dir = correction_dir or correction_dir_for(document)
+    crops_dir = crops_dir or crops_dir_for(document)
+
     eq_jsons = sorted(equations_dir.glob("page_*.json"))
     if not eq_jsons:
-        print(f"Error: no equation output in {equations_dir}. Run Stage 3 first.", file=sys.stderr)
+        print(f"Error: no equation output in {equations_dir}. Run layout/formula enrichment first.", file=sys.stderr)
         return 0, 0
 
     if start_page or end_page:
@@ -507,8 +526,8 @@ def correct_pages(
             print(f"  [correction] page {pn}: no equation crops, skipping.")
             skipped_no_crops += 1
             continue
-        if not should_process("correction", pn):
-            status, _ = get_status("correction", pn)
+        if not should_process("correction", document, pn):
+            status, _ = get_status("correction", document, pn)
             if status == "done":
                 skipped += 1
             else:
@@ -544,14 +563,14 @@ def correct_pages(
         nonlocal done
         out_path = correction_dir / f"page_{pn:04d}.md"
         out_path.write_text(markdown, encoding="utf-8")
-        set_status("correction", pn, "done", str(out_path))
+        set_status("correction", document, pn, "done", str(out_path))
         done += 1
         lines = markdown.count("\n") + 1
         print(f"  [correction] page {pn} → {out_path.name}  ({lines} lines)")
 
     def _commit_failure(pn: int, exc: Exception) -> None:
         nonlocal failed
-        set_status("correction", pn, "failed")
+        set_status("correction", document, pn, "failed")
         failed += 1
         print(f"  [correction] page {pn}: FAILED — {exc}")
 

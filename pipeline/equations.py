@@ -1,17 +1,14 @@
-"""Stage 3: Surya layout detection + Surya LaTeX OCR on equation regions.
+"""Layout- and formula-enrichment utilities for OCR outputs.
 
-Two phases within one stage — single VRAM budget, sequential model loads:
+This module currently couples Surya layout detection and LaTeX extraction under
+a shared GPU lifecycle. It enriches rendered-page OCR JSON with semantic block
+types, equation crops, and equation LaTeX while the broader architecture moves
+toward the spec-defined split between layout and formula subsystems.
 
-  Phase 1 (Surya Layout):   identifies Equation / Text / Heading / Figure / Table regions
-                            across all pages in a single model load, then unloads.
-  Phase 2 (Surya LaTeX OCR): crops each equation region, converts to LaTeX using
-                            RecognitionPredictor with TaskNames.block_without_boxes,
-                            then unloads. No separate texify model needed.
+Input:  checkpoints/rendered/page_{N:04d}.png
+        checkpoints/ocr/page_{N:04d}.json
 
-Input:  checkpoints/rendered/page_{N:04d}.png   (from Stage 1)
-        checkpoints/ocr/page_{N:04d}.json       (from Stage 2)
-
-Output: checkpoints/equations/page_{N:04d}.json (OCR JSON enriched with block_type + latex)
+Output: checkpoints/equations/page_{N:04d}.json
         checkpoints/crops/page_{N:04d}_eq_{M:02d}.png
 """
 from __future__ import annotations
@@ -25,7 +22,7 @@ from typing import Optional
 import torch
 from PIL import Image
 
-from config import CROPS_DIR, EQUATION_CONF_THRESHOLD, EQUATIONS_DIR, FOOTER_STRIP_RATIO, HEADER_STRIP_RATIO, OCR_DIR, RENDER_DIR
+from config import EQUATION_CONF_THRESHOLD, FOOTER_STRIP_RATIO, HEADER_STRIP_RATIO, crops_dir_for, equations_dir_for, ocr_dir_for, render_dir_for
 from pipeline.checkpoint import get_status, init_db, set_status, should_process
 from pipeline.models import BlockType, TextBlock
 
@@ -186,10 +183,11 @@ def _crop_equation(image: Image.Image, block: TextBlock, pad: float = 0.10) -> I
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def process_equations(
-    render_dir: Path = RENDER_DIR,
-    ocr_dir: Path = OCR_DIR,
-    equations_dir: Path = EQUATIONS_DIR,
-    crops_dir: Path = CROPS_DIR,
+    document: str,
+    render_dir: Path | None = None,
+    ocr_dir: Path | None = None,
+    equations_dir: Path | None = None,
+    crops_dir: Path | None = None,
     start_page: Optional[int] = None,
     end_page: Optional[int] = None,
     eq_threshold: float = EQUATION_CONF_THRESHOLD,
@@ -199,9 +197,14 @@ def process_equations(
     def _pnum(p: Path) -> int:
         return int(p.stem.split("_")[1])
 
+    render_dir = render_dir or render_dir_for(document)
+    ocr_dir = ocr_dir or ocr_dir_for(document)
+    equations_dir = equations_dir or equations_dir_for(document)
+    crops_dir = crops_dir or crops_dir_for(document)
+
     ocr_jsons = sorted(ocr_dir.glob("page_*.json"))
     if not ocr_jsons:
-        print(f"Error: no OCR output in {ocr_dir}. Run Stage 2 first.", file=sys.stderr)
+        print(f"Error: no OCR output in {ocr_dir}. Run OCR extraction first.", file=sys.stderr)
         return 0, 0
 
     if start_page or end_page:
@@ -212,8 +215,8 @@ def process_equations(
     skipped = pre_failed = 0
     for jp in ocr_jsons:
         pn = _pnum(jp)
-        if not should_process("equations", pn):
-            status, _ = get_status("equations", pn)
+        if not should_process("equations", document, pn):
+            status, _ = get_status("equations", document, pn)
             if status == "done":
                 skipped += 1
             else:
@@ -329,12 +332,12 @@ def process_equations(
             out_path = equations_dir / f"page_{pn:04d}.json"
             out_path.write_text(json.dumps(out, indent=2, ensure_ascii=False))
 
-            set_status("equations", pn, "done", str(out_path))
+            set_status("equations", document, pn, "done", str(out_path))
             done += 1
             print(f"  [equations] page {pn} → {out_path.name}  ({len(eq_crops)} equations extracted)")
 
         except Exception as exc:
-            set_status("equations", pn, "failed")
+            set_status("equations", document, pn, "failed")
             failed += 1
             print(f"  [equations] page {pn}: FAILED — {exc}")
 

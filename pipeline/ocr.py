@@ -1,103 +1,66 @@
-"""Stage 2: Surya OCR on rendered page images.
+"""OCR extraction on rendered page images via the Phase A provider layer.
 
-Input:  checkpoints/rendered/page_{N:04d}.png
-Output: checkpoints/ocr/page_{N:04d}.json
+Input:  document-scoped checkpoints/rendered/page_{N:04d}.png
+Output: document-scoped checkpoints/ocr/page_{N:04d}.json
 
 JSON schema:
   { "page_num": int, "image_path": str, "image_width": int, "image_height": int,
-    "blocks": [ TextBlock.to_dict(), ... ] }   # column-reordered, block_type=unknown
+    "blocks": [ TextBlock.to_dict(), ... ], "ocr_provider": str, "ocr_metadata": dict }
 """
 from __future__ import annotations
-import gc
+
 import json
 import sys
 from pathlib import Path
 from typing import Optional
 
-import torch
 from PIL import Image
 
-from config import OCR_DIR, RENDER_DIR
-from pipeline.checkpoint import init_db, set_status, should_process, get_status
-from pipeline.models import BlockType, BoundingBox, TextBlock
+from config import ocr_dir_for, render_dir_for
+from pipeline.checkpoint import get_status, init_db, set_status, should_process
+from pipeline.foundation.gpu import gpu_scheduler
+from pipeline.foundation.ocr import SuryaOCRProvider
+from pipeline.models import TextBlock
 
 
-def _load_surya():
-    try:
-        from surya.detection import DetectionPredictor
-        from surya.foundation import FoundationPredictor
-        from surya.recognition import RecognitionPredictor
-        from surya.settings import settings
-    except ImportError:
-        print("Error: surya-ocr is not installed. Run: pip install surya-ocr", file=sys.stderr)
-        sys.exit(1)
-
-    print("  loading detection model...")
-    det = DetectionPredictor()
-    print("  loading recognition model...")
-    foundation = FoundationPredictor(checkpoint=settings.RECOGNITION_MODEL_CHECKPOINT)
-    rec = RecognitionPredictor(foundation)
-    return det, rec, foundation
-
-
-def _surya_ocr_page(
-    image: Image.Image,
-    det_predictor,
-    rec_predictor,
-) -> list[TextBlock]:
-    """Run Surya on one page image. Returns TextBlocks (not yet column-reordered)."""
-    results = rec_predictor([image], det_predictor=det_predictor)
-    blocks: list[TextBlock] = []
-    for line in results[0].text_lines:
-        if not line.text.strip():
-            continue
-        x0, y0, x1, y1 = line.bbox
-        blocks.append(TextBlock(
-            bbox=BoundingBox(x0=x0, y0=y0, x1=x1, y1=y1),
-            raw_text=line.text,
-            confidence=float(line.confidence or 0.0),
-            block_type=BlockType.UNKNOWN,
-        ))
-    return blocks
+def _pnum(path: Path) -> int:
+    return int(path.stem.split("_")[1])
 
 
 def ocr_pages(
-    render_dir: Path = RENDER_DIR,
-    ocr_dir: Path = OCR_DIR,
+    document: str,
+    render_dir: Path | None = None,
+    ocr_dir: Path | None = None,
     start_page: Optional[int] = None,
     end_page: Optional[int] = None,
 ) -> tuple[int, int]:
-    """
-    Run Surya OCR on all rendered PNGs that haven't been processed yet.
+    """Run OCR on rendered PNGs for one document. Returns (done, failed)."""
 
-    Loads models once, processes pages in order, writes per-page JSON, returns (done, failed).
-    """
-    def _pnum(p: Path) -> int:
-        return int(p.stem.split("_")[1])
+    render_dir = render_dir or render_dir_for(document)
+    ocr_dir = ocr_dir or ocr_dir_for(document)
 
     pngs = sorted(render_dir.glob("page_*.png"))
     if not pngs:
-        print(f"Error: no rendered pages found in {render_dir}. Run Stage 1 first.", file=sys.stderr)
+        print(f"Error: no rendered pages found in {render_dir}. Run rasterization first.", file=sys.stderr)
         return 0, 0
 
     if start_page or end_page:
         lo, hi = start_page or 1, end_page or _pnum(pngs[-1])
-        pngs = [p for p in pngs if lo <= _pnum(p) <= hi]
+        pngs = [path for path in pngs if lo <= _pnum(path) <= hi]
 
     ocr_dir.mkdir(parents=True, exist_ok=True)
     init_db()
 
-    # Pre-check before loading models
     to_process: list[Path] = []
     skipped = pre_failed = 0
     for png in pngs:
-        pn = _pnum(png)
-        if not should_process("ocr", pn):
-            status, _ = get_status("ocr", pn)
+        page_num = _pnum(png)
+        if not should_process("ocr", document, page_num):
+            status, _ = get_status("ocr", document, page_num)
             if status == "done":
                 skipped += 1
             else:
-                print(f"  [ocr] page {pn}: exhausted retries, skipping.")
+                print(f"  [ocr] page {page_num}: exhausted retries, skipping.")
                 pre_failed += 1
         else:
             to_process.append(png)
@@ -106,45 +69,48 @@ def ocr_pages(
         print(f"OCR: all pages already processed ({skipped} done, {pre_failed} exhausted).")
         return 0, pre_failed
 
-    print("Loading Surya OCR (GPU)...")
-    det_predictor, rec_predictor, foundation = _load_surya()
-    print("Surya OCR loaded.")
-
+    provider = SuryaOCRProvider()
     done = failed = 0
-    for png in to_process:
-        pn = _pnum(png)
-        try:
-            image = Image.open(png).convert("RGB")
-            w, h = image.size
 
-            blocks = _surya_ocr_page(image, det_predictor, rec_predictor)
-            ordered = sorted(blocks, key=lambda b: b.bbox.y0)
+    print("Loading OCR provider (GPU)...")
+    with gpu_scheduler.claim("ocr"):
+        provider.load()
+        print(f"OCR provider loaded: {provider.name}.")
 
-            record = {
-                "page_num":     pn,
-                "image_path":   str(png),
-                "image_width":  w,
-                "image_height": h,
-                "blocks":       [b.to_dict() for b in ordered],
-            }
-            out_path = ocr_dir / f"page_{pn:04d}.json"
-            out_path.write_text(json.dumps(record, indent=2, ensure_ascii=False))
+        for png in to_process:
+            page_num = _pnum(png)
+            try:
+                image = Image.open(png).convert("RGB")
+                width, height = image.size
+                image_bytes = png.read_bytes()
+                result = provider.extract(image_bytes=image_bytes, region_type="page")
+                blocks = [TextBlock.from_dict(block) for block in result.typed_content["blocks"]]
+                ordered = sorted(blocks, key=lambda block: block.bbox.y0)
 
-            set_status("ocr", pn, "done", str(out_path))
-            done += 1
-            print(f"  [ocr] page {pn} → {out_path.name}  ({len(ordered)} blocks)")
+                record = {
+                    "page_num": page_num,
+                    "image_path": str(png),
+                    "image_width": width,
+                    "image_height": height,
+                    "blocks": [block.to_dict() for block in ordered],
+                    "ocr_provider": result.provider,
+                    "ocr_metadata": result.extraction_metadata,
+                }
+                out_path = ocr_dir / f"page_{page_num:04d}.json"
+                out_path.write_text(json.dumps(record, indent=2, ensure_ascii=False))
 
-        except Exception as exc:
-            set_status("ocr", pn, "failed")
-            failed += 1
-            print(f"  [ocr] page {pn}: FAILED — {exc}")
+                set_status("ocr", document, page_num, "done", str(out_path))
+                done += 1
+                print(
+                    f"  [ocr] page {page_num} → {out_path.name}  "
+                    f"({len(ordered)} blocks, {result.latency_ms} ms)"
+                )
+            except Exception as exc:
+                set_status("ocr", document, page_num, "failed")
+                failed += 1
+                print(f"  [ocr] page {page_num}: FAILED — {exc}")
 
-    # Unload Surya from VRAM before next stage
-    del rec_predictor, det_predictor, foundation
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    print("  Surya OCR unloaded from GPU.")
+        provider.offload()
 
     print(f"\nOCR complete: {done} done, {skipped} skipped, {failed + pre_failed} failed.")
     return done, failed + pre_failed

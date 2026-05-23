@@ -1,9 +1,9 @@
-"""Stage 5: Assemble corrected per-page Markdown into final .md and .json outputs.
+"""Assemble per-page exports into final document outputs.
 
-Input:  checkpoints/corrected/page_{N:04d}.md  (from Stage 4)
-        checkpoints/equations/page_{N:04d}.json (Stage 3 fallback when --no-llm)
+Input:  checkpoints/corrected/page_{N:04d}.md
+        checkpoints/equations/page_{N:04d}.json
 
-Output: output/{stem}.md   — full book Markdown, pages delimited by <!-- page N -->
+Output: output/{stem}.md   — rendered export, pages delimited by <!-- page N -->
         output/{stem}.json — structured manifest (OutputManifest)
 """
 from __future__ import annotations
@@ -59,7 +59,7 @@ def _page_num(path: Path) -> int:
 
 
 def _format_blocks_as_markdown(blocks: list[TextBlock]) -> str:
-    """Lightweight --no-llm formatter: Stage 3 JSON blocks → Markdown."""
+    """Lightweight fallback formatter: enriched JSON blocks to Markdown export."""
     lines: list[str] = []
     for b in blocks:
         text = b.raw_text.strip()
@@ -90,7 +90,7 @@ def _collect_pages(
 ) -> list[tuple[int, str | None]]:
     """Return (page_num, content_or_None) sorted by page.
 
-    Prefers Stage 4 .md; falls back to formatting Stage 3 JSON inline;
+    Prefers corrected .md exports; falls back to formatting enriched JSON inline;
     yields None only if a page number exists in one dict but not the other
     (shouldn't occur in practice).
     """
@@ -200,7 +200,7 @@ def assemble(
     if not pages:
         raise ValueError(
             f"No pages found in {corrected_dir} or {equations_dir}. "
-            "Run earlier pipeline stages first."
+            "Run the required upstream pipeline steps first."
         )
 
     stem = source_pdf.stem
@@ -208,7 +208,7 @@ def assemble(
     md_path   = output_dir / f"{stem}.md"
     json_path = output_dir / f"{stem}.json"
 
-    # ── Markdown ──────────────────────────────────────────────────────────────
+    # ── Rendered Export ─────────────────────────────────────────────────────────
     parts: list[str] = []
     succeeded = 0
     for pn, content in pages:
@@ -248,6 +248,6 @@ def assemble(
     )
 
     print(f"Assembly complete: {succeeded} pages assembled, {failed} failed/missing.")
-    print(f"  Markdown → {md_path}")
+    print(f"  Rendered export → {md_path}")
     print(f"  Manifest → {json_path}")
     return manifest

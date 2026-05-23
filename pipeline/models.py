@@ -1,21 +1,24 @@
-"""Shared data models used across all pipeline stages."""
+"""Shared data models used across compatibility modules and Phase A foundations."""
 from __future__ import annotations
+
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
+from pipeline.foundation.cif import ProvenanceRecord, SourceCoords, StructuredBlock
+
 
 class BlockType(str, Enum):
-    TEXT      = "text"
-    HEADING   = "heading"
-    EQUATION  = "equation"
+    TEXT = "text"
+    HEADING = "heading"
+    EQUATION = "equation"
     EQUATION_FAILED = "equation_failed"
-    FOOTNOTE  = "footnote"
-    FIGURE    = "figure"
-    CAPTION   = "caption"
-    TABLE     = "table"
+    FOOTNOTE = "footnote"
+    FIGURE = "figure"
+    CAPTION = "caption"
+    TABLE = "table"
     LIST_ITEM = "list_item"
-    UNKNOWN   = "unknown"
+    UNKNOWN = "unknown"
 
 
 @dataclass
@@ -40,6 +43,9 @@ class BoundingBox:
     def from_dict(cls, d: dict) -> BoundingBox:
         return cls(d["x0"], d["y0"], d["x1"], d["y1"])
 
+    def to_tuple(self) -> tuple[int, int, int, int]:
+        return (int(self.x0), int(self.y0), int(self.x1), int(self.y1))
+
 
 @dataclass
 class TextBlock:
@@ -59,6 +65,39 @@ class TextBlock:
             "latex": self.latex,
             "latex_confidence": self.latex_confidence,
         }
+
+    def to_structured_block(
+        self,
+        *,
+        block_id: str,
+        doc_id: str,
+        reading_order: int,
+        page: int | None = None,
+        provider: str | None = None,
+        source_stage: str = "ocr",
+        section_path: list[str] | None = None,
+    ) -> StructuredBlock:
+        content: dict[str, object] = {"text": self.raw_text}
+        if self.latex is not None:
+            content["latex"] = self.latex
+        if self.latex_confidence is not None:
+            content["latex_confidence"] = self.latex_confidence
+        return StructuredBlock(
+            block_id=block_id,
+            doc_id=doc_id,
+            block_type=self.block_type.value,
+            content=content,
+            section_path=section_path or [],
+            reading_order=reading_order,
+            page=page,
+            source_coords=SourceCoords(page=page, bbox=self.bbox.to_tuple()),
+            provenance=ProvenanceRecord(
+                source_stage=source_stage,
+                provider=provider,
+                confidence=self.confidence,
+                metadata={"adapter_model": "TextBlock"},
+            ),
+        )
 
     @classmethod
     def from_dict(cls, d: dict) -> TextBlock:

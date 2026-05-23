@@ -1,33 +1,86 @@
-"""Central configuration — paths and tuneable constants for every pipeline stage."""
+"""Compatibility configuration facade backed by typed pipeline settings."""
+
+from __future__ import annotations
+
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).parent
-CORPUS_DIR    = PROJECT_ROOT.parent / "RAG-corpus"
+from pipeline.foundation.config import get_settings, slugify_document_name
 
-CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
-OUTPUT_DIR     = PROJECT_ROOT / "output"
-MODELS_DIR     = PROJECT_ROOT / "models"
+SETTINGS = get_settings()
 
-# ── Stage 1: Render ───────────────────────────────────────────────────────────
-RENDER_DIR  = CHECKPOINT_DIR / "rendered"
-RENDER_ZOOM = 2.0          # 2× → ~150 DPI at standard A4/letter size
+PROJECT_ROOT = SETTINGS.paths.project_root
+CORPUS_DIR = SETTINGS.paths.corpus_dir
 
-# ── Stage 2: OCR ──────────────────────────────────────────────────────────────
-OCR_DIR  = CHECKPOINT_DIR / "ocr"
-OCR_LANG = "en"
+CHECKPOINT_DIR = SETTINGS.paths.checkpoint_dir
+OUTPUT_DIR = SETTINGS.paths.output_dir
+MODELS_DIR = SETTINGS.paths.models_dir
 
-# ── Stage 3: Equations ────────────────────────────────────────────────────────
-EQUATIONS_DIR           = CHECKPOINT_DIR / "equations"
-CROPS_DIR               = CHECKPOINT_DIR / "crops"
-EQUATION_CONF_THRESHOLD = 0.5
-HEADER_STRIP_RATIO      = 0.10   # top N% of page height stripped as running header
-FOOTER_STRIP_RATIO      = 0.90   # bottom N% threshold (content below this is stripped)
+RENDER_ZOOM = SETTINGS.rendering.zoom
+OCR_LANG = SETTINGS.ocr.language
+EQUATION_CONF_THRESHOLD = SETTINGS.equations.confidence_threshold
+HEADER_STRIP_RATIO = SETTINGS.equations.header_strip_ratio
+FOOTER_STRIP_RATIO = SETTINGS.equations.footer_strip_ratio
+OLLAMA_MODEL = SETTINGS.ollama.model
+OLLAMA_BASE = SETTINGS.ollama.base_url
+MAX_RETRIES = SETTINGS.runtime.max_retries
+DB_PATH = SETTINGS.paths.database_path
 
-# ── Stage 4: LLM Correction (Ollama) ─────────────────────────────────────────
-CORRECTION_DIR   = CHECKPOINT_DIR / "corrected"
-OLLAMA_MODEL     = "qwen2.5vl:3b"
-OLLAMA_BASE      = "http://localhost:11434"
 
-# ── Shared ────────────────────────────────────────────────────────────────────
-MAX_RETRIES = 3
-DB_PATH     = CHECKPOINT_DIR / "pipeline.db"
+def document_slug(pdf_path: Path) -> str:
+    return SETTINGS.paths.document_slug(pdf_path)
+
+
+def document_checkpoint_dir(document: str) -> Path:
+    return SETTINGS.paths.document_checkpoint_dir(document)
+
+
+def render_dir_for(document: str) -> Path:
+    return SETTINGS.paths.render_dir_for(document)
+
+
+def ocr_dir_for(document: str) -> Path:
+    return SETTINGS.paths.ocr_dir_for(document)
+
+
+def equations_dir_for(document: str) -> Path:
+    return SETTINGS.paths.equations_dir_for(document)
+
+
+def crops_dir_for(document: str) -> Path:
+    return SETTINGS.paths.crops_dir_for(document)
+
+
+def correction_dir_for(document: str) -> Path:
+    return SETTINGS.paths.correction_dir_for(document)
+
+
+def output_dir_for(document: str, base_output_dir: Path | None = None) -> Path:
+    return SETTINGS.paths.output_dir_for(document, base_output_dir=base_output_dir)
+
+
+__all__ = [
+    "CHECKPOINT_DIR",
+    "CORPUS_DIR",
+    "DB_PATH",
+    "EQUATION_CONF_THRESHOLD",
+    "FOOTER_STRIP_RATIO",
+    "HEADER_STRIP_RATIO",
+    "MAX_RETRIES",
+    "MODELS_DIR",
+    "OCR_LANG",
+    "OLLAMA_BASE",
+    "OLLAMA_MODEL",
+    "OUTPUT_DIR",
+    "PROJECT_ROOT",
+    "RENDER_ZOOM",
+    "SETTINGS",
+    "correction_dir_for",
+    "crops_dir_for",
+    "document_checkpoint_dir",
+    "document_slug",
+    "equations_dir_for",
+    "ocr_dir_for",
+    "output_dir_for",
+    "render_dir_for",
+    "slugify_document_name",
+]

@@ -1,160 +1,137 @@
-# textbook-ocr
+# pocket-specialist
 
-GPU-accelerated pipeline that converts physics textbook PDFs into clean, structured Markdown with properly rendered equations. Stage 4 now verifies equation crops one at a time with a vision model and then renders the page deterministically.
+Local-first document intelligence pipeline for heterogeneous document ingestion, typed extraction, and retrieval-oriented downstream processing.
 
-## Pipeline overview
+This branch is being refactored against [docs/document_intelligence_pipeline_spec_v_0_5_0_beta.md](/home/jjmr/github-repos/pocket-specialist/docs/document_intelligence_pipeline_spec_v_0_5_0_beta.md:1). The current implementation target is **Phase A — Foundation** from the May 2026 beta spec.
 
-| Stage | Command | Model(s) |
-|-------|---------|----------|
-| S0 — Rename corpus | `rename-corpus` | — |
-| S1 — Render pages | `render` | PyMuPDF |
-| S2 — OCR | `ocr` | Surya (detection + recognition) |
-| S3 — Layout + equations | `equations` | Surya layout + Surya LaTeX OCR |
-| S4 — Equation correction | `correct` | `qwen2.5vl:3b` via Ollama |
-| S5 — Assemble | `assemble` | — |
+## Phase A Scope
 
-## Requirements
+Phase A establishes the architectural baseline for the new system:
 
-- Python 3.10+
-- CUDA-capable GPU (tuned for RTX 2080 Ti, 11 GB VRAM)
-- [Ollama](https://ollama.com) running locally
+- project scaffold for a DAG-oriented extraction pipeline
+- typed runtime configuration
+- OCR provider abstraction
+- output validation and repair layer
+- deterministic GPU scheduling
+- typed Canonical Intermediate Format (CIF) primitives
 
-```bash
-# Install Python deps (order matters — see requirements.txt comments)
-pip install -r requirements.txt
+This is an architecture transition point, not the final end-state pipeline. Some legacy stage modules still exist in the repo while they are being retired behind the new foundation layer.
 
-# Pull the LLM
-ollama pull qwen2.5vl:3b
+## Architectural Direction
+
+The new spec changes the repo from a Markdown-first OCR pipeline into a structured document intelligence system with these rules:
+
+- typed intermediates are the authoritative internal state
+- OCR performs extraction, not final semantic interpretation
+- layout is first-class and separate from OCR
+- execution is graph-shaped, not purely linear
+- GPU ownership is explicit and serialized
+- providers are isolated behind protocols
+- Markdown is a rendering/export layer, not storage
+- provenance must be preserved on extracted artifacts
+
+## Current Foundation Modules
+
+Phase A foundation code lives under `pipeline/foundation/` and currently includes:
+
+- `config.py`: typed settings and path management
+- `tasks.py`: extraction tasks and strongly typed processing units
+- `ocr.py`: `OCRProvider` protocol and Surya-backed provider adapter
+- `validation.py`: JSON parsing, repair, and schema gatekeeping
+- `gpu.py`: serialized GPU access and cache release hooks
+- `cif.py`: CIF blocks, artifacts, source coordinates, and provenance
+
+The legacy top-level `config.py` remains as a compatibility facade while the rest of the repo is migrated.
+
+## Repository Layout
+
+```text
+pipeline/
+  foundation/
+    cif.py
+    config.py
+    gpu.py
+    ocr.py
+    tasks.py
+    validation.py
+  checkpoint.py
+  ocr.py
+  equations.py
+  correction.py
+  assemble.py
+  render.py
+cli.py
+config.py
+docs/
 ```
 
-Surya model weights are downloaded automatically on first run.
+## Runtime Requirements
 
-## Usage
+- Python 3.11+
+- CUDA-capable GPU for Surya-backed OCR paths
+- Local filesystem access for checkpoints and artifacts
+- Optional Ollama runtime for legacy correction paths that have not been removed yet
 
-### Full pipeline (recommended)
+## Install
 
 ```bash
+python3 -m venv .venv
+./.venv/bin/pip install -r requirements.txt
+```
+
+Surya model weights download on first use.
+
+## Current CLI Surface
+
+The CLI still exposes the legacy commands while the architecture is being migrated:
+
+```bash
+python3 cli.py --help
+python3 cli.py render <pdf>
+python3 cli.py ocr <pdf>
+python3 cli.py equations <pdf>
+python3 cli.py correct <pdf>
+python3 cli.py assemble <pdf>
 python3 cli.py run <pdf>
 ```
 
-Options:
+Those commands should now be understood as compatibility entry points around an in-progress refactor. The new authoritative design is the spec, not the older stage naming.
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--start-page N` | 1 | First page (1-indexed) |
-| `--end-page N` | last | Last page inclusive |
-| `--zoom FLOAT` | 2.0 | Render scale (2.0 ≈ 150 DPI) |
-| `--no-llm` | off | Skip Stage 4 equation correction |
-| `--ollama-model NAME` | `qwen2.5vl:3b` | Ollama model for Stage 4 |
-| `--parallel-pages N` | `2` | Max Stage 4 pages to process concurrently |
-| `--output-dir PATH` | `output/` | Final output directory |
+## Configuration Model
+
+Runtime configuration now centers on typed settings in `pipeline/foundation/config.py`, with environment-variable overrides for paths and key runtime values.
 
 Examples:
 
 ```bash
-# Full book
-python3 cli.py run RAG-corpus/scherer.pdf
-
-# Pages 50–59 only
-python3 cli.py run RAG-corpus/scherer.pdf --start-page 50 --end-page 59
-
-# Single page
-python3 cli.py run RAG-corpus/scherer.pdf --start-page 42 --end-page 42
-
-# Skip Stage 4 equation correction (faster, Surya-only output)
-python3 cli.py run RAG-corpus/scherer.pdf --no-llm
-
-# Ten non-consecutive pages (run once per page; checkpoints accumulate)
-for p in 12 34 56 78 100 123 145 167 200 220; do
-  python3 cli.py run RAG-corpus/scherer.pdf --start-page $p --end-page $p
-done
+export PIPELINE_CHECKPOINT_DIR=/data/checkpoints
+export PIPELINE_OUTPUT_DIR=/data/output
+export PIPELINE_OCR_PROVIDER=surya
+export PIPELINE_OLLAMA_MODEL=qwen2.5vl:3b
 ```
 
-### Run all PDFs in corpus
+## Testing
 
 ```bash
-python3 cli.py run-all
-python3 cli.py run-all RAG-corpus/ --start-page 1 --end-page 100
+./.venv/bin/python -m pytest
 ```
 
-### Per-stage commands
+If legacy tests fail on missing old modules, that indicates the repo still contains pre-refactor test artifacts that need to be migrated or removed as part of the architecture cleanup.
 
-Run individual stages when you need to re-process or debug a specific step.
+## Status
 
-```bash
-# Stage 0: normalize filenames
-python3 cli.py rename-corpus RAG-corpus/
+Implemented in Phase A:
 
-# Stage 1: render PDF pages to PNG
-python3 cli.py render RAG-corpus/scherer.pdf --start-page 1 --end-page 50
+- typed configuration scaffold
+- OCR provider abstraction baseline
+- mandatory validation layer primitives
+- GPU scheduler baseline
+- CIF data primitives
 
-# Stage 2: Surya OCR
-python3 cli.py ocr --start-page 1 --end-page 50
+Not yet implemented from the spec:
 
-# Stage 3: layout detection + equation OCR
-python3 cli.py equations --start-page 1 --end-page 50
-
-# Stage 4: equation correction from Stage 3 crop images
-python3 cli.py correct --start-page 1 --end-page 50
-python3 cli.py correct --start-page 1 --end-page 50 --parallel-pages 1
-
-# Stage 5: assemble corrected pages into final .md and .json
-python3 cli.py assemble RAG-corpus/scherer.pdf
-```
-
-### Checkpoint management
-
-Each stage records its progress in `checkpoints/pipeline.db`. Re-running a stage skips already-completed pages.
-
-`reset` is destructive by design for development: it clears both checkpoint rows and the on-disk outputs for the selected stage and every downstream stage.
-
-Cascade behavior:
-- `reset --stage render` clears `rendered/`, `ocr/`, `equations/`, `crops/`, and `corrected/`
-- `reset --stage ocr` clears `ocr/`, `equations/`, `crops/`, and `corrected/`
-- `reset --stage equations` clears `equations/`, `crops/`, and `corrected/`
-- `reset --stage correction` clears `corrected/`
-
-```bash
-# Show per-stage progress
-python3 cli.py status
-
-# Re-run Stage 4 only
-python3 cli.py reset --stage correction -y
-python3 cli.py correct --start-page 1 --end-page 50
-
-# Rebuild equations and everything downstream
-python3 cli.py reset --stage equations -y
-python3 cli.py equations --start-page 1 --end-page 50
-python3 cli.py correct --start-page 1 --end-page 50
-
-# Reset all stage artifacts and checkpoints
-python3 cli.py reset --yes
-```
-
-## Configuration
-
-All tuneable constants live in `config.py`:
-
-| Constant | Default | Description |
-|----------|---------|-------------|
-| `OLLAMA_MODEL` | `qwen2.5vl:3b` | Vision model used in Stage 4 equation correction |
-| `RENDER_ZOOM` | `2.0` | PNG render scale |
-| `EQUATION_CONF_THRESHOLD` | `0.5` | Min confidence for equation detection |
-| `HEADER_STRIP_RATIO` | `0.10` | Top fraction stripped as running header |
-| `FOOTER_STRIP_RATIO` | `0.90` | Bottom fraction threshold |
-
-## Outputs
-
-```
-checkpoints/
-  rendered/       page_NNNN.png        Stage 1 output
-  ocr/            page_NNNN.json       Stage 2 output
-  equations/      page_NNNN.json       Stage 3 output
-  crops/          page_NNNN_eq_MM.png  Stage 3 equation crop output
-  corrected/      page_NNNN.md         Stage 4 output
-  pipeline.db                          checkpoint state
-
-output/
-  <bookname>.md                        final assembled Markdown
-  <bookname>.json                      page manifest with metadata
-```
+- first-class layout subsystem
+- region-guided OCR routing
+- formula subsystem isolation
+- chunk serialization and retrieval APIs
+- phase-wide hardening and scaling features
