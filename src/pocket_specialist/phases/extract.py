@@ -20,6 +20,8 @@ from pocket_specialist.handlers.intake import (
     render_pdf_page_to_bytes,
 )
 from pocket_specialist.layout.providers import LayoutRegion, LayoutResult, build_layout_provider, crop_region_image
+from pocket_specialist.formula.providers import FormulaExtractor, FormulaResult, build_formula_extractor
+from pocket_specialist.formula.symbolic import inline_formula_candidates, looks_symbolic, symbolic_latex
 from pocket_specialist.ocr.providers import OCRProvider, build_fallback_ocr_provider, build_primary_ocr_provider
 
 
@@ -82,7 +84,7 @@ def _native_contract(region_type: str, text: str) -> dict[str, object]:
     if region_type == "figure":
         return {"type": "FigureBlock", "caption": None, "alt_text": "", "embedded_text": [text] if text else None}
     if region_type == "formula":
-        return {"type": "FormulaBlock", "raw_formula_text": text, "provider": "ocr-fallback", "inline": False}
+        return _formula_fallback_contract(text, inline=False)
     return {"type": "TextBlock", "text": text, "heading_level": None, "language": None}
 
 
@@ -101,6 +103,72 @@ def _ocr_contract(region_type: str, texts: list[str]) -> dict[str, object]:
     if region_type == "figure":
         return {"type": "FigureBlock", "caption": None, "alt_text": merged_text, "embedded_text": texts or None}
     return {"type": "TextBlock", "text": merged_text, "heading_level": None, "language": None}
+
+
+def _formula_contract(result: FormulaResult) -> dict[str, object]:
+    return {
+        "type": "FormulaBlock",
+        "latex": result.latex,
+        "mathml": result.mathml,
+        "inline": result.is_inline,
+        "provider": result.provider,
+    }
+
+
+def _symbolic_formula_contract(raw_formula_text: str, *, inline: bool) -> dict[str, object]:
+    return {
+        "type": "FormulaBlock",
+        "latex": symbolic_latex(raw_formula_text),
+        "mathml": None,
+        "inline": inline,
+        "provider": "symbolic-fallback",
+        "raw_formula_text": raw_formula_text,
+    }
+
+
+def _formula_fallback_contract(raw_formula_text: str = "", *, inline: bool = False) -> dict[str, object]:
+    if looks_symbolic(raw_formula_text):
+        return _symbolic_formula_contract(raw_formula_text, inline=inline)
+    return {"type": "FormulaFallback", "raw_formula_text": raw_formula_text, "provider": "ocr-fallback", "inline": inline}
+
+
+def _inline_formula_blocks(
+    *,
+    document: str,
+    page_num: int,
+    parent_block_id: str,
+    text: str,
+    reading_order: int,
+    bbox: tuple[int, int, int, int] | None,
+    provider: str,
+) -> list[StructuredBlock]:
+    blocks: list[StructuredBlock] = []
+    for idx, candidate in enumerate(inline_formula_candidates(text), 1):
+        blocks.append(
+            StructuredBlock(
+                block_id=f"{parent_block_id}-inline-formula-{idx:04d}",
+                doc_id=document,
+                block_type="FormulaBlock",
+                content=_symbolic_formula_contract(candidate.latex, inline=True),
+                section_path=[],
+                reading_order=reading_order + idx,
+                page=page_num,
+                source_coords=SourceCoords(page=page_num, bbox=bbox),
+                provenance=ProvenanceRecord(
+                    source_stage="formula_route",
+                    provider="symbolic-fallback",
+                    lineage=[parent_block_id],
+                    metadata={
+                        "route": "inline_heuristic",
+                        "source_provider": provider,
+                        "raw_formula_text": candidate.raw_text,
+                        "char_start": candidate.start,
+                        "char_end": candidate.end,
+                    },
+                ),
+            )
+        )
+    return blocks
 
 
 def _native_page_blocks(document: str, page_num: int, native_blocks, layout: LayoutResult) -> list[StructuredBlock]:
@@ -125,6 +193,18 @@ def _native_page_blocks(document: str, page_num: int, native_blocks, layout: Lay
             ),
         )
         blocks.append(block)
+        if region_type != "formula":
+            blocks.extend(
+                _inline_formula_blocks(
+                    document=document,
+                    page_num=page_num,
+                    parent_block_id=block.block_id,
+                    text=native.text,
+                    reading_order=block.reading_order,
+                    bbox=native.bbox,
+                    provider="fitz-native-text",
+                )
+            )
     return sorted(blocks, key=lambda block: block.reading_order)
 
 
@@ -137,28 +217,63 @@ def _extract_with_fallback(primary: OCRProvider, fallback: OCRProvider | None, c
         return fallback.extract(crop_bytes, region_type)
 
 
-def _ocr_page_blocks(document: str, page_num: int, image_bytes: bytes, layout: LayoutResult, primary_provider: OCRProvider, fallback_provider: OCRProvider | None) -> list[StructuredBlock]:
+def _extract_formula_symbolic_fallback(primary: OCRProvider, fallback: OCRProvider | None, crop_bytes: bytes) -> str:
+    try:
+        result = _extract_with_fallback(primary, fallback, crop_bytes, "formula")
+    except Exception:
+        return ""
+    return "\n".join(str(block["raw_text"]).strip() for block in result.typed_content["blocks"] if str(block["raw_text"]).strip())
+
+
+def _ocr_page_blocks(
+    document: str,
+    page_num: int,
+    image_bytes: bytes,
+    layout: LayoutResult,
+    primary_provider: OCRProvider,
+    fallback_provider: OCRProvider | None,
+    formula_extractor: FormulaExtractor | None = None,
+) -> list[StructuredBlock]:
     blocks: list[StructuredBlock] = []
     block_index = 0
+    settings = get_settings()
     for region in sorted(layout.regions, key=lambda item: item.reading_order):
         block_type = _layout_region_to_block_type(region.region_type)
         if region.region_type == "formula":
             block_index += 1
+            crop_bytes = crop_region_image(image_bytes, region.bbox)
+            formula_result: FormulaResult | None = None
+            formula_error: str | None = None
+            if settings.formula.enabled and formula_extractor is not None:
+                try:
+                    formula_result = formula_extractor.extract(crop_bytes)
+                except Exception as exc:
+                    formula_error = str(exc)
+                    if not settings.formula.fallback_to_ocr:
+                        raise
+
+            raw_formula_text = "" if formula_result is not None else _extract_formula_symbolic_fallback(primary_provider, fallback_provider, crop_bytes)
+            content = _formula_contract(formula_result) if formula_result is not None else _formula_fallback_contract(raw_formula_text, inline=False)
             blocks.append(
                 StructuredBlock(
                     block_id=f"{document}-page-{page_num:04d}-formula-{block_index:04d}",
                     doc_id=document,
                     block_type=block_type,
-                    content={"type": "FormulaBlock", "raw_formula_text": "", "provider": "ocr-fallback", "inline": False},
+                    content=content,
                     section_path=[],
                     reading_order=region.reading_order,
                     page=page_num,
                     source_coords=SourceCoords(page=page_num, bbox=region.bbox),
                     provenance=ProvenanceRecord(
-                        source_stage="structured_extract",
-                        provider="layout-routing",
-                        confidence=region.confidence,
-                        metadata={"layout_region_id": region.region_id, "region_type": region.region_type},
+                        source_stage="formula_extract" if formula_result is not None else "structured_extract",
+                        provider=formula_result.provider if formula_result is not None else "layout-routing",
+                        confidence=formula_result.confidence if formula_result is not None else region.confidence,
+                        metadata={
+                            "layout_region_id": region.region_id,
+                            "region_type": region.region_type,
+                            "formula_latency_ms": formula_result.latency_ms if formula_result is not None else None,
+                            "fallback_reason": formula_error,
+                        },
                     ),
                 )
             )
@@ -172,28 +287,39 @@ def _ocr_page_blocks(document: str, page_num: int, image_bytes: bytes, layout: L
         if not texts and region.region_type != "figure":
             continue
         block_index += 1
-        blocks.append(
-            StructuredBlock(
-                block_id=f"{document}-page-{page_num:04d}-ocr-{block_index:04d}",
-                doc_id=document,
-                block_type=block_type,
-                content=_ocr_contract(region.region_type, texts),
-                section_path=[],
-                reading_order=region.reading_order,
-                page=page_num,
-                source_coords=SourceCoords(page=page_num, bbox=region.bbox),
-                provenance=ProvenanceRecord(
-                    source_stage="structured_extract",
-                    provider=result.provider,
-                    confidence=result.confidence,
-                    metadata={
-                        "region_type": region.region_type,
-                        "layout_region_id": region.region_id,
-                        "ocr_mode": result.extraction_metadata.get("mode"),
-                    },
-                ),
-            )
+        ocr_block = StructuredBlock(
+            block_id=f"{document}-page-{page_num:04d}-ocr-{block_index:04d}",
+            doc_id=document,
+            block_type=block_type,
+            content=_ocr_contract(region.region_type, texts),
+            section_path=[],
+            reading_order=region.reading_order,
+            page=page_num,
+            source_coords=SourceCoords(page=page_num, bbox=region.bbox),
+            provenance=ProvenanceRecord(
+                source_stage="structured_extract",
+                provider=result.provider,
+                confidence=result.confidence,
+                metadata={
+                    "region_type": region.region_type,
+                    "layout_region_id": region.region_id,
+                    "ocr_mode": result.extraction_metadata.get("mode"),
+                },
+            ),
         )
+        blocks.append(ocr_block)
+        if region.region_type in {"text", "heading", "list"}:
+            blocks.extend(
+                _inline_formula_blocks(
+                    document=document,
+                    page_num=page_num,
+                    parent_block_id=ocr_block.block_id,
+                    text="\n".join(texts),
+                    reading_order=ocr_block.reading_order,
+                    bbox=region.bbox,
+                    provider=result.provider,
+                )
+            )
     return blocks
 
 
@@ -291,13 +417,26 @@ def extract_structured_document(
     if scanned_pages:
         primary_provider = build_primary_ocr_provider()
         fallback_provider = build_fallback_ocr_provider()
+        formula_needed = settings.formula.enabled and any(
+            region.region_type == "formula"
+            for page_num in scanned_pages
+            for region in page_layouts[page_num].regions
+        )
+        formula_extractor = build_formula_extractor() if formula_needed else None
         primary_provider.load()
         if getattr(fallback_provider, "name", None) != getattr(primary_provider, "name", None):
             fallback_provider.load()
+        if formula_extractor is not None:
+            try:
+                formula_extractor.load()
+            except Exception:
+                if not settings.formula.fallback_to_ocr:
+                    raise
+                formula_extractor = None
         try:
             for page_num in scanned_pages:
                 layout_result = page_layouts[page_num]
-                page_blocks = _ocr_page_blocks(document, page_num, page_images[page_num], layout_result, primary_provider, fallback_provider)
+                page_blocks = _ocr_page_blocks(document, page_num, page_images[page_num], layout_result, primary_provider, fallback_provider, formula_extractor)
                 structured_path = structured_dir / f"page_{page_num:04d}.json"
                 _write_structured_page(document, page_num, page_blocks, {"page_mode": PDFContentType.SCANNED.value}, structured_path)
                 for block in page_blocks:
@@ -308,6 +447,8 @@ def extract_structured_document(
             primary_provider.offload()
             if fallback_provider is not primary_provider:
                 fallback_provider.offload()
+            if formula_extractor is not None:
+                formula_extractor.offload()
 
     _write_json(structured_dir / "document.json", asdict(cif))
     return done, failed, cif

@@ -111,6 +111,7 @@ class FormulaSettings:
     base_url: str = "http://localhost:8001"
     model_size: str = "base"
     fallback_to_ocr: bool = True
+    timeout_seconds: int = 60
 
 
 @dataclass(frozen=True)
@@ -227,6 +228,7 @@ class PipelineSettings:
                 base_url=os.getenv("PIPELINE_FORMULA_BASE_URL", str(_nested_get(config_data, "formula", "base_url", default="http://localhost:8001"))),
                 model_size=os.getenv("PIPELINE_FORMULA_MODEL_SIZE", str(_nested_get(config_data, "formula", "model_size", default="base"))),
                 fallback_to_ocr=os.getenv("PIPELINE_FORMULA_FALLBACK_TO_OCR", str(_nested_get(config_data, "formula", "fallback_to_ocr", default=True))).lower() not in {"0", "false", "no"},
+                timeout_seconds=int(os.getenv("PIPELINE_FORMULA_TIMEOUT_SECONDS", str(_nested_get(config_data, "formula", "timeout_seconds", default=60)))),
             ),
             embedding=EmbeddingSettings(
                 provider=os.getenv("PIPELINE_EMBEDDING_PROVIDER", str(_nested_get(config_data, "embedding", "provider", default="nomic-embed-text"))),

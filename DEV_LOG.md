@@ -2,12 +2,30 @@
 
 This log records the implementation process and engineering decisions behind the current DAG OCR refactor line. It is intentionally more detailed than commit messages: each entry captures context, tradeoffs, validation, bugs found, and follow-up implications.
 
+## Branch Order and Commit Map
+
+Current implementation line:
+
+1. `main`
+   - `1ca148a` - `refactor(stage4): correct equations one crop at a time`
+2. `DAG-OCR-phase-A`
+   - `dffa67f` - `Refactor pipeline toward Phase A foundation`
+   - `ba51574` - `Rename legacy pipeline modules to spec-aligned subsystems`
+3. `DAG-OCR-phase-B`
+   - `363f4d4` - `Refactor package layout for Phase B`
+4. `feat/checkpoints`
+   - `267425d` - `Add DAG checkpoint observations`
+5. `DAG-OCR-phase-c-unimernet`
+   - Starts from `feat/checkpoints` at `267425d`.
+   - Phase C formula-system commit implements the UniMERNet service/client, formula routing, inline equation handling, and symbolic fallback path.
+
 ## Branch Lineage
 
 - `main` baseline: legacy stage-oriented OCR/correction pipeline.
 - `DAG-OCR-phase-A`: Phase A foundation work from the document-intelligence beta spec.
 - `DAG-OCR-phase-B`: Phase B layout/OCR and package-structure migration.
-- `feat/checkpoints`: current checkpoint observation work. The requested branch name `feat:checkpoints` was not used because `:` is invalid in Git ref names.
+- `feat/checkpoints`: checkpoint observation work. The requested branch name `feat:checkpoints` was not used because `:` is invalid in Git ref names.
+- `DAG-OCR-phase-c-unimernet`: Phase C formula-system work created from `feat/checkpoints`.
 
 ## dffa67f - Refactor pipeline toward Phase A foundation
 
@@ -27,6 +45,15 @@ Important implementation nuance:
 - The compatibility CLI still exposed old command names, but the help text and README were shifted toward the new terminology. This was deliberate: changing the user-facing command surface too early would have broken existing workflow tests before the new DAG runner existed.
 - `requirements.txt` was cleaned to reflect actual runtime and foundation dependencies, including OCR/provider support and test tooling.
 - The initial spec was committed into `docs/` as implementation context, not as an external-only planning document.
+
+Nuance and fixes during development:
+
+- The first branch creation attempt used `DAG-OCR-phase-B` as the base because the requested lowercase branch name did not exist locally and the available Phase B branch was uppercase. After correction, the branch was deleted and recreated from `feat/checkpoints`; the existing `DEV_LOG.md` work was preserved and restored.
+- The first formula routing pass handled explicit layout `formula` regions but missed inline formulas in ordinary text. A follow-up audit against the Phase C checklist found that gap, so deterministic inline candidates are now emitted as separate `FormulaBlock`s with provenance lineage to their source block.
+- The initial fallback path emitted an empty formula fallback when UniMERNet was unavailable. That was tightened so the crop is sent through OCR and converted into a symbolic `FormulaBlock` when the recognized text looks formula-like; otherwise it remains an explicit `FormulaFallback`.
+- UniMERNet loading is deferred until scanned pages actually contain formula regions. This keeps scanned OCR paths from failing just because the formula service is not running for documents without formulas.
+- The service import boundary is intentionally strict: UniMERNet imports happen only inside the service runtime, not in the main ingestion process. That preserves the spec requirement for dependency isolation and avoids making ordinary extraction dependent on UniMERNet installation.
+- Tests use fake HTTP sessions and fake OCR/formula providers so the contract, routing, and fallback behavior are validated without loading UniMERNet or requiring network/model availability.
 
 Validation performed:
 
@@ -122,6 +149,28 @@ Known limitations left by the commit:
 - Formula extraction and retrieval subsystems were scaffolded but not implemented.
 - Region-guided OCR routing existed as a baseline, not as a production-hardened DAG runner.
 
+## Phase C formula-system commit - UniMERNet service and symbolic routing
+
+This commit was developed on `DAG-OCR-phase-c-unimernet`. The branch was recreated from `feat/checkpoints` after an initial incorrect branch base from `DAG-OCR-phase-B`; the corrected branch head starts at checkpoint commit `267425d`. The implementation target was the v0.5.1 Phase C formula system: UniMERNet microservice, formula routing, inline equation handling, and symbolic fallback.
+
+Implementation decisions:
+
+- Added a formula provider contract under `src/pocket_specialist/formula/` with `FormulaResult`, `FormulaExtractor`, and a `UniMERNetFormulaExtractor` HTTP client.
+- Added an isolated UniMERNet microservice module with `/health`, `/load`, `/offload`, `/extract`, and `/extract_batch` JSON endpoints. The service keeps UniMERNet imports out of the main ingestion process.
+- Added `pocket-specialist-formula-service` as a console entry point for running the service process.
+- Wired scanned-PDF formula layout regions into Phase B structured extraction so formula crops become typed `FormulaBlock` payloads when the service succeeds.
+- Added deterministic inline formula routing for native/OCR text using math delimiters and symbolic-density heuristics. Inline formulas are emitted as separate `FormulaBlock` records with lineage back to the source text block.
+- Added a symbolic fallback path: when UniMERNet extraction fails, formula crops can be OCRed and converted into `FormulaBlock` content if the text looks symbolic, otherwise the pipeline emits `FormulaFallback`.
+- Preserved graceful degradation: if formula extraction fails and `fallback_to_ocr` is enabled, the page can still complete with fallback provenance metadata instead of failing the whole page.
+- Added formula timeout configuration through `PIPELINE_FORMULA_TIMEOUT_SECONDS` and `[formula].timeout_seconds`.
+
+Validation performed:
+
+- `PYTHONPATH=src python3 -m compileall src tests`
+- `PYTHONPATH=src ./.venv/bin/python -m pytest tests/test_phase_c_formula.py -q`
+- `PYTHONPATH=src ./.venv/bin/python -m pytest -q`
+- Current result: `20 passed`.
+
 ## Current WIP on feat/checkpoints - DAG checkpoint observation layer
 
 This work is not committed yet. It started after verifying that local `DAG-OCR-phase-B` matched `origin/DAG-OCR-phase-B` at `363f4d4`. A new branch, `feat/checkpoints`, was created from that verified remote head.
@@ -177,3 +226,88 @@ Current status:
 - New file: `tests/test_checkpoint_observations.py`.
 - `DEV_LOG.md` is being added as this development history record.
 - Ignored/generated files remain untracked, including `RAG-corpus/*.pdf`, `.venv/`, caches, checkpoints, and local `data/`.
+
+## Smoke Test Audit After 267425d - Phase B PDF Readiness
+
+This section documents the PDF readiness smoke-test work performed after the checkpoint observation commit. No source-code change was made during this audit; the goal was to determine whether the Phase B infrastructure can run a PDF completely enough to produce layout and structured outputs.
+
+Scope of the audit:
+
+- Only Phase B PDF execution was evaluated.
+- Later spec features such as retrieval, formula extraction service hardening, chunk serialization, and production DAG scheduling were not treated as blockers unless they prevented a Phase B PDF run.
+- The checked path was `pocket_specialist.cli extract-structured`, which calls `extract_structured_document()` and should produce layout JSON, per-page structured JSON, aggregate `document.json`, and checkpoint records.
+
+Validation commands and checks:
+
+- Verified the repo was clean on `feat/checkpoints` before running smoke tests.
+- Confirmed installed runtime dependencies in `.venv` included `surya-ocr`, `PyMuPDF`, `Pillow`, `torch`, `typer`, and `requests`.
+- Confirmed the Surya layout and OCR imports used by the code are importable:
+  - `surya.foundation.FoundationPredictor`
+  - `surya.layout.LayoutPredictor`
+  - `surya.detection.DetectionPredictor`
+  - `surya.recognition.RecognitionPredictor`
+- Confirmed the configured default providers in `pipeline.toml`:
+  - layout provider: `pp-doclayout-v3`
+  - OCR primary: `glm-ocr`
+  - OCR fallback: `deepseek-ocr`
+
+Digital PDF smoke test:
+
+- Created a temporary one-page digital PDF with native text using PyMuPDF.
+- Ran `extract-structured` with isolated temporary output, checkpoint, and SQLite paths.
+- Result: passed.
+- Produced:
+  - `layout/page_0001.json`
+  - `structured/page_0001.json`
+  - `structured/document.json`
+  - `pipeline.db`
+- Interpretation: the digital PDF path is runnable for Phase B. It uses layout detection plus native text extraction, so it does not depend on OCR model availability for text content.
+
+Scanned PDF smoke test with default OCR config:
+
+- Created a temporary one-page scanned-style PDF by embedding a raster image containing text.
+- Ran `extract-structured` using the default OCR config from `pipeline.toml`.
+- Initial result: failed with `HTTPError: 404 Client Error` from Ollama `/api/generate`.
+- Cause: the configured production OCR model names, `glm-ocr` and `deepseek-ocr`, were not installed at that moment. The local Ollama model list only contained `qwen2.5vl:3b`, `qwen2.5:7b`, and `qwen2.5vl:7b`.
+- Decision: this was recorded as a real production-readiness gap, not something to hide by falling back to Surya. The intended production OCR providers must be present and callable.
+
+Scanned PDF smoke test with Surya OCR override:
+
+- Re-ran the scanned-style PDF test with:
+  - `PIPELINE_OCR_PROVIDER=surya`
+  - `PIPELINE_OCR_FALLBACK_PROVIDER=surya`
+- Result: passed.
+- Produced layout and structured outputs.
+- Interpretation: the scanned-PDF infrastructure path itself can run when a working OCR provider is configured. This proved that PDF rendering, layout detection, region cropping, OCR invocation, structured output writing, and checkpoint writes are connected. It did not prove production OCR model readiness because Surya is not the configured production provider.
+
+Resume/rerun smoke test:
+
+- Ran `extract-structured` twice against the same completed one-page digital PDF using the same SQLite checkpoint and output directories.
+- First run: completed with `1 done, 0 failed` and wrote one block to `document.json`.
+- Second run: reported `0 done, 0 failed`, but rewrote aggregate `structured/document.json` with zero blocks while leaving `structured/page_0001.json` in place.
+- Bug found: completed pages are skipped by checkpoint state, but aggregate CIF assembly does not reload existing page outputs before rewriting `document.json`.
+- Readiness impact: this is a Phase B resume blocker. Resume can avoid reprocessing pages, but a no-op rerun can corrupt the aggregate output by replacing it with an empty document. The fix should either preserve existing aggregate output on a no-op run or rebuild the aggregate CIF from existing per-page structured artifacts.
+
+OCR model smoke test after model installation:
+
+- After `glm-ocr:latest` and `deepseek-ocr:latest` appeared in `ollama list`, re-ran the scanned PDF smoke test using the default production OCR config.
+- Result: command completed successfully.
+- Ollama showed `glm-ocr:latest` resident on GPU after the run.
+- The structured output recorded provider `glm-ocr`, confirming that the primary production OCR path was called.
+- Bug found: the extracted text content was not meaningful. The model returned the placeholder text from the prompt contract:
+  - `"text": "..."`
+- Readiness impact: OCR model availability is no longer the blocker in that environment, but output contract quality is still a blocker for production scanned PDFs. The current `_contract_hint()` examples use placeholders, and the model can satisfy JSON shape requirements by echoing placeholders instead of extracting real text.
+
+Gaps identified that prevent reliable Phase B PDF runs:
+
+- Resume aggregation bug: rerunning a completed document can overwrite `structured/document.json` with an empty CIF because skipped pages are not reloaded from existing per-page outputs.
+- Production OCR quality bug: `glm-ocr` can return placeholder content that passes the structural JSON contract but is not useful OCR output.
+- Provider readiness depends on actual Ollama model installation. The code can call `glm-ocr` and `deepseek-ocr`, but a fresh environment will fail if those model tags are not pulled first.
+- The installed console script `pocket-specialist` was not available on PATH during the audit; running through `PYTHONPATH=src ./.venv/bin/python -m pocket_specialist.cli ...` works. This means editable installation or PATH setup is required before using README-style CLI commands directly.
+
+Decisions from the audit:
+
+- Do not treat Surya override success as proof that production OCR is ready. It is useful infrastructure validation, but production config is `glm-ocr` with `deepseek-ocr` fallback.
+- Treat the placeholder OCR output as a contract/prompt validation issue, not merely a model quality issue. The validator currently checks shape, not semantic extraction usefulness.
+- Treat the resume aggregation behavior as a real blocker before testing long documents, because a recovery/retry flow must not destroy already generated aggregate output.
+- Keep ignored smoke-test artifacts out of the repo. All smoke-test files were written under `/tmp` or ignored local data paths.
