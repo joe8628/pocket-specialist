@@ -98,6 +98,16 @@ pocket-specialist extract-structured <pdf-or-html>
 
 Commands with older names are compatibility entry points around spec-aligned subsystems. New work should depend on the `src/pocket_specialist/` package layout, not root-level wrappers or the retired `pipeline/` package.
 
+## Checkpoint Observation Layer
+
+Checkpointing is now modeled as DAG node observations on top of SQLite:
+
+- `dag_node_state` stores the current `(document, page, node)` status used for resume decisions.
+- `dag_observations` stores append-only events for starts, completions, failures, and stage compatibility updates.
+- Observation metadata follows the existing task/unit/provenance contract: `doc_id`, `unit_id`, `task_id`, `task_type`, `source_stage`, and optional artifact metadata such as `artifact_uri`.
+- Existing stage checkpoints still work and mirror their updates into DAG node state.
+- `pocket-specialist status` reports both stage summaries and DAG node summaries.
+
 ## Configuration Model
 
 Runtime configuration now centers on typed settings in `src/pocket_specialist/core/config.py` and `pipeline.toml`, with environment-variable overrides for paths and key runtime values.

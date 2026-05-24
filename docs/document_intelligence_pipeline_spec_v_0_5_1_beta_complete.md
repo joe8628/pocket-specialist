@@ -618,8 +618,29 @@ Embedding providers remain replaceable behind a provider abstraction.
 | Metadata Store | SQLite/Postgres | CIF persistence |
 | Artifact Store | Filesystem/Object store | Images/rendered pages |
 | State Store | SQLite | Checkpointing |
+| Observation Store | SQLite/Postgres | DAG node state and append-only processing events |
 
-## 14.3 Large-Scale Considerations
+## 14.3 DAG Checkpoint Observation Layer
+
+The checkpoint system records progress at DAG-node granularity, not only legacy stage granularity.
+
+Required tables:
+
+- `dag_node_state`: current state for `(document, page, node)` with status, attempts, artifact path, timestamps, metadata, and error.
+- `dag_observations`: append-only event log for node starts, completions, failures, retries, and compatibility stage updates.
+- Metadata must reuse the existing task/unit/provenance shape: `doc_id`, `unit_id`, `task_id`, `task_type`, `source_stage`, plus optional artifact metadata such as `artifact_uri`.
+
+Resume behavior:
+
+- skip nodes with `status = done`
+- retry nodes with `status = failed` until `MAX_RETRIES`
+- treat missing nodes as processable
+- compute resume position from the first processable page for a node
+- preserve old stage checkpoints by mirroring stage status changes into DAG node state
+
+This enables a document to resume from the last completed page/node in a graph-shaped workflow while retaining an auditable processing history.
+
+## 14.4 Large-Scale Considerations
 
 For larger deployments:
 

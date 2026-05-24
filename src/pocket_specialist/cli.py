@@ -431,7 +431,7 @@ def status(
     doc: str = typer.Option(None, "--doc", help="Show status for one document slug."),
 ) -> None:
     """Show per-step progress from the checkpoint database."""
-    from pocket_specialist.storage.checkpoint import STAGES, get_failed_pages, get_summary, init_db
+    from pocket_specialist.storage.checkpoint import STAGES, get_failed_pages, get_node_summary, get_resume_state, get_summary, init_db
 
     init_db()
     documents = [_resolve_document(pdf, doc)] if (pdf or doc) else _known_documents()
@@ -456,6 +456,15 @@ def status(
                     fail_detail += f" (+{more} more)"
             label = stage.capitalize().ljust(width)
             typer.echo(f"{label}: {done:>4} done  {failed:>3} failed{fail_detail}")
+        node_summary = get_node_summary(document)
+        if node_summary:
+            typer.echo("DAG nodes:")
+            for node in sorted(node_summary):
+                counts = node_summary[node]
+                detail = "  ".join(f"{status}: {count}" for status, count in sorted(counts.items()))
+                resume = get_resume_state(document, node)
+                resume_detail = f"  resume page: {resume.next_page}" if resume.next_page else ""
+                typer.echo(f"  {node.ljust(width)}: {detail}{resume_detail}")
         resume_stage, resume_page = _resume_state(document)
         if resume_stage and resume_page:
             typer.echo(f"Resume point: step {resume_stage} page {resume_page}")
