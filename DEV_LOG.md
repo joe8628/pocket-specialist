@@ -378,3 +378,11 @@ Section 11.4 figure-artifact follow-up:
 - Coverage was extended in `tests/test_phase_c_formula.py` at two levels: one test asserts that an OCR-routed figure block receives an `artifact_uri`, and a second integration-style test proves `extract_structured_document()` collects the corresponding figure artifact in `cif.artifacts` for a scanned PDF page.
 - Validation in this environment remained dependency-limited, so the concrete verification completed here was `python3 -m py_compile src/pocket_specialist/phases/extract.py tests/test_phase_c_formula.py`.
 
+Section 17 layout-enabled runtime-config follow-up:
+
+- A later audit found that `layout.enabled` was loaded from configuration but not actually honored in the active PDF extraction path. The code always built and loaded a layout provider for PDF documents, which meant section 17 runtime configuration was only partially effective even when the operator explicitly disabled layout.
+- The extraction path now gates PDF layout detection on `settings.layout.enabled`. When the flag is `false`, PDF extraction skips layout-provider construction entirely, preserves native-text extraction for digital pages, and falls back to full-page OCR for pages without native text instead of using region-guided layout routing.
+- Document-level and per-page structured metadata now record `layout_enabled: false` on that degraded path so downstream consumers can distinguish a no-layout extraction result from the normal layout-guided flow.
+- Coverage was extended in `tests/test_phase_c_formula.py` to assert that the layout provider is not called when the flag is disabled for a digital PDF, and that a scanned PDF still routes through full-page OCR in that mode.
+- Validation in this environment remained dependency-limited, so the concrete verification completed here was `python3 -m py_compile src/pocket_specialist/phases/extract.py tests/test_phase_c_formula.py`.
+

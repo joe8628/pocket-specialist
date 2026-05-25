@@ -406,6 +406,126 @@ class PhaseCFormulaTests(unittest.TestCase):
         self.assertEqual(cif.artifacts[0].uri, cif.blocks[0].content["artifact_uri"])
         self.assertTrue((settings.paths.project_root / cif.artifacts[0].uri).exists())
 
+    def test_extract_structured_document_skips_layout_provider_when_disabled_for_digital_pdf(self) -> None:
+        image = Image.new("RGB", (64, 32), "white")
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        profile = DocumentProfile(
+            doc_id="doc",
+            source_path=Path("/tmp/doc.pdf"),
+            source_kind=SourceKind.PDF,
+            mime_type="application/pdf",
+            pdf_content_type=PDFContentType.DIGITAL,
+            page_count=1,
+            text_extractable=True,
+            metadata={"page_modes": [PDFContentType.DIGITAL.value]},
+        )
+        native_blocks = [NativeTextBlock(text="native paragraph", bbox=(0, 0, 30, 10), block_no=0)]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            base = PipelineSettings.from_env(project_root=root)
+            settings = base.__class__(
+                paths=base.paths,
+                pipeline_version=base.pipeline_version,
+                rendering=base.rendering,
+                ocr=base.ocr,
+                layout=base.layout.__class__(provider=base.layout.provider, enabled=False),
+                formula=base.formula,
+                embedding=base.embedding,
+                gpu=base.gpu,
+                chunking=base.chunking,
+                storage=base.storage,
+                equations=base.equations,
+                ollama=base.ollama,
+                runtime=base.runtime,
+            )
+            with patch("pocket_specialist.phases.extract.classify_document", return_value=profile), \
+                 patch("pocket_specialist.phases.extract.get_settings", return_value=settings), \
+                 patch("pocket_specialist.phases.extract.render_pdf_page_to_bytes", return_value=buffer.getvalue()), \
+                 patch("pocket_specialist.phases.extract.get_pdf_native_blocks", return_value=native_blocks), \
+                 patch("pocket_specialist.phases.extract.build_layout_provider", side_effect=AssertionError("layout should be disabled")), \
+                 patch("pocket_specialist.phases.extract.init_db"), \
+                 patch("pocket_specialist.phases.extract.set_status"), \
+                 patch("pocket_specialist.phases.extract.should_process", return_value=True):
+                done, failed, cif = extract_structured_document(
+                    Path("/tmp/doc.pdf"),
+                    structured_output_dir=root / "structured-out",
+                    layout_output_dir=root / "layout-out",
+                )
+
+        self.assertEqual(done, 1)
+        self.assertEqual(failed, 0)
+        self.assertEqual(cif.blocks[0].content["text"], "native paragraph")
+        self.assertEqual(cif.metadata["layout_enabled"], False)
+
+    def test_extract_structured_document_uses_full_page_ocr_when_layout_disabled_for_scanned_pdf(self) -> None:
+        image = Image.new("RGB", (64, 32), "white")
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        profile = DocumentProfile(
+            doc_id="doc",
+            source_path=Path("/tmp/doc.pdf"),
+            source_kind=SourceKind.PDF,
+            mime_type="application/pdf",
+            pdf_content_type=PDFContentType.SCANNED,
+            page_count=1,
+            text_extractable=False,
+            metadata={"page_modes": [PDFContentType.SCANNED.value]},
+        )
+
+        class PageOCRProvider(FakeOCRProvider):
+            def extract(self, image_bytes: bytes, region_type: str):
+                self.last_region_type = region_type
+                return SimpleNamespace(
+                    provider=self.name,
+                    confidence=0.72,
+                    typed_content={"blocks": [{"raw_text": self.text, "bbox": {"x0": 0, "y0": 0, "x1": 1, "y1": 1}, "confidence": 1.0, "block_type": "text"}]},
+                    extraction_metadata={"mode": "PAGE_STRUCTURED"},
+                )
+
+        provider = PageOCRProvider("scanned page text")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            base = PipelineSettings.from_env(project_root=root)
+            settings = base.__class__(
+                paths=base.paths,
+                pipeline_version=base.pipeline_version,
+                rendering=base.rendering,
+                ocr=base.ocr,
+                layout=base.layout.__class__(provider=base.layout.provider, enabled=False),
+                formula=base.formula,
+                embedding=base.embedding,
+                gpu=base.gpu,
+                chunking=base.chunking,
+                storage=base.storage,
+                equations=base.equations,
+                ollama=base.ollama,
+                runtime=base.runtime,
+            )
+            with patch("pocket_specialist.phases.extract.classify_document", return_value=profile), \
+                 patch("pocket_specialist.phases.extract.get_settings", return_value=settings), \
+                 patch("pocket_specialist.phases.extract.render_pdf_page_to_bytes", return_value=buffer.getvalue()), \
+                 patch("pocket_specialist.phases.extract.get_pdf_native_blocks", return_value=[]), \
+                 patch("pocket_specialist.phases.extract.build_layout_provider", side_effect=AssertionError("layout should be disabled")), \
+                 patch("pocket_specialist.phases.extract.build_primary_ocr_provider", return_value=provider), \
+                 patch("pocket_specialist.phases.extract.build_fallback_ocr_provider", return_value=None), \
+                 patch("pocket_specialist.phases.extract.init_db"), \
+                 patch("pocket_specialist.phases.extract.set_status"), \
+                 patch("pocket_specialist.phases.extract.should_process", return_value=True):
+                done, failed, cif = extract_structured_document(
+                    Path("/tmp/doc.pdf"),
+                    structured_output_dir=root / "structured-out",
+                    layout_output_dir=root / "layout-out",
+                )
+
+        self.assertEqual(done, 1)
+        self.assertEqual(failed, 0)
+        self.assertEqual(provider.last_region_type, "page")
+        self.assertEqual(cif.blocks[0].content["text"], "scanned page text")
+        self.assertEqual(cif.metadata["layout_enabled"], False)
+
     def test_extract_structured_document_claims_gpu_scheduler_for_active_phase_b_c_resources(self) -> None:
         image = Image.new("RGB", (64, 32), "white")
         buffer = io.BytesIO()

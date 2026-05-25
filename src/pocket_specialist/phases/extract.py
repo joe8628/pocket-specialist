@@ -590,6 +590,28 @@ def _write_structured_page(document: str, page_num: int, blocks: list[Structured
     )
 
 
+def _empty_layout_result(page_num: int) -> LayoutResult:
+    return LayoutResult(page_id=f"page-{page_num:04d}", regions=[], layout_confidence=None)
+
+
+def _write_layout_disabled_page(
+    *,
+    cif: CanonicalIntermediateFormat,
+    document: str,
+    page_num: int,
+    page_blocks: list[StructuredBlock],
+    structured_dir: Path,
+    page_mode: str,
+) -> None:
+    structured_path = structured_dir / f"page_{page_num:04d}.json"
+    _write_structured_page(document, page_num, page_blocks, {"page_mode": page_mode, "layout_enabled": False}, structured_path)
+    for block in page_blocks:
+        cif.add_block(block)
+    for artifact in _artifacts_from_blocks(page_blocks):
+        cif.add_artifact(artifact)
+    set_status("structured", document, page_num, "done", str(structured_path))
+
+
 def _ocr_result_to_page_blocks(document: str, page_num: int, result: OCRResult) -> list[StructuredBlock]:
     blocks: list[StructuredBlock] = []
     for idx, raw_block in enumerate(result.typed_content["blocks"], 1):
@@ -711,9 +733,6 @@ def extract_structured_document(
                 with gpu_scheduler.claim("ocr"):
                     fallback_provider.offload()
 
-    layout_provider = build_layout_provider()
-    with gpu_scheduler.claim("layout"):
-        layout_provider.load()
     page_layouts: dict[int, LayoutResult] = {}
     page_images: dict[int, bytes] = {}
     native_pages: set[int] = set()
@@ -725,12 +744,81 @@ def extract_structured_document(
             "source_kind": profile.source_kind.value,
             "pdf_content_type": profile.pdf_content_type.value,
             "source_path": str(profile.source_path),
+            "layout_enabled": settings.layout.enabled,
         },
     )
 
     done = failed = 0
+    page_modes = profile.metadata.get("page_modes", [])
+
+    if not settings.layout.enabled:
+        pages_needing_ocr: list[tuple[int, str]] = []
+        for page_num in range(1, profile.page_count + 1):
+            if not should_process("structured", document, page_num):
+                continue
+            page_mode = page_modes[page_num - 1] if page_num - 1 < len(page_modes) else profile.pdf_content_type.value
+            zoom = settings.rendering.zoom if page_mode == PDFContentType.DIGITAL.value else settings.rendering.scanned_pdf_zoom
+            image_bytes = render_pdf_page_to_bytes(source_path, page_num, zoom=zoom)
+            page_images[page_num] = image_bytes
+            native_blocks = get_pdf_native_blocks(source_path, page_num)
+            if native_blocks:
+                native_pages.add(page_num)
+                page_blocks = _native_page_blocks(
+                    document,
+                    page_num,
+                    native_blocks,
+                    _empty_layout_result(page_num),
+                    page_image_bytes=image_bytes,
+                    artifact_root=settings.paths.artifact_path,
+                    project_root=settings.paths.project_root,
+                )
+                _write_layout_disabled_page(
+                    cif=cif,
+                    document=document,
+                    page_num=page_num,
+                    page_blocks=page_blocks,
+                    structured_dir=structured_dir,
+                    page_mode=PDFContentType.DIGITAL.value,
+                )
+                done += 1
+            else:
+                pages_needing_ocr.append((page_num, page_mode))
+
+        if pages_needing_ocr:
+            primary_provider = build_primary_ocr_provider()
+            fallback_provider = build_fallback_ocr_provider()
+            with gpu_scheduler.claim("ocr"):
+                primary_provider.load()
+            if fallback_provider is not None and getattr(fallback_provider, "name", None) != getattr(primary_provider, "name", None):
+                with gpu_scheduler.claim("ocr"):
+                    fallback_provider.load()
+            try:
+                for page_num, page_mode in pages_needing_ocr:
+                    result = _extract_with_fallback(primary_provider, fallback_provider, page_images[page_num], "page")
+                    page_blocks = _ocr_result_to_page_blocks(document, page_num, result)
+                    _write_layout_disabled_page(
+                        cif=cif,
+                        document=document,
+                        page_num=page_num,
+                        page_blocks=page_blocks,
+                        structured_dir=structured_dir,
+                        page_mode=page_mode,
+                    )
+                    done += 1
+            finally:
+                with gpu_scheduler.claim("ocr"):
+                    primary_provider.offload()
+                if fallback_provider is not None and fallback_provider is not primary_provider:
+                    with gpu_scheduler.claim("ocr"):
+                        fallback_provider.offload()
+
+        _write_json(structured_dir / "document.json", asdict(cif))
+        return done, failed, cif
+
+    layout_provider = build_layout_provider()
+    with gpu_scheduler.claim("layout"):
+        layout_provider.load()
     try:
-        page_modes = profile.metadata.get("page_modes", [])
         for page_num in range(1, profile.page_count + 1):
             if not should_process("structured", document, page_num):
                 continue
