@@ -14,7 +14,7 @@ from pocket_specialist.formula.providers import FormulaResult, UniMERNetFormulaE
 from pocket_specialist.layout.providers import LayoutRegion, LayoutResult
 from pocket_specialist.handlers.intake import DocumentProfile, NativeTextBlock, PDFContentType, SourceKind
 from pocket_specialist.formula.symbolic import inline_formula_candidates, looks_symbolic
-from pocket_specialist.phases.extract import _matched_layout_region_ids, _ocr_page_blocks, extract_structured_document
+from pocket_specialist.phases.extract import _matched_layout_region_ids, _native_page_blocks, _ocr_page_blocks, extract_structured_document
 
 
 class FakeResponse:
@@ -122,6 +122,30 @@ class FakeOCRProvider:
         )
 
 
+class FakeStructuredTableOCRProvider:
+    name = "fake-structured-table-ocr"
+
+    def load(self) -> None:
+        return None
+
+    def offload(self) -> None:
+        return None
+
+    def extract(self, image_bytes: bytes, region_type: str):
+        return SimpleNamespace(
+            provider=self.name,
+            confidence=0.83,
+            typed_content={
+                "type": "TableBlock",
+                "headers": ["name", "value"],
+                "rows": [{"name": "alpha", "value": "1"}, {"name": "beta", "value": "2"}],
+                "caption": "Sample table",
+                "blocks": [{"raw_text": "name | value\nalpha | 1\nbeta | 2", "bbox": {"x0": 0, "y0": 0, "x1": 1, "y1": 1}}],
+            },
+            extraction_metadata={"mode": "REGION_GUIDED"},
+        )
+
+
 class UnusedOCRProvider:
     def load(self) -> None:
         return None
@@ -220,6 +244,48 @@ class PhaseCFormulaTests(unittest.TestCase):
         self.assertEqual(formula_blocks[0].content["latex"], "E=mc^2")
         self.assertEqual(formula_blocks[0].content["inline"], True)
         self.assertEqual(formula_blocks[0].provenance.metadata["route"], "inline_heuristic")
+
+    def test_native_table_region_emits_normalized_table_rows(self) -> None:
+        layout = LayoutResult(
+            page_id="page-0001",
+            regions=[LayoutRegion("region-0001", "table", (0, 0, 30, 10), 0.97, 0)],
+            layout_confidence=0.97,
+        )
+        native_blocks = [NativeTextBlock(text="name | value\nalpha | 1\nbeta | 2", bbox=(0, 0, 30, 10), block_no=0)]
+
+        blocks = _native_page_blocks("doc", 1, native_blocks, layout)
+
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0].block_type, "TableBlock")
+        self.assertEqual(blocks[0].content["headers"], ["name", "value"])
+        self.assertEqual(blocks[0].content["rows"], [{"name": "alpha", "value": "1"}, {"name": "beta", "value": "2"}])
+        self.assertNotIn("text", blocks[0].content)
+
+    def test_ocr_table_region_preserves_structured_table_payload(self) -> None:
+        image = Image.new("RGB", (24, 24), "white")
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        layout = LayoutResult(
+            page_id="page-0001",
+            regions=[LayoutRegion("region-0001", "table", (0, 0, 24, 24), 0.97, 0)],
+            layout_confidence=0.97,
+        )
+
+        blocks = _ocr_page_blocks(
+            "doc",
+            1,
+            buffer.getvalue(),
+            layout,
+            FakeStructuredTableOCRProvider(),
+            None,
+            None,
+        )
+
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0].content["headers"], ["name", "value"])
+        self.assertEqual(blocks[0].content["rows"], [{"name": "alpha", "value": "1"}, {"name": "beta", "value": "2"}])
+        self.assertEqual(blocks[0].content["caption"], "Sample table")
+        self.assertNotIn("text", blocks[0].content)
 
     def test_formula_failure_uses_symbolic_ocr_fallback(self) -> None:
         image = Image.new("RGB", (24, 24), "white")

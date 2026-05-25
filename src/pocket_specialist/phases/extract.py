@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict
 from pathlib import Path
 
@@ -45,6 +46,121 @@ _REGION_TO_BLOCK_TYPE = {
 }
 
 _OCR_REGION_TYPES = {"text", "heading", "table", "code", "key_value", "list", "footer", "header", "figure"}
+
+
+_TABLE_HEADER_SPLIT_RE = re.compile(r"\s{2,}")
+_TABLE_SEPARATOR_CHARS = {"-", ":", "="}
+
+
+def _stringify_table_value(value: object) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _normalize_table_headers(headers: list[object]) -> list[str]:
+    normalized: list[str] = []
+    seen: dict[str, int] = {}
+    for idx, header in enumerate(headers, 1):
+        candidate = _stringify_table_value(header) or f"column_{idx}"
+        count = seen.get(candidate, 0) + 1
+        seen[candidate] = count
+        normalized.append(candidate if count == 1 else f"{candidate}_{count}")
+    return normalized
+
+
+def _table_row_objects(headers: list[str], rows: list[list[object]]) -> list[dict[str, str]]:
+    normalized_rows: list[dict[str, str]] = []
+    for row in rows:
+        normalized_rows.append({header: _stringify_table_value(row[idx]) if idx < len(row) else "" for idx, header in enumerate(headers)})
+    return normalized_rows
+
+
+def _is_table_separator_row(cells: list[str]) -> bool:
+    cleaned = [cell.replace(" ", "") for cell in cells if cell.strip()]
+    return bool(cleaned) and all(set(cell) <= _TABLE_SEPARATOR_CHARS for cell in cleaned)
+
+
+def _split_table_line(line: str) -> list[str]:
+    stripped = line.strip()
+    if not stripped:
+        return []
+    if "|" in stripped:
+        parts = [part.strip() for part in stripped.strip("|").split("|")]
+        return [part for part in parts if part or len(parts) > 1]
+    if "	" in stripped:
+        return [part.strip() for part in stripped.split("	")]
+    for delimiter in (",", ";"):
+        if delimiter in stripped:
+            parts = [part.strip() for part in stripped.split(delimiter)]
+            if len(parts) > 1:
+                return parts
+    parts = [part.strip() for part in _TABLE_HEADER_SPLIT_RE.split(stripped) if part.strip()]
+    if len(parts) > 1:
+        return parts
+    return [stripped]
+
+
+def _looks_like_header_row(cells: list[str]) -> bool:
+    non_empty = [cell for cell in cells if cell]
+    if len(non_empty) != len(cells) or not non_empty:
+        return False
+    if len({cell.lower() for cell in non_empty}) != len(non_empty):
+        return False
+    alpha_cells = sum(any(ch.isalpha() for ch in cell) for cell in non_empty)
+    digit_cells = sum(cell.replace(".", "", 1).isdigit() for cell in non_empty)
+    return alpha_cells >= max(1, len(non_empty) - digit_cells)
+
+
+def _table_contract_from_matrix(matrix: list[list[object]], *, caption: str | None = None) -> dict[str, object]:
+    cleaned_rows = [[_stringify_table_value(cell) for cell in row] for row in matrix if any(_stringify_table_value(cell) for cell in row)]
+    if not cleaned_rows:
+        return {"type": "TableBlock", "headers": [], "rows": [], "caption": caption}
+
+    cleaned_rows = [row for row in cleaned_rows if not _is_table_separator_row(row)]
+    if not cleaned_rows:
+        return {"type": "TableBlock", "headers": [], "rows": [], "caption": caption}
+
+    if len(cleaned_rows) == 1 and len(cleaned_rows[0]) == 1:
+        headers = ["value"]
+        rows = [{"value": cleaned_rows[0][0]}]
+        return {"type": "TableBlock", "headers": headers, "rows": rows, "caption": caption}
+
+    if len(cleaned_rows) > 1 and _looks_like_header_row(cleaned_rows[0]):
+        headers = _normalize_table_headers(cleaned_rows[0])
+        body = cleaned_rows[1:]
+    else:
+        width = max(len(row) for row in cleaned_rows)
+        headers = [f"column_{idx}" for idx in range(1, width + 1)]
+        body = cleaned_rows
+    return {"type": "TableBlock", "headers": headers, "rows": _table_row_objects(headers, body), "caption": caption}
+
+
+def _table_contract_from_text(text: str, *, caption: str | None = None) -> dict[str, object]:
+    matrix = [_split_table_line(line) for line in text.splitlines() if line.strip()]
+    matrix = [row for row in matrix if row]
+    return _table_contract_from_matrix(matrix, caption=caption)
+
+
+def _table_contract_from_ocr_payload(payload: dict[str, object], fallback_text: str) -> dict[str, object]:
+    caption = payload.get("caption") if isinstance(payload.get("caption"), str) else None
+    headers_obj = payload.get("headers")
+    rows_obj = payload.get("rows")
+    if isinstance(headers_obj, list) and isinstance(rows_obj, list):
+        headers = _normalize_table_headers(list(headers_obj))
+        if rows_obj and all(isinstance(row, dict) for row in rows_obj):
+            if not headers:
+                first_row = rows_obj[0]
+                headers = _normalize_table_headers(list(first_row.keys()))
+            rows = [
+                {header: _stringify_table_value(row.get(header, "")) for header in headers}
+                for row in rows_obj
+                if isinstance(row, dict)
+            ]
+            return {"type": "TableBlock", "headers": headers, "rows": rows, "caption": caption}
+        if all(isinstance(row, list) for row in rows_obj):
+            return _table_contract_from_matrix(([headers] if headers else []) + list(rows_obj), caption=caption)
+    return _table_contract_from_text(fallback_text, caption=caption)
 
 
 def _layout_region_to_block_type(region_type: str) -> str:
@@ -93,7 +209,7 @@ def _native_contract(region_type: str, text: str) -> dict[str, object]:
     if region_type == "code":
         return {"type": "CodeBlock", "language": None, "code": text}
     if region_type == "table":
-        return {"type": "TableBlock", "headers": [], "rows": [], "caption": None, "text": text}
+        return _table_contract_from_text(text)
     if region_type == "key_value":
         return {"type": "KeyValueBlock", "pairs": _parse_key_value_pairs(text)}
     if region_type == "figure":
@@ -103,7 +219,7 @@ def _native_contract(region_type: str, text: str) -> dict[str, object]:
     return {"type": "TextBlock", "text": text, "heading_level": None, "language": None}
 
 
-def _ocr_contract(region_type: str, texts: list[str]) -> dict[str, object]:
+def _ocr_contract(region_type: str, texts: list[str], payload: dict[str, object] | None = None) -> dict[str, object]:
     merged_text = "\n".join(texts)
     if region_type == "heading":
         return {"type": "TextBlock", "text": merged_text, "heading_level": 1, "language": None}
@@ -112,7 +228,7 @@ def _ocr_contract(region_type: str, texts: list[str]) -> dict[str, object]:
     if region_type == "code":
         return {"type": "CodeBlock", "language": None, "code": merged_text}
     if region_type == "table":
-        return {"type": "TableBlock", "headers": [], "rows": [], "caption": None, "text": merged_text}
+        return _table_contract_from_ocr_payload(payload or {}, merged_text)
     if region_type == "key_value":
         return {"type": "KeyValueBlock", "pairs": _parse_key_value_pairs(merged_text)}
     if region_type == "figure":
@@ -307,7 +423,7 @@ def _ocr_page_blocks(
             block_id=f"{document}-page-{page_num:04d}-ocr-{block_index:04d}",
             doc_id=document,
             block_type=block_type,
-            content=_ocr_contract(region.region_type, texts),
+            content=_ocr_contract(region.region_type, texts, result.typed_content),
             section_path=[],
             reading_order=region.reading_order,
             page=page_num,

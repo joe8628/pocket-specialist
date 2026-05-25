@@ -78,7 +78,11 @@ def _validate_ocr_payload(payload: object) -> dict[str, object]:
             )
         normalized.append(block)
 
-    return {"blocks": normalized}
+    validated: dict[str, object] = {"blocks": normalized}
+    for optional_key in ("type", "headers", "rows", "caption"):
+        if optional_key in payload:
+            validated[optional_key] = payload[optional_key]
+    return validated
 
 
 def _contract_hint(region_type: str) -> str:

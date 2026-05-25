@@ -361,3 +361,12 @@ Decisions from the audit:
 - Treat the placeholder OCR output as a contract/prompt validation issue, not merely a model quality issue. The validator currently checks shape, not semantic extraction usefulness.
 - Treat the resume aggregation behavior as a real blocker before testing long documents, because a recovery/retry flow must not destroy already generated aggregate output.
 - Keep ignored smoke-test artifacts out of the repo. All smoke-test files were written under `/tmp` or ignored local data paths.
+
+Section 12 table-contract follow-up:
+
+- A later audit found that Phase B table routing existed only as scaffolding in the active extraction path. Both native and OCR table regions still emitted `TableBlock` payloads with empty `headers`/`rows` plus a raw `text` field, which was enough to prove routing but not enough to satisfy the section 12 structured output contract.
+- The extraction layer now normalizes table content in `phases/extract.py` for both native text and OCR table regions. Native table text is parsed into headers plus object-normalized row dictionaries, and OCR table regions now preserve provider-supplied structured `headers`/`rows` when available while falling back to text-based normalization when the OCR result only provides spans.
+- The OCR validator in `ocr/providers.py` was also tightened so top-level table fields such as `headers`, `rows`, and `caption` survive validation instead of being discarded when the provider response is normalized down to its `blocks` list.
+- Coverage was extended in `tests/test_phase_c_formula.py` to assert that native table routing emits normalized row objects and that OCR table routing preserves a structured table payload rather than collapsing back to stub content.
+- Validation in this environment was limited by missing runtime test dependencies (`pytest`, package-path setup, and `fitz` for the broader suite), so the concrete verification completed here was `python3 -m py_compile src/pocket_specialist/phases/extract.py src/pocket_specialist/ocr/providers.py tests/test_phase_c_formula.py`.
+
