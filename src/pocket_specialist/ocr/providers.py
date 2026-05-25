@@ -95,6 +95,27 @@ def _contract_hint(region_type: str) -> str:
     return '{"type":"TextBlock","text":"...","blocks":[{"bbox":{"x0":0,"y0":0,"x1":0,"y1":0},"raw_text":"...","confidence":1.0,"block_type":"text"}]}'
 
 
+def _constrained_prompt_suffix() -> str:
+    return (
+        " Return only compact valid JSON with double-quoted keys and string values where required. "
+        "Do not emit markdown fences, commentary, or trailing text. "
+        "If uncertain, return an empty 'blocks' list that still matches the schema exactly."
+    )
+
+
+def _is_timeout_error(exc: Exception) -> bool:
+    if isinstance(exc, (TimeoutError, requests.Timeout)):
+        return True
+    return "timeout" in str(exc).lower() or "timed out" in str(exc).lower()
+
+
+def _is_oom_error(exc: Exception) -> bool:
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    message = str(exc).lower()
+    return "out of memory" in message or "cuda oom" in message or message.strip() == "oom"
+
+
 class OllamaOCRProvider:
     """Structured OCR provider backed by a local Ollama model."""
 
@@ -112,11 +133,7 @@ class OllamaOCRProvider:
     def load(self) -> None:
         self._session = requests.Session()
 
-    def extract(self, image_bytes: bytes, region_type: str) -> OCRResult:
-        if self._session is None:
-            raise RuntimeError(f"{self.name}.load() must be called before extract()")
-
-        started = time.monotonic()
+    def _build_prompt(self, region_type: str, *, constrained: bool = False) -> str:
         prompt = (
             "Extract the content from the attached image and return only strict JSON. "
             f"Use the region_type '{region_type}'. "
@@ -124,6 +141,15 @@ class OllamaOCRProvider:
             "Follow this shape exactly: "
             f"{_contract_hint(region_type)}"
         )
+        if constrained:
+            prompt += _constrained_prompt_suffix()
+        return prompt
+
+    def _extract_once(self, image_bytes: bytes, region_type: str, *, constrained: bool = False) -> OCRResult:
+        if self._session is None:
+            raise RuntimeError(f"{self.name}.load() must be called before extract()")
+
+        prompt = self._build_prompt(region_type, constrained=constrained)
         payload = {
             "model": self.model_name,
             "prompt": prompt,
@@ -140,7 +166,6 @@ class OllamaOCRProvider:
         if parse_result.value is None:
             raise OutputValidationError(parse_result.issues)
         typed_content = self._validator.require(parse_result.value, _validate_ocr_payload)
-        latency_ms = int((time.monotonic() - started) * 1000)
         return OCRResult(
             region_type=region_type,
             typed_content=typed_content,
@@ -149,13 +174,28 @@ class OllamaOCRProvider:
             structure_confidence=None,
             bounding_boxes=[block["bbox"] for block in typed_content["blocks"]],
             raw_response=raw_response,
-            latency_ms=latency_ms,
+            latency_ms=0,
             extraction_metadata={
                 "mode": (ExtractionMode.PAGE_STRUCTURED.value if region_type == "page" else ExtractionMode.REGION_GUIDED.value),
                 "runtime": "ollama",
                 "block_count": len(typed_content["blocks"]),
+                "constrained_prompt": constrained,
             },
         )
+
+    def extract(self, image_bytes: bytes, region_type: str) -> OCRResult:
+        started = time.monotonic()
+        attempt_count = 1
+        try:
+            result = self._extract_once(image_bytes, region_type, constrained=False)
+        except OutputValidationError as exc:
+            attempt_count = 2
+            result = self._extract_once(image_bytes, region_type, constrained=True)
+            result.extraction_metadata["retry_strategy"] = "constrained_prompt"
+            result.extraction_metadata["initial_validation_issue_codes"] = [issue.code for issue in exc.issues]
+        result.latency_ms = int((time.monotonic() - started) * 1000)
+        result.extraction_metadata["attempt_count"] = attempt_count
+        return result
 
     def extract_batch(self, units: list[RegionUnit]) -> list[OCRResult]:
         return [self.extract(unit.image_bytes, unit.region_type) for unit in units]
@@ -212,22 +252,15 @@ class SuryaOCRProvider:
         self._foundation = FoundationPredictor(checkpoint=settings.RECOGNITION_MODEL_CHECKPOINT)
         self._rec_predictor = RecognitionPredictor(self._foundation)
 
-    def extract(self, image_bytes: bytes, region_type: str) -> OCRResult:
-        if self._det_predictor is None or self._rec_predictor is None:
-            raise RuntimeError("SuryaOCRProvider.load() must be called before extract()")
-
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        started = time.monotonic()
-        with gpu_scheduler.claim("ocr"):
-            results = self._rec_predictor([image], det_predictor=self._det_predictor)
+    def _result_from_prediction(self, prediction: object, region_type: str, latency_ms: int, *, batch_size: int) -> OCRResult:
         blocks: list[TextBlock] = []
         confidences: list[float] = []
-        for line in results[0].text_lines:
-            text = line.text.strip()
+        for line in getattr(prediction, "text_lines", []):
+            text = str(getattr(line, "text", "")).strip()
             if not text:
                 continue
             x0, y0, x1, y1 = line.bbox
-            confidence = float(line.confidence or 0.0)
+            confidence = float(getattr(line, "confidence", 0.0) or 0.0)
             confidences.append(confidence)
             blocks.append(
                 TextBlock(
@@ -240,7 +273,6 @@ class SuryaOCRProvider:
 
         typed_content = {"blocks": [block.to_dict() for block in blocks]}
         typed_content = self._validator.require(typed_content, _validate_ocr_payload)
-        latency_ms = int((time.monotonic() - started) * 1000)
         return OCRResult(
             region_type=region_type,
             typed_content=typed_content,
@@ -255,11 +287,47 @@ class SuryaOCRProvider:
                 "language": get_settings().ocr.language,
                 "block_count": len(typed_content["blocks"]),
                 "runtime": "surya",
+                "batch_size": batch_size,
             },
         )
 
+    def _recognize_batch(self, images: list[Image.Image]) -> list[object]:
+        if self._det_predictor is None or self._rec_predictor is None:
+            raise RuntimeError("SuryaOCRProvider.load() must be called before extract()")
+        with gpu_scheduler.claim("ocr"):
+            return self._rec_predictor(images, det_predictor=self._det_predictor)
+
+    def _extract_batch_once(self, units: list[RegionUnit]) -> list[OCRResult]:
+        images = [Image.open(io.BytesIO(unit.image_bytes)).convert("RGB") for unit in units]
+        started = time.monotonic()
+        predictions = self._recognize_batch(images)
+        latency_ms = int((time.monotonic() - started) * 1000)
+        return [
+            self._result_from_prediction(prediction, unit.region_type, latency_ms, batch_size=len(units))
+            for unit, prediction in zip(units, predictions, strict=False)
+        ]
+
+    def _extract_batch_with_recovery(self, units: list[RegionUnit]) -> list[OCRResult]:
+        try:
+            return self._extract_batch_once(units)
+        except Exception as exc:
+            if len(units) > 1 and (_is_timeout_error(exc) or _is_oom_error(exc)):
+                midpoint = max(1, len(units) // 2)
+                return self._extract_batch_with_recovery(units[:midpoint]) + self._extract_batch_with_recovery(units[midpoint:])
+            raise
+
+    def extract(self, image_bytes: bytes, region_type: str) -> OCRResult:
+        unit = RegionUnit(unit_id="single", doc_id="single", region_type=region_type, image_bytes=image_bytes)
+        return self._extract_batch_once([unit])[0]
+
     def extract_batch(self, units: list[RegionUnit]) -> list[OCRResult]:
-        return [self.extract(unit.image_bytes, unit.region_type) for unit in units]
+        if not units:
+            return []
+        batch_size = max(1, get_settings().ocr.batch_size)
+        results: list[OCRResult] = []
+        for start in range(0, len(units), batch_size):
+            results.extend(self._extract_batch_with_recovery(units[start : start + batch_size]))
+        return results
 
     def offload(self) -> None:
         self._rec_predictor = None

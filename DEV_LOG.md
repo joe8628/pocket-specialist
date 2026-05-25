@@ -19,6 +19,7 @@ Current implementation line:
    - Starts from `feat/checkpoints` at `267425d`.
    - `916d0f8` - `Implement Phase C formula system`
    - `4e5d07c` - `Fix Phase B/C GPU serialization`
+   - `1af873f` - `Refactor GPU scheduler to file lock`
 
 ## Branch Lineage
 
@@ -200,6 +201,15 @@ Cross-process scheduler refactor after the enforcement fix:
 - The async path now acquires and releases the same file lock through `asyncio.to_thread(...)` so event-loop callers preserve the old API without blocking the loop. Timeout behavior remains driven by `runtime.gpu_serialization_timeout_s`, implemented as non-blocking lock attempts plus short sleep polling until the deadline expires.
 - Test coverage in `tests/test_phase_a_foundation.py` was extended to verify successful repeated sync claims, timeout while another holder owns the shared lock file, and async acquisition through the file-lock path.
 - Validation for the scheduler-primitive refactor used `.venv/bin/python3 -m pytest tests/test_phase_a_foundation.py` and `.venv/bin/python3 -m pytest tests/test_phase_a_foundation.py tests/test_phase_b_foundation.py tests/test_phase_c_formula.py`, with `24 passed`.
+
+Section 7.3 retry and escalation follow-up:
+
+- Output validation already existed, but the active OCR path still stopped short of the section 7.3 policy: malformed JSON could be repaired once, and provider fallback existed at the extraction layer, but there was no constrained-prompt retry for structured OCR failures and no batch-size reduction strategy for timeout or OOM conditions.
+- `OllamaOCRProvider.extract()` was extended to retry once with a stricter JSON-only prompt when the first response fails structured validation. The successful retry records retry metadata so downstream provenance can distinguish the escalated path from the first-pass success case.
+- `SuryaOCRProvider.extract_batch()` was expanded from a simple per-unit loop into batched execution with recursive recovery. When a batched OCR call fails due to timeout or OOM-style errors, the batch is split into smaller chunks until the work succeeds or reaches a single unit that still fails. This covers both the smaller-batch timeout recovery and OOM-driven batch reduction missing from section 7.3.
+- The extraction orchestration API did not need to change for this follow-up; the missing behavior belonged in the OCR provider layer, which is where structured-output retries and batch-size recovery are now enforced.
+- Added `tests/test_ocr_retry_policy.py` to cover constrained-prompt retry after malformed JSON, timeout-triggered batch splitting, and OOM-triggered batch splitting.
+- Validation for this follow-up used `.venv/bin/python3 -m pytest tests/test_ocr_retry_policy.py` and `.venv/bin/python3 -m pytest tests/test_phase_a_foundation.py tests/test_phase_b_foundation.py tests/test_phase_c_formula.py tests/test_ocr_retry_policy.py`, with `27 passed`.
 
 ## Current WIP on feat/checkpoints - DAG checkpoint observation layer
 
