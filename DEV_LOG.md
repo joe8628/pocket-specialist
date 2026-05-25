@@ -20,6 +20,7 @@ Current implementation line:
    - `916d0f8` - `Implement Phase C formula system`
    - `4e5d07c` - `Fix Phase B/C GPU serialization`
    - `1af873f` - `Refactor GPU scheduler to file lock`
+   - `1588e34` - `Add OCR retry escalation policy`
 
 ## Branch Lineage
 
@@ -210,6 +211,15 @@ Section 7.3 retry and escalation follow-up:
 - The extraction orchestration API did not need to change for this follow-up; the missing behavior belonged in the OCR provider layer, which is where structured-output retries and batch-size recovery are now enforced.
 - Added `tests/test_ocr_retry_policy.py` to cover constrained-prompt retry after malformed JSON, timeout-triggered batch splitting, and OOM-triggered batch splitting.
 - Validation for this follow-up used `.venv/bin/python3 -m pytest tests/test_ocr_retry_policy.py` and `.venv/bin/python3 -m pytest tests/test_phase_a_foundation.py tests/test_phase_b_foundation.py tests/test_phase_c_formula.py tests/test_ocr_retry_policy.py`, with `27 passed`.
+
+Section 18 document-handler matrix follow-up:
+
+- The intake layer still only recognized PDF, HTML, text, and Markdown, which left the pre-Phase-D handler matrix incomplete even though the spec expected broader document coverage before retrieval work. Unsupported inputs were still rejected up front in `handlers/intake.py`, so the missing formats never reached any fallback path.
+- `SourceKind` and `classify_document()` were expanded to cover full-image OCR inputs (`PNG`, `JPG`, `TIFF`), tabular text formats (`CSV`, `TSV`), office text containers (`DOCX`, `ODT`), spreadsheets (`XLSX`), and `EPUB`.
+- Lightweight ingestion helpers were added for the non-PDF formats without introducing new third-party dependencies: CSV/TSV via the stdlib `csv` reader, DOCX/ODT/XLSX/EPUB via ZIP/XML parsing, and EPUB chapter content through the existing HTML block parser.
+- The active Phase B extraction entrypoint was extended so these new source kinds are accepted end-to-end. Textual/tabular/archive formats now emit CIF directly, while image formats route through the existing full-page OCR provider path and convert the OCR result into `StructuredBlock`s without forcing a PDF wrapper.
+- `tests/test_phase_b_foundation.py` was broadened to cover classification and ingestion for CSV, DOCX, XLSX, EPUB, and image inputs, plus the full-image OCR extraction branch.
+- Validation for the handler-matrix follow-up used `.venv/bin/python3 -m pytest tests/test_phase_b_foundation.py` and `.venv/bin/python3 -m pytest tests/test_phase_a_foundation.py tests/test_phase_b_foundation.py tests/test_phase_c_formula.py tests/test_ocr_retry_policy.py`, with `30 passed`.
 
 ## Current WIP on feat/checkpoints - DAG checkpoint observation layer
 

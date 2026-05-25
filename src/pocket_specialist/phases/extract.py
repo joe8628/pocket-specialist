@@ -16,8 +16,13 @@ from pocket_specialist.handlers.intake import (
     SourceKind,
     classify_document,
     get_pdf_native_blocks,
+    ingest_docx_to_cif,
+    ingest_epub_to_cif,
     ingest_html_to_cif,
+    ingest_odt_to_cif,
+    ingest_tabular_to_cif,
     ingest_text_to_cif,
+    ingest_xlsx_to_cif,
     render_pdf_page_to_bytes,
 )
 from pocket_specialist.layout.providers import LayoutRegion, LayoutResult, build_layout_provider, crop_region_image
@@ -355,6 +360,45 @@ def _write_structured_page(document: str, page_num: int, blocks: list[Structured
     )
 
 
+def _ocr_result_to_page_blocks(document: str, page_num: int, result: OCRResult) -> list[StructuredBlock]:
+    blocks: list[StructuredBlock] = []
+    for idx, raw_block in enumerate(result.typed_content["blocks"], 1):
+        text = str(raw_block.get("raw_text", "")).strip()
+        if not text:
+            continue
+        bbox = raw_block.get("bbox") if isinstance(raw_block.get("bbox"), dict) else {}
+        source_bbox = None
+        if isinstance(bbox, dict):
+            try:
+                source_bbox = (
+                    int(float(bbox.get("x0", 0))),
+                    int(float(bbox.get("y0", 0))),
+                    int(float(bbox.get("x1", 0))),
+                    int(float(bbox.get("y1", 0))),
+                )
+            except (TypeError, ValueError):
+                source_bbox = None
+        blocks.append(
+            StructuredBlock(
+                block_id=f"{document}-page-{page_num:04d}-ocr-{idx:04d}",
+                doc_id=document,
+                block_type="TextBlock",
+                content={"type": "TextBlock", "text": text, "heading_level": None, "language": None},
+                section_path=[],
+                reading_order=idx,
+                page=page_num,
+                source_coords=SourceCoords(page=page_num, bbox=source_bbox),
+                provenance=ProvenanceRecord(
+                    source_stage="structured_extract",
+                    provider=result.provider,
+                    confidence=result.confidence,
+                    metadata={"ocr_mode": result.extraction_metadata.get("mode")},
+                ),
+            )
+        )
+    return blocks
+
+
 def extract_structured_document(
     source_path: Path,
     structured_output_dir: Path | None = None,
@@ -380,6 +424,62 @@ def extract_structured_document(
         _write_json(structured_dir / "document.json", asdict(cif))
         set_status("structured", document, 1, "done", str(structured_dir / "document.json"))
         return 1, 0, cif
+
+    if profile.source_kind in {SourceKind.CSV, SourceKind.TSV}:
+        cif = ingest_tabular_to_cif(source_path)
+        _write_json(structured_dir / "document.json", asdict(cif))
+        set_status("structured", document, 1, "done", str(structured_dir / "document.json"))
+        return 1, 0, cif
+
+    if profile.source_kind == SourceKind.DOCX:
+        cif = ingest_docx_to_cif(source_path)
+        _write_json(structured_dir / "document.json", asdict(cif))
+        set_status("structured", document, 1, "done", str(structured_dir / "document.json"))
+        return 1, 0, cif
+
+    if profile.source_kind == SourceKind.ODT:
+        cif = ingest_odt_to_cif(source_path)
+        _write_json(structured_dir / "document.json", asdict(cif))
+        set_status("structured", document, 1, "done", str(structured_dir / "document.json"))
+        return 1, 0, cif
+
+    if profile.source_kind == SourceKind.XLSX:
+        cif = ingest_xlsx_to_cif(source_path)
+        _write_json(structured_dir / "document.json", asdict(cif))
+        set_status("structured", document, 1, "done", str(structured_dir / "document.json"))
+        return 1, 0, cif
+
+    if profile.source_kind == SourceKind.EPUB:
+        cif = ingest_epub_to_cif(source_path)
+        _write_json(structured_dir / "document.json", asdict(cif))
+        set_status("structured", document, 1, "done", str(structured_dir / "document.json"))
+        return 1, 0, cif
+
+    if profile.source_kind == SourceKind.IMAGE:
+        primary_provider = build_primary_ocr_provider()
+        fallback_provider = build_fallback_ocr_provider()
+        with gpu_scheduler.claim("ocr"):
+            primary_provider.load()
+        if fallback_provider is not None and getattr(fallback_provider, "name", None) != getattr(primary_provider, "name", None):
+            with gpu_scheduler.claim("ocr"):
+                fallback_provider.load()
+        try:
+            result = _extract_with_fallback(primary_provider, fallback_provider, source_path.read_bytes(), "page")
+            blocks = _ocr_result_to_page_blocks(document, 1, result)
+            cif = CanonicalIntermediateFormat(
+                doc_id=document,
+                blocks=blocks,
+                metadata={"source_kind": profile.source_kind.value, "mime_type": profile.mime_type, "source_path": str(profile.source_path)},
+            )
+            _write_json(structured_dir / "document.json", asdict(cif))
+            set_status("structured", document, 1, "done", str(structured_dir / "document.json"))
+            return 1, 0, cif
+        finally:
+            with gpu_scheduler.claim("ocr"):
+                primary_provider.offload()
+            if fallback_provider is not None and fallback_provider is not primary_provider:
+                with gpu_scheduler.claim("ocr"):
+                    fallback_provider.offload()
 
     layout_provider = build_layout_provider()
     with gpu_scheduler.claim("layout"):
