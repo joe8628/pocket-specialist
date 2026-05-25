@@ -81,7 +81,8 @@ class SuryaLayoutProvider:
             raise RuntimeError("SuryaLayoutProvider.load() must be called before detect()")
 
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        result = self._predictor([image])[0]
+        with gpu_scheduler.claim("layout"):
+            result = self._predictor([image])[0]
         raw_regions = getattr(result, "bboxes", [])
         ordered = sorted(raw_regions, key=lambda item: getattr(item, "position", 0))
         regions: list[LayoutRegion] = []

@@ -21,6 +21,7 @@ from typing import Any, Protocol
 
 from PIL import Image
 
+from pocket_specialist.core.gpu import gpu_scheduler
 from pocket_specialist.formula.providers import FormulaResult
 
 
@@ -46,20 +47,21 @@ class UniMERNetRuntime:
     def load(self, model_size: str) -> None:
         if self._model is not None and self._model_size == model_size:
             return
-        self.offload()
-        try:
-            from unimernet.common.config import Config
-            from unimernet.tasks import setup_task
-        except ImportError as exc:
-            raise RuntimeError("UniMERNet is not installed in the formula service environment") from exc
+        with gpu_scheduler.claim("formula"):
+            self.offload()
+            try:
+                from unimernet.common.config import Config
+                from unimernet.tasks import setup_task
+            except ImportError as exc:
+                raise RuntimeError("UniMERNet is not installed in the formula service environment") from exc
 
-        config_path = self._resolve_config_path(model_size)
-        cfg = Config.from_file(str(config_path))
-        self._task = setup_task(cfg)
-        self._model = self._task.build_model(cfg)
-        if hasattr(self._model, "eval"):
-            self._model.eval()
-        self._model_size = model_size
+            config_path = self._resolve_config_path(model_size)
+            cfg = Config.from_file(str(config_path))
+            self._task = setup_task(cfg)
+            self._model = self._task.build_model(cfg)
+            if hasattr(self._model, "eval"):
+                self._model.eval()
+            self._model_size = model_size
 
     def extract(self, image_bytes: bytes, *, model_size: str) -> FormulaResult:
         if self._model is None or self._model_size != model_size:
@@ -67,7 +69,8 @@ class UniMERNetRuntime:
 
         image = Image.open(BytesIO(image_bytes)).convert("RGB")
         started = time.monotonic()
-        latex = self._predict_latex(image)
+        with gpu_scheduler.claim("formula"):
+            latex = self._predict_latex(image)
         latency_ms = int((time.monotonic() - started) * 1000)
         return FormulaResult(
             latex=latex.strip(),

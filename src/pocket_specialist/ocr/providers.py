@@ -131,7 +131,8 @@ class OllamaOCRProvider:
             "stream": False,
             "format": "json",
         }
-        response = self._session.post(f"{self._base_url}/api/generate", json=payload, timeout=self._timeout)
+        with gpu_scheduler.claim("ocr"):
+            response = self._session.post(f"{self._base_url}/api/generate", json=payload, timeout=self._timeout)
         response.raise_for_status()
         body = response.json()
         raw_response = str(body.get("response", "")).strip()
@@ -217,7 +218,8 @@ class SuryaOCRProvider:
 
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         started = time.monotonic()
-        results = self._rec_predictor([image], det_predictor=self._det_predictor)
+        with gpu_scheduler.claim("ocr"):
+            results = self._rec_predictor([image], det_predictor=self._det_predictor)
         blocks: list[TextBlock] = []
         confidences: list[float] = []
         for line in results[0].text_lines:

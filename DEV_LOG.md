@@ -171,6 +171,27 @@ Validation performed:
 - `PYTHONPATH=src ./.venv/bin/python -m pytest -q`
 - Current result: `20 passed`.
 
+Follow-up fix after spec audit:
+
+- A later audit against sections 4 through 19 of the v0.5.1 spec found that digital and hybrid PDF pages were still incorrectly treated as fully complete as soon as native text was present. That meant uncovered layout regions such as image-only formulas on otherwise digital pages never reached OCR or UniMERNet.
+- The structured extraction path was adjusted so native text blocks only satisfy the layout regions they actually cover. Unmatched layout regions are now routed through the OCR/formula path and merged back into the page result. This keeps digital/hybrid pages aligned with the spec rule that complex regions can still trigger OCR even when native text exists.
+- The first implementation pass exposed an edge case in cleanup: the orchestration code allowed `fallback_provider` to be `None` during extraction, but the final offload logic still assumed an object existed. That produced an `AttributeError` in the new orchestration test. The offload/load guards were tightened so `None` fallback providers are handled consistently.
+- Test coverage was extended beyond unit routing helpers. The new integration-style test patches document classification, layout detection, native block extraction, and provider factories to prove that a digital page with native text plus an uncovered formula region now emits both the native `TextBlock` and the routed `FormulaBlock`.
+
+Validation performed for the follow-up fix:
+
+- `python3 -m compileall src tests`
+- `PYTHONPATH=src ./.venv/bin/python -m pytest tests/test_phase_c_formula.py -q`
+- `PYTHONPATH=src ./.venv/bin/python -m pytest -q`
+- Follow-up result: `22 passed`.
+
+Missing detail now documented after a later spec audit:
+
+- Section 9 GPU serialization was still not actually enforced in the active Phase B/C extraction path even though `GPUScheduler` existed. The code was releasing GPU memory after provider use, but the live layout, OCR, and formula paths were not consistently claiming the scheduler at model load/inference/offload boundaries.
+- The corrective follow-up wired scheduler claims into the Phase B/C orchestration path and the concrete GPU-heavy providers/runtime: layout detection, OCR inference, UniMERNet service client requests, and the isolated UniMERNet runtime. This keeps CPU work outside the lock while serializing the GPU-heavy sections the spec actually cares about.
+- Regression coverage was extended to assert scheduler claims on the active extraction path and provider-level inference boundaries, in addition to the existing digital-page formula routing coverage.
+- Validation for this GPU-serialization follow-up used the project virtualenv test run: `.venv/bin/python3 -m pytest tests/test_phase_c_formula.py tests/test_phase_b_foundation.py tests/test_phase_a_foundation.py`, with `22 passed`.
+
 ## Current WIP on feat/checkpoints - DAG checkpoint observation layer
 
 This work is not committed yet. It started after verifying that local `DAG-OCR-phase-B` matched `origin/DAG-OCR-phase-B` at `363f4d4`. A new branch, `feat/checkpoints`, was created from that verified remote head.

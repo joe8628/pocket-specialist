@@ -11,6 +11,7 @@ from typing import Protocol
 import requests
 
 from pocket_specialist.core.config import get_settings
+from pocket_specialist.core.gpu import gpu_scheduler
 from pocket_specialist.core.tasks import FormulaUnit
 from pocket_specialist.core.validation import OutputValidationError, OutputValidator, ValidationIssue
 
@@ -84,7 +85,8 @@ class UniMERNetFormulaExtractor:
     def load(self) -> None:
         self._session = requests.Session()
         try:
-            response = self._session.post(f"{self._base_url}/load", json={"model_size": self._model_size}, timeout=self._timeout)
+            with gpu_scheduler.claim("formula"):
+                response = self._session.post(f"{self._base_url}/load", json={"model_size": self._model_size}, timeout=self._timeout)
             if response.status_code == 404:
                 return
             response.raise_for_status()
@@ -102,7 +104,8 @@ class UniMERNetFormulaExtractor:
             "model_size": self._model_size,
         }
         try:
-            response = self._session.post(f"{self._base_url}/extract", json=payload, timeout=self._timeout)
+            with gpu_scheduler.claim("formula"):
+                response = self._session.post(f"{self._base_url}/extract", json=payload, timeout=self._timeout)
             response.raise_for_status()
             body = response.json()
         except (requests.RequestException, ValueError) as exc:
@@ -136,7 +139,8 @@ class UniMERNetFormulaExtractor:
             "model_size": self._model_size,
         }
         try:
-            response = self._session.post(f"{self._base_url}/extract_batch", json=payload, timeout=self._timeout)
+            with gpu_scheduler.claim("formula"):
+                response = self._session.post(f"{self._base_url}/extract_batch", json=payload, timeout=self._timeout)
             if response.status_code == 404:
                 return [self.extract(crop) for crop in crops]
             response.raise_for_status()
@@ -174,7 +178,8 @@ class UniMERNetFormulaExtractor:
         if session is None:
             return
         try:
-            session.post(f"{self._base_url}/offload", timeout=min(self._timeout, 5))
+            with gpu_scheduler.claim("formula"):
+                session.post(f"{self._base_url}/offload", timeout=min(self._timeout, 5))
         except requests.RequestException:
             pass
         session.close()

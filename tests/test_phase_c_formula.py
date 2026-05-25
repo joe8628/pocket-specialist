@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import io
+from contextlib import contextmanager
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -9,8 +12,9 @@ from PIL import Image
 
 from pocket_specialist.formula.providers import FormulaResult, UniMERNetFormulaExtractor
 from pocket_specialist.layout.providers import LayoutRegion, LayoutResult
+from pocket_specialist.handlers.intake import DocumentProfile, NativeTextBlock, PDFContentType, SourceKind
 from pocket_specialist.formula.symbolic import inline_formula_candidates, looks_symbolic
-from pocket_specialist.phases.extract import _ocr_page_blocks
+from pocket_specialist.phases.extract import _matched_layout_region_ids, _ocr_page_blocks, extract_structured_document
 
 
 class FakeResponse:
@@ -53,7 +57,27 @@ class FakeSession:
         self.closed = True
 
 
+class FakeLayoutProvider:
+    def __init__(self, layout: LayoutResult) -> None:
+        self._layout = layout
+
+    def load(self) -> None:
+        return None
+
+    def detect(self, image_bytes: bytes) -> LayoutResult:
+        return self._layout
+
+    def offload(self) -> None:
+        return None
+
+
 class FakeFormulaExtractor:
+    def load(self) -> None:
+        return None
+
+    def offload(self) -> None:
+        return None
+
     def extract(self, image_bytes: bytes) -> FormulaResult:
         return FormulaResult(
             latex="x^2 + y^2",
@@ -67,6 +91,12 @@ class FakeFormulaExtractor:
 
 
 class FailingFormulaExtractor:
+    def load(self) -> None:
+        return None
+
+    def offload(self) -> None:
+        return None
+
     def extract(self, image_bytes: bytes) -> FormulaResult:
         raise RuntimeError("formula service unavailable")
 
@@ -76,6 +106,12 @@ class FakeOCRProvider:
 
     def __init__(self, text: str) -> None:
         self.text = text
+
+    def load(self) -> None:
+        return None
+
+    def offload(self) -> None:
+        return None
 
     def extract(self, image_bytes: bytes, region_type: str):
         return SimpleNamespace(
@@ -87,8 +123,24 @@ class FakeOCRProvider:
 
 
 class UnusedOCRProvider:
+    def load(self) -> None:
+        return None
+
+    def offload(self) -> None:
+        return None
+
     def extract(self, image_bytes: bytes, region_type: str):  # pragma: no cover - should not be called
         raise AssertionError("OCR should not be called for formula-only layout regions")
+
+
+class ClaimRecorder:
+    def __init__(self) -> None:
+        self.claims: list[str] = []
+
+    @contextmanager
+    def claim(self, resource_type: str):
+        self.claims.append(resource_type)
+        yield
 
 
 class PhaseCFormulaTests(unittest.TestCase):
@@ -194,6 +246,149 @@ class PhaseCFormulaTests(unittest.TestCase):
         self.assertEqual(blocks[0].content["provider"], "symbolic-fallback")
         self.assertEqual(blocks[0].content["latex"], "E = mc^2")
         self.assertEqual(blocks[0].provenance.metadata["fallback_reason"], "formula service unavailable")
+
+    def test_native_region_coverage_leaves_unmatched_formula_for_followup_routing(self) -> None:
+        layout = LayoutResult(
+            page_id="page-0001",
+            regions=[
+                LayoutRegion("region-0001", "text", (0, 0, 30, 10), 0.97, 0),
+                LayoutRegion("region-0002", "formula", (40, 0, 60, 20), 0.97, 1),
+            ],
+            layout_confidence=0.97,
+        )
+        native_blocks = [NativeTextBlock(text="native paragraph", bbox=(0, 0, 30, 10), block_no=0)]
+
+        matched = _matched_layout_region_ids(native_blocks, layout)
+
+        self.assertEqual(matched, {"region-0001"})
+
+    def test_extract_structured_document_claims_gpu_scheduler_for_active_phase_b_c_resources(self) -> None:
+        image = Image.new("RGB", (64, 32), "white")
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        layout = LayoutResult(
+            page_id="page-0001",
+            regions=[
+                LayoutRegion("region-0001", "text", (0, 0, 30, 10), 0.97, 0),
+                LayoutRegion("region-0002", "formula", (40, 0, 60, 20), 0.97, 1),
+            ],
+            layout_confidence=0.97,
+        )
+        profile = DocumentProfile(
+            doc_id="doc",
+            source_path=Path("/tmp/doc.pdf"),
+            source_kind=SourceKind.PDF,
+            mime_type="application/pdf",
+            pdf_content_type=PDFContentType.DIGITAL,
+            page_count=1,
+            text_extractable=True,
+            metadata={"page_modes": [PDFContentType.DIGITAL.value]},
+        )
+        native_blocks = [NativeTextBlock(text="native paragraph", bbox=(0, 0, 30, 10), block_no=0)]
+        recorder = ClaimRecorder()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            with patch("pocket_specialist.phases.extract.classify_document", return_value=profile), \
+                 patch("pocket_specialist.phases.extract.render_pdf_page_to_bytes", return_value=buffer.getvalue()), \
+                 patch("pocket_specialist.phases.extract.build_layout_provider", return_value=FakeLayoutProvider(layout)), \
+                 patch("pocket_specialist.phases.extract.get_pdf_native_blocks", return_value=native_blocks), \
+                 patch("pocket_specialist.phases.extract.build_primary_ocr_provider", return_value=UnusedOCRProvider()), \
+                 patch("pocket_specialist.phases.extract.build_fallback_ocr_provider", return_value=None), \
+                 patch("pocket_specialist.phases.extract.build_formula_extractor", return_value=FakeFormulaExtractor()), \
+                 patch("pocket_specialist.phases.extract.gpu_scheduler", recorder), \
+                 patch("pocket_specialist.phases.extract.init_db"), \
+                 patch("pocket_specialist.phases.extract.set_status"), \
+                 patch("pocket_specialist.phases.extract.should_process", return_value=True):
+                extract_structured_document(
+                    Path("/tmp/doc.pdf"),
+                    structured_output_dir=root / "structured-out",
+                    layout_output_dir=root / "layout-out",
+                )
+
+        assert recorder.claims == ["layout", "layout", "ocr", "ocr"]
+
+    def test_layout_provider_detect_claims_gpu_scheduler(self) -> None:
+        class FakePredictor:
+            def __call__(self, images):
+                return [SimpleNamespace(bboxes=[])]
+
+        recorder = ClaimRecorder()
+        from pocket_specialist.layout.providers import SuryaLayoutProvider
+
+        provider = SuryaLayoutProvider()
+        provider._predictor = FakePredictor()
+
+        image = Image.new("RGB", (24, 24), "white")
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+
+        with patch("pocket_specialist.layout.providers.gpu_scheduler", recorder):
+            provider.detect(buffer.getvalue())
+
+        assert recorder.claims == ["layout"]
+
+    def test_ollama_formula_client_claims_gpu_scheduler(self) -> None:
+        session = FakeSession()
+        recorder = ClaimRecorder()
+        with patch("pocket_specialist.formula.providers.requests.Session", return_value=session), \
+             patch("pocket_specialist.formula.providers.gpu_scheduler", recorder):
+            extractor = UniMERNetFormulaExtractor(base_url="http://formula.local", model_size="small")
+            extractor.load()
+            extractor.extract(b"image-bytes")
+            extractor.offload()
+
+        assert recorder.claims == ["formula", "formula", "formula"]
+
+    def test_digital_page_routes_uncovered_formula_region_through_formula_path(self) -> None:
+        image = Image.new("RGB", (64, 32), "white")
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        layout = LayoutResult(
+            page_id="page-0001",
+            regions=[
+                LayoutRegion("region-0001", "text", (0, 0, 30, 10), 0.97, 0),
+                LayoutRegion("region-0002", "formula", (40, 0, 60, 20), 0.97, 1),
+            ],
+            layout_confidence=0.97,
+        )
+        profile = DocumentProfile(
+            doc_id="doc",
+            source_path=Path("/tmp/doc.pdf"),
+            source_kind=SourceKind.PDF,
+            mime_type="application/pdf",
+            pdf_content_type=PDFContentType.DIGITAL,
+            page_count=1,
+            text_extractable=True,
+            metadata={"page_modes": [PDFContentType.DIGITAL.value]},
+        )
+        native_blocks = [NativeTextBlock(text="native paragraph", bbox=(0, 0, 30, 10), block_no=0)]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            with patch("pocket_specialist.phases.extract.classify_document", return_value=profile), \
+                 patch("pocket_specialist.phases.extract.render_pdf_page_to_bytes", return_value=buffer.getvalue()), \
+                 patch("pocket_specialist.phases.extract.build_layout_provider", return_value=FakeLayoutProvider(layout)), \
+                 patch("pocket_specialist.phases.extract.get_pdf_native_blocks", return_value=native_blocks), \
+                 patch("pocket_specialist.phases.extract.build_primary_ocr_provider", return_value=UnusedOCRProvider()), \
+                 patch("pocket_specialist.phases.extract.build_fallback_ocr_provider", return_value=None), \
+                 patch("pocket_specialist.phases.extract.build_formula_extractor", return_value=FakeFormulaExtractor()), \
+                 patch("pocket_specialist.phases.extract.init_db"), \
+                 patch("pocket_specialist.phases.extract.set_status"), \
+                 patch("pocket_specialist.phases.extract.should_process", return_value=True):
+                done, failed, cif = extract_structured_document(
+                    Path("/tmp/doc.pdf"),
+                    structured_output_dir=root / "structured-out",
+                    layout_output_dir=root / "layout-out",
+                )
+
+        self.assertEqual(done, 1)
+        self.assertEqual(failed, 0)
+        self.assertEqual(len(cif.blocks), 2)
+        self.assertEqual(cif.blocks[0].block_type, "TextBlock")
+        self.assertEqual(cif.blocks[1].block_type, "FormulaBlock")
+        self.assertEqual(cif.blocks[1].content["type"], "FormulaBlock")
+        self.assertEqual(cif.blocks[1].content["latex"], "x^2 + y^2")
 
 
 if __name__ == "__main__":

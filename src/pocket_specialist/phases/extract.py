@@ -10,6 +10,7 @@ from pocket_specialist.storage.checkpoint import init_db, set_status, should_pro
 
 from pocket_specialist.core.cif import CanonicalIntermediateFormat, ProvenanceRecord, SourceCoords, StructuredBlock
 from pocket_specialist.core.config import get_settings
+from pocket_specialist.core.gpu import gpu_scheduler
 from pocket_specialist.handlers.intake import (
     PDFContentType,
     SourceKind,
@@ -58,6 +59,15 @@ def _match_region(bbox: tuple[int, int, int, int], layout: LayoutResult) -> Layo
                 best = region
                 best_area = area
     return best
+
+
+def _matched_layout_region_ids(native_blocks, layout: LayoutResult) -> set[str]:
+    matched: set[str] = set()
+    for native in native_blocks:
+        region = _match_region(native.bbox, layout)
+        if region is not None:
+            matched.add(region.region_id)
+    return matched
 
 
 def _parse_key_value_pairs(text: str) -> dict[str, str]:
@@ -233,11 +243,12 @@ def _ocr_page_blocks(
     primary_provider: OCRProvider,
     fallback_provider: OCRProvider | None,
     formula_extractor: FormulaExtractor | None = None,
+    regions: list[LayoutRegion] | None = None,
 ) -> list[StructuredBlock]:
     blocks: list[StructuredBlock] = []
     block_index = 0
     settings = get_settings()
-    for region in sorted(layout.regions, key=lambda item: item.reading_order):
+    for region in sorted(regions or layout.regions, key=lambda item: item.reading_order):
         block_type = _layout_region_to_block_type(region.region_type)
         if region.region_type == "formula":
             block_index += 1
@@ -371,10 +382,13 @@ def extract_structured_document(
         return 1, 0, cif
 
     layout_provider = build_layout_provider()
-    layout_provider.load()
+    with gpu_scheduler.claim("layout"):
+        layout_provider.load()
     page_layouts: dict[int, LayoutResult] = {}
     page_images: dict[int, bytes] = {}
     native_pages: set[int] = set()
+    page_base_blocks: dict[int, list[StructuredBlock]] = {}
+    supplemental_regions_by_page: dict[int, list[LayoutRegion]] = {}
     cif = CanonicalIntermediateFormat(
         doc_id=document,
         metadata={
@@ -404,28 +418,38 @@ def extract_structured_document(
             if native_blocks:
                 native_pages.add(page_num)
                 page_blocks = _native_page_blocks(document, page_num, native_blocks, layout_result)
-                structured_path = structured_dir / f"page_{page_num:04d}.json"
-                _write_structured_page(document, page_num, page_blocks, {"page_mode": PDFContentType.DIGITAL.value}, structured_path)
-                for block in page_blocks:
-                    cif.add_block(block)
-                set_status("structured", document, page_num, "done", str(structured_path))
-                done += 1
+                page_base_blocks[page_num] = page_blocks
+                matched_region_ids = _matched_layout_region_ids(native_blocks, layout_result)
+                uncovered_regions = [region for region in layout_result.regions if region.region_id not in matched_region_ids]
+                if uncovered_regions:
+                    supplemental_regions_by_page[page_num] = uncovered_regions
+                else:
+                    structured_path = structured_dir / f"page_{page_num:04d}.json"
+                    _write_structured_page(document, page_num, page_blocks, {"page_mode": PDFContentType.DIGITAL.value}, structured_path)
+                    for block in page_blocks:
+                        cif.add_block(block)
+                    set_status("structured", document, page_num, "done", str(structured_path))
+                    done += 1
     finally:
-        layout_provider.offload()
+        with gpu_scheduler.claim("layout"):
+            layout_provider.offload()
 
     scanned_pages = [page_num for page_num in range(1, profile.page_count + 1) if page_num not in native_pages and should_process("structured", document, page_num)]
-    if scanned_pages:
+    ocr_pages = sorted(set(scanned_pages) | set(supplemental_regions_by_page))
+    if ocr_pages:
         primary_provider = build_primary_ocr_provider()
         fallback_provider = build_fallback_ocr_provider()
         formula_needed = settings.formula.enabled and any(
             region.region_type == "formula"
-            for page_num in scanned_pages
-            for region in page_layouts[page_num].regions
+            for page_num in ocr_pages
+            for region in (supplemental_regions_by_page.get(page_num) or page_layouts[page_num].regions)
         )
         formula_extractor = build_formula_extractor() if formula_needed else None
-        primary_provider.load()
-        if getattr(fallback_provider, "name", None) != getattr(primary_provider, "name", None):
-            fallback_provider.load()
+        with gpu_scheduler.claim("ocr"):
+            primary_provider.load()
+        if fallback_provider is not None and getattr(fallback_provider, "name", None) != getattr(primary_provider, "name", None):
+            with gpu_scheduler.claim("ocr"):
+                fallback_provider.load()
         if formula_extractor is not None:
             try:
                 formula_extractor.load()
@@ -434,19 +458,32 @@ def extract_structured_document(
                     raise
                 formula_extractor = None
         try:
-            for page_num in scanned_pages:
+            for page_num in ocr_pages:
                 layout_result = page_layouts[page_num]
-                page_blocks = _ocr_page_blocks(document, page_num, page_images[page_num], layout_result, primary_provider, fallback_provider, formula_extractor)
+                ocr_blocks = _ocr_page_blocks(
+                    document,
+                    page_num,
+                    page_images[page_num],
+                    layout_result,
+                    primary_provider,
+                    fallback_provider,
+                    formula_extractor,
+                    regions=supplemental_regions_by_page.get(page_num),
+                )
+                page_blocks = sorted(page_base_blocks.get(page_num, []) + ocr_blocks, key=lambda block: (block.reading_order, block.block_id))
                 structured_path = structured_dir / f"page_{page_num:04d}.json"
-                _write_structured_page(document, page_num, page_blocks, {"page_mode": PDFContentType.SCANNED.value}, structured_path)
+                page_mode = PDFContentType.DIGITAL.value if page_num in native_pages else PDFContentType.SCANNED.value
+                _write_structured_page(document, page_num, page_blocks, {"page_mode": page_mode}, structured_path)
                 for block in page_blocks:
                     cif.add_block(block)
                 set_status("structured", document, page_num, "done", str(structured_path))
                 done += 1
         finally:
-            primary_provider.offload()
-            if fallback_provider is not primary_provider:
-                fallback_provider.offload()
+            with gpu_scheduler.claim("ocr"):
+                primary_provider.offload()
+            if fallback_provider is not None and fallback_provider is not primary_provider:
+                with gpu_scheduler.claim("ocr"):
+                    fallback_provider.offload()
             if formula_extractor is not None:
                 formula_extractor.offload()
 
@@ -469,7 +506,8 @@ def detect_layout_document(
     init_db()
 
     provider = build_layout_provider()
-    provider.load()
+    with gpu_scheduler.claim("layout"):
+        provider.load()
     done = failed = 0
     results: dict[int, LayoutResult] = {}
     try:
@@ -486,7 +524,8 @@ def detect_layout_document(
             set_status("layout", document, page_num, "done", str(out_path))
             done += 1
     finally:
-        provider.offload()
+        with gpu_scheduler.claim("layout"):
+            provider.offload()
 
     return done, failed, results
 
