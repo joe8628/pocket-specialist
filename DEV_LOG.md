@@ -17,7 +17,8 @@ Current implementation line:
    - `267425d` - `Add DAG checkpoint observations`
 5. `DAG-OCR-phase-c-unimernet`
    - Starts from `feat/checkpoints` at `267425d`.
-   - Phase C formula-system commit implements the UniMERNet service/client, formula routing, inline equation handling, and symbolic fallback path.
+   - `916d0f8` - `Implement Phase C formula system`
+   - `4e5d07c` - `Fix Phase B/C GPU serialization`
 
 ## Branch Lineage
 
@@ -191,6 +192,14 @@ Missing detail now documented after a later spec audit:
 - The corrective follow-up wired scheduler claims into the Phase B/C orchestration path and the concrete GPU-heavy providers/runtime: layout detection, OCR inference, UniMERNet service client requests, and the isolated UniMERNet runtime. This keeps CPU work outside the lock while serializing the GPU-heavy sections the spec actually cares about.
 - Regression coverage was extended to assert scheduler claims on the active extraction path and provider-level inference boundaries, in addition to the existing digital-page formula routing coverage.
 - Validation for this GPU-serialization follow-up used the project virtualenv test run: `.venv/bin/python3 -m pytest tests/test_phase_c_formula.py tests/test_phase_b_foundation.py tests/test_phase_a_foundation.py`, with `22 passed`.
+
+Cross-process scheduler refactor after the enforcement fix:
+
+- The earlier enforcement fix made the active Phase B/C paths call `gpu_scheduler.claim()` consistently, but the scheduler implementation itself still used only in-process `threading.Lock` and `asyncio.Lock` state. That meant separate local processes such as the main extractor and the UniMERNet service could still overlap on GPU use.
+- The scheduler was refactored to keep the existing `claim()` and `acquire()` API while replacing the internal lock primitive with an OS-backed `fcntl.flock` lock on a shared file. The default path is `/tmp/pocket-specialist-gpu.lock`, with `PIPELINE_GPU_LOCK_PATH` available for override.
+- The async path now acquires and releases the same file lock through `asyncio.to_thread(...)` so event-loop callers preserve the old API without blocking the loop. Timeout behavior remains driven by `runtime.gpu_serialization_timeout_s`, implemented as non-blocking lock attempts plus short sleep polling until the deadline expires.
+- Test coverage in `tests/test_phase_a_foundation.py` was extended to verify successful repeated sync claims, timeout while another holder owns the shared lock file, and async acquisition through the file-lock path.
+- Validation for the scheduler-primitive refactor used `.venv/bin/python3 -m pytest tests/test_phase_a_foundation.py` and `.venv/bin/python3 -m pytest tests/test_phase_a_foundation.py tests/test_phase_b_foundation.py tests/test_phase_c_formula.py`, with `24 passed`.
 
 ## Current WIP on feat/checkpoints - DAG checkpoint observation layer
 

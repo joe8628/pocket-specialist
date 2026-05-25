@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import threading
 from pathlib import Path
 
 from pocket_specialist.core.cif import CanonicalIntermediateFormat
@@ -86,3 +88,60 @@ def test_gpu_scheduler_claim_is_reentrant_per_call():
     scheduler = GPUScheduler()
     with scheduler.claim("ocr"):
         assert True
+
+
+def test_gpu_scheduler_claim_times_out_when_lock_is_held(tmp_path, monkeypatch):
+    scheduler = GPUScheduler(lock_path=tmp_path / "gpu.lock")
+    holder = GPUScheduler(lock_path=tmp_path / "gpu.lock")
+
+    settings = PipelineSettings.from_env(project_root=tmp_path)
+    settings = settings.__class__(
+        paths=settings.paths,
+        pipeline_version=settings.pipeline_version,
+        rendering=settings.rendering,
+        ocr=settings.ocr,
+        layout=settings.layout,
+        formula=settings.formula,
+        embedding=settings.embedding,
+        gpu=settings.gpu,
+        chunking=settings.chunking,
+        storage=settings.storage,
+        equations=settings.equations,
+        ollama=settings.ollama,
+        runtime=settings.runtime.__class__(
+            max_retries=settings.runtime.max_retries,
+            gpu_serialization_timeout_s=0.05,
+            gpu_enabled=settings.runtime.gpu_enabled,
+        ),
+    )
+    monkeypatch.setattr("pocket_specialist.core.gpu.get_settings", lambda: settings)
+
+    release = threading.Event()
+
+    def hold_lock() -> None:
+        with holder.claim("ocr"):
+            release.wait(timeout=1)
+
+    thread = threading.Thread(target=hold_lock)
+    thread.start()
+    try:
+        while not (tmp_path / "gpu.lock").exists():
+            pass
+        try:
+            with scheduler.claim("ocr"):
+                raise AssertionError("lock acquisition should have timed out")
+        except TimeoutError:
+            pass
+    finally:
+        release.set()
+        thread.join(timeout=1)
+
+
+async def _acquire_scheduler_once(scheduler: GPUScheduler) -> None:
+    async with scheduler.acquire("ocr"):
+        return None
+
+
+def test_gpu_scheduler_acquire_uses_async_file_lock(tmp_path):
+    scheduler = GPUScheduler(lock_path=tmp_path / "gpu.lock")
+    asyncio.run(_acquire_scheduler_once(scheduler))
