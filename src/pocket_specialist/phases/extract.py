@@ -9,7 +9,7 @@ from pathlib import Path
 
 from pocket_specialist.storage.checkpoint import init_db, set_status, should_process
 
-from pocket_specialist.core.cif import CanonicalIntermediateFormat, ProvenanceRecord, SourceCoords, StructuredBlock
+from pocket_specialist.core.cif import CanonicalIntermediateFormat, ProcessingArtifact, ProvenanceRecord, SourceCoords, StructuredBlock
 from pocket_specialist.core.config import get_settings
 from pocket_specialist.core.gpu import gpu_scheduler
 from pocket_specialist.handlers.intake import (
@@ -191,6 +191,78 @@ def _matched_layout_region_ids(native_blocks, layout: LayoutResult) -> set[str]:
     return matched
 
 
+def _artifact_uri_for_path(path: Path, project_root: Path | None) -> str:
+    if project_root is not None:
+        try:
+            return path.relative_to(project_root).as_posix()
+        except ValueError:
+            pass
+    return str(path)
+
+
+def _write_figure_artifact(
+    *,
+    document: str,
+    page_num: int,
+    block_id: str,
+    artifact_bytes: bytes | None,
+    artifact_root: Path | None,
+    project_root: Path | None,
+) -> str | None:
+    if artifact_bytes is None:
+        return None
+    settings = get_settings()
+    artifact_base = artifact_root or settings.paths.artifact_path
+    root_path = project_root or settings.paths.project_root
+    artifact_dir = artifact_base / document / "figures"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    artifact_path = artifact_dir / f"{block_id}.png"
+    artifact_path.write_bytes(artifact_bytes)
+    return _artifact_uri_for_path(artifact_path, root_path)
+
+
+def _figure_contract(
+    *,
+    caption: str | None,
+    alt_text: str,
+    embedded_text: list[str] | None,
+    artifact_uri: str | None,
+) -> dict[str, object]:
+    return {
+        "type": "FigureBlock",
+        "caption": caption,
+        "alt_text": alt_text,
+        "embedded_text": embedded_text,
+        "artifact_uri": artifact_uri,
+    }
+
+
+def _artifacts_from_blocks(blocks: list[StructuredBlock]) -> list[ProcessingArtifact]:
+    artifacts: list[ProcessingArtifact] = []
+    seen_uris: set[str] = set()
+    for block in blocks:
+        if block.block_type != "FigureBlock":
+            continue
+        artifact_uri = block.content.get("artifact_uri")
+        if not isinstance(artifact_uri, str) or not artifact_uri or artifact_uri in seen_uris:
+            continue
+        seen_uris.add(artifact_uri)
+        metadata: dict[str, object] = {"block_id": block.block_id}
+        if block.page is not None:
+            metadata["page"] = block.page
+        if block.source_coords is not None and block.source_coords.bbox is not None:
+            metadata["bbox"] = list(block.source_coords.bbox)
+        artifacts.append(
+            ProcessingArtifact(
+                artifact_id=f"{block.block_id}-artifact",
+                artifact_type="figure",
+                uri=artifact_uri,
+                metadata=metadata,
+            )
+        )
+    return artifacts
+
+
 def _parse_key_value_pairs(text: str) -> dict[str, str]:
     pairs: dict[str, str] = {}
     for line in [part.strip() for part in text.splitlines() if part.strip()]:
@@ -201,7 +273,7 @@ def _parse_key_value_pairs(text: str) -> dict[str, str]:
     return pairs
 
 
-def _native_contract(region_type: str, text: str) -> dict[str, object]:
+def _native_contract(region_type: str, text: str, *, artifact_uri: str | None = None) -> dict[str, object]:
     if region_type == "heading":
         return {"type": "TextBlock", "text": text, "heading_level": 1, "language": None}
     if region_type == "list":
@@ -213,13 +285,13 @@ def _native_contract(region_type: str, text: str) -> dict[str, object]:
     if region_type == "key_value":
         return {"type": "KeyValueBlock", "pairs": _parse_key_value_pairs(text)}
     if region_type == "figure":
-        return {"type": "FigureBlock", "caption": None, "alt_text": "", "embedded_text": [text] if text else None}
+        return _figure_contract(caption=None, alt_text="", embedded_text=[text] if text else None, artifact_uri=artifact_uri)
     if region_type == "formula":
         return _formula_fallback_contract(text, inline=False)
     return {"type": "TextBlock", "text": text, "heading_level": None, "language": None}
 
 
-def _ocr_contract(region_type: str, texts: list[str], payload: dict[str, object] | None = None) -> dict[str, object]:
+def _ocr_contract(region_type: str, texts: list[str], payload: dict[str, object] | None = None, *, artifact_uri: str | None = None) -> dict[str, object]:
     merged_text = "\n".join(texts)
     if region_type == "heading":
         return {"type": "TextBlock", "text": merged_text, "heading_level": 1, "language": None}
@@ -232,7 +304,8 @@ def _ocr_contract(region_type: str, texts: list[str], payload: dict[str, object]
     if region_type == "key_value":
         return {"type": "KeyValueBlock", "pairs": _parse_key_value_pairs(merged_text)}
     if region_type == "figure":
-        return {"type": "FigureBlock", "caption": None, "alt_text": merged_text, "embedded_text": texts or None}
+        caption = payload.get("caption") if isinstance(payload, dict) and isinstance(payload.get("caption"), str) else None
+        return _figure_contract(caption=caption, alt_text=merged_text, embedded_text=texts or None, artifact_uri=artifact_uri)
     return {"type": "TextBlock", "text": merged_text, "heading_level": None, "language": None}
 
 
@@ -302,17 +375,41 @@ def _inline_formula_blocks(
     return blocks
 
 
-def _native_page_blocks(document: str, page_num: int, native_blocks, layout: LayoutResult) -> list[StructuredBlock]:
+def _native_page_blocks(
+    document: str,
+    page_num: int,
+    native_blocks,
+    layout: LayoutResult,
+    *,
+    page_image_bytes: bytes | None = None,
+    artifact_root: Path | None = None,
+    project_root: Path | None = None,
+) -> list[StructuredBlock]:
     blocks: list[StructuredBlock] = []
     for idx, native in enumerate(native_blocks, 1):
         region = _match_region(native.bbox, layout)
         region_type = region.region_type if region else "text"
         block_type = _layout_region_to_block_type(region_type)
+        block_id = f"{document}-page-{page_num:04d}-native-{idx:04d}"
+        artifact_uri = None
+        if region_type == "figure":
+            artifact_bytes = crop_region_image(page_image_bytes, native.bbox) if page_image_bytes is not None else None
+            artifact_uri = _write_figure_artifact(
+                document=document,
+                page_num=page_num,
+                block_id=block_id,
+                artifact_bytes=artifact_bytes,
+                artifact_root=artifact_root,
+                project_root=project_root,
+            )
+        metadata = {"region_type": region_type, "layout_region_id": region.region_id if region else None}
+        if artifact_uri is not None:
+            metadata["artifact_uri"] = artifact_uri
         block = StructuredBlock(
-            block_id=f"{document}-page-{page_num:04d}-native-{idx:04d}",
+            block_id=block_id,
             doc_id=document,
             block_type=block_type,
-            content=_native_contract(region_type, native.text),
+            content=_native_contract(region_type, native.text, artifact_uri=artifact_uri),
             section_path=[],
             reading_order=region.reading_order if region else idx,
             page=page_num,
@@ -320,7 +417,7 @@ def _native_page_blocks(document: str, page_num: int, native_blocks, layout: Lay
             provenance=ProvenanceRecord(
                 source_stage="structured_extract",
                 provider="fitz-native-text",
-                metadata={"region_type": region_type, "layout_region_id": region.region_id if region else None},
+                metadata=metadata,
             ),
         )
         blocks.append(block)
@@ -365,6 +462,9 @@ def _ocr_page_blocks(
     fallback_provider: OCRProvider | None,
     formula_extractor: FormulaExtractor | None = None,
     regions: list[LayoutRegion] | None = None,
+    *,
+    artifact_root: Path | None = None,
+    project_root: Path | None = None,
 ) -> list[StructuredBlock]:
     blocks: list[StructuredBlock] = []
     block_index = 0
@@ -419,11 +519,29 @@ def _ocr_page_blocks(
         if not texts and region.region_type != "figure":
             continue
         block_index += 1
+        block_id = f"{document}-page-{page_num:04d}-ocr-{block_index:04d}"
+        artifact_uri = None
+        if region.region_type == "figure":
+            artifact_uri = _write_figure_artifact(
+                document=document,
+                page_num=page_num,
+                block_id=block_id,
+                artifact_bytes=crop_bytes,
+                artifact_root=artifact_root,
+                project_root=project_root,
+            )
+        metadata = {
+            "region_type": region.region_type,
+            "layout_region_id": region.region_id,
+            "ocr_mode": result.extraction_metadata.get("mode"),
+        }
+        if artifact_uri is not None:
+            metadata["artifact_uri"] = artifact_uri
         ocr_block = StructuredBlock(
-            block_id=f"{document}-page-{page_num:04d}-ocr-{block_index:04d}",
+            block_id=block_id,
             doc_id=document,
             block_type=block_type,
-            content=_ocr_contract(region.region_type, texts, result.typed_content),
+            content=_ocr_contract(region.region_type, texts, result.typed_content, artifact_uri=artifact_uri),
             section_path=[],
             reading_order=region.reading_order,
             page=page_num,
@@ -432,11 +550,7 @@ def _ocr_page_blocks(
                 source_stage="structured_extract",
                 provider=result.provider,
                 confidence=result.confidence,
-                metadata={
-                    "region_type": region.region_type,
-                    "layout_region_id": region.region_id,
-                    "ocr_mode": result.extraction_metadata.get("mode"),
-                },
+                metadata=metadata,
             ),
         )
         blocks.append(ocr_block)
@@ -633,7 +747,15 @@ def extract_structured_document(
             native_blocks = get_pdf_native_blocks(source_path, page_num)
             if native_blocks:
                 native_pages.add(page_num)
-                page_blocks = _native_page_blocks(document, page_num, native_blocks, layout_result)
+                page_blocks = _native_page_blocks(
+                    document,
+                    page_num,
+                    native_blocks,
+                    layout_result,
+                    page_image_bytes=page_images[page_num],
+                    artifact_root=settings.paths.artifact_path,
+                    project_root=settings.paths.project_root,
+                )
                 page_base_blocks[page_num] = page_blocks
                 matched_region_ids = _matched_layout_region_ids(native_blocks, layout_result)
                 uncovered_regions = [region for region in layout_result.regions if region.region_id not in matched_region_ids]
@@ -644,6 +766,8 @@ def extract_structured_document(
                     _write_structured_page(document, page_num, page_blocks, {"page_mode": PDFContentType.DIGITAL.value}, structured_path)
                     for block in page_blocks:
                         cif.add_block(block)
+                    for artifact in _artifacts_from_blocks(page_blocks):
+                        cif.add_artifact(artifact)
                     set_status("structured", document, page_num, "done", str(structured_path))
                     done += 1
     finally:
@@ -685,6 +809,8 @@ def extract_structured_document(
                     fallback_provider,
                     formula_extractor,
                     regions=supplemental_regions_by_page.get(page_num),
+                    artifact_root=settings.paths.artifact_path,
+                    project_root=settings.paths.project_root,
                 )
                 page_blocks = sorted(page_base_blocks.get(page_num, []) + ocr_blocks, key=lambda block: (block.reading_order, block.block_id))
                 structured_path = structured_dir / f"page_{page_num:04d}.json"
@@ -692,6 +818,8 @@ def extract_structured_document(
                 _write_structured_page(document, page_num, page_blocks, {"page_mode": page_mode}, structured_path)
                 for block in page_blocks:
                     cif.add_block(block)
+                for artifact in _artifacts_from_blocks(page_blocks):
+                    cif.add_artifact(artifact)
                 set_status("structured", document, page_num, "done", str(structured_path))
                 done += 1
         finally:

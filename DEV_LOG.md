@@ -370,3 +370,11 @@ Section 12 table-contract follow-up:
 - Coverage was extended in `tests/test_phase_c_formula.py` to assert that native table routing emits normalized row objects and that OCR table routing preserves a structured table payload rather than collapsing back to stub content.
 - Validation in this environment was limited by missing runtime test dependencies (`pytest`, package-path setup, and `fitz` for the broader suite), so the concrete verification completed here was `python3 -m py_compile src/pocket_specialist/phases/extract.py src/pocket_specialist/ocr/providers.py tests/test_phase_c_formula.py`.
 
+Section 11.4 figure-artifact follow-up:
+
+- A later audit found that figure handling was only partially aligned with the CIF/storage contract. HTML image ingestion already carried `artifact_uri`, but the active PDF/layout-routed figure path only emitted `FigureBlock` content with caption/alt/OCR text and never materialized an external figure artifact or registered one in `CanonicalIntermediateFormat.artifacts`.
+- The extraction layer now writes PDF figure crops as external PNG artifacts under the configured artifact root, adds `artifact_uri` to native and OCR-routed `FigureBlock` payloads, and mirrors that URI into provenance metadata for traceability.
+- Aggregate CIF assembly now derives `ProcessingArtifact` entries from figure blocks during page collection so the document-level structured output includes both the `FigureBlock` and the externally stored artifact record required by section 11.4.
+- Coverage was extended in `tests/test_phase_c_formula.py` at two levels: one test asserts that an OCR-routed figure block receives an `artifact_uri`, and a second integration-style test proves `extract_structured_document()` collects the corresponding figure artifact in `cif.artifacts` for a scanned PDF page.
+- Validation in this environment remained dependency-limited, so the concrete verification completed here was `python3 -m py_compile src/pocket_specialist/phases/extract.py tests/test_phase_c_formula.py`.
+

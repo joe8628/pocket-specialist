@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from PIL import Image
 
+from pocket_specialist.core.config import PipelineSettings
 from pocket_specialist.formula.providers import FormulaResult, UniMERNetFormulaExtractor
 from pocket_specialist.layout.providers import LayoutRegion, LayoutResult
 from pocket_specialist.handlers.intake import DocumentProfile, NativeTextBlock, PDFContentType, SourceKind
@@ -261,6 +262,37 @@ class PhaseCFormulaTests(unittest.TestCase):
         self.assertEqual(blocks[0].content["rows"], [{"name": "alpha", "value": "1"}, {"name": "beta", "value": "2"}])
         self.assertNotIn("text", blocks[0].content)
 
+    def test_ocr_figure_region_writes_artifact_uri(self) -> None:
+        image = Image.new("RGB", (24, 24), "white")
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        layout = LayoutResult(
+            page_id="page-0001",
+            regions=[LayoutRegion("region-0001", "figure", (0, 0, 24, 24), 0.97, 0)],
+            layout_confidence=0.97,
+        )
+        settings = PipelineSettings.from_env(project_root=Path(tempfile.mkdtemp()))
+
+        with patch("pocket_specialist.phases.extract.get_settings", return_value=settings):
+            blocks = _ocr_page_blocks(
+                "doc",
+                1,
+                buffer.getvalue(),
+                layout,
+                FakeOCRProvider("figure text"),
+                None,
+                None,
+                artifact_root=settings.paths.artifact_path,
+                project_root=settings.paths.project_root,
+            )
+
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0].block_type, "FigureBlock")
+        artifact_uri = blocks[0].content["artifact_uri"]
+        self.assertTrue(isinstance(artifact_uri, str) and artifact_uri)
+        self.assertTrue((settings.paths.project_root / artifact_uri).exists())
+        self.assertEqual(blocks[0].provenance.metadata["artifact_uri"], artifact_uri)
+
     def test_ocr_table_region_preserves_structured_table_payload(self) -> None:
         image = Image.new("RGB", (24, 24), "white")
         buffer = io.BytesIO()
@@ -327,6 +359,52 @@ class PhaseCFormulaTests(unittest.TestCase):
         matched = _matched_layout_region_ids(native_blocks, layout)
 
         self.assertEqual(matched, {"region-0001"})
+
+    def test_extract_structured_document_collects_pdf_figure_artifacts(self) -> None:
+        image = Image.new("RGB", (64, 32), "white")
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        layout = LayoutResult(
+            page_id="page-0001",
+            regions=[LayoutRegion("region-0001", "figure", (0, 0, 24, 24), 0.97, 0)],
+            layout_confidence=0.97,
+        )
+        profile = DocumentProfile(
+            doc_id="doc",
+            source_path=Path("/tmp/doc.pdf"),
+            source_kind=SourceKind.PDF,
+            mime_type="application/pdf",
+            pdf_content_type=PDFContentType.SCANNED,
+            page_count=1,
+            text_extractable=False,
+            metadata={"page_modes": [PDFContentType.SCANNED.value]},
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            settings = PipelineSettings.from_env(project_root=root)
+            with patch("pocket_specialist.phases.extract.classify_document", return_value=profile), \
+                 patch("pocket_specialist.phases.extract.get_settings", return_value=settings), \
+                 patch("pocket_specialist.phases.extract.render_pdf_page_to_bytes", return_value=buffer.getvalue()), \
+                 patch("pocket_specialist.phases.extract.build_layout_provider", return_value=FakeLayoutProvider(layout)), \
+                 patch("pocket_specialist.phases.extract.get_pdf_native_blocks", return_value=[]), \
+                 patch("pocket_specialist.phases.extract.build_primary_ocr_provider", return_value=FakeOCRProvider("figure text")), \
+                 patch("pocket_specialist.phases.extract.build_fallback_ocr_provider", return_value=None), \
+                 patch("pocket_specialist.phases.extract.init_db"), \
+                 patch("pocket_specialist.phases.extract.set_status"), \
+                 patch("pocket_specialist.phases.extract.should_process", return_value=True):
+                _, _, cif = extract_structured_document(
+                    Path("/tmp/doc.pdf"),
+                    structured_output_dir=root / "structured-out",
+                    layout_output_dir=root / "layout-out",
+                )
+
+        self.assertEqual(len(cif.blocks), 1)
+        self.assertEqual(cif.blocks[0].block_type, "FigureBlock")
+        self.assertEqual(len(cif.artifacts), 1)
+        self.assertEqual(cif.artifacts[0].artifact_type, "figure")
+        self.assertEqual(cif.artifacts[0].uri, cif.blocks[0].content["artifact_uri"])
+        self.assertTrue((settings.paths.project_root / cif.artifacts[0].uri).exists())
 
     def test_extract_structured_document_claims_gpu_scheduler_for_active_phase_b_c_resources(self) -> None:
         image = Image.new("RGB", (64, 32), "white")
