@@ -325,7 +325,7 @@ def _symbolic_formula_contract(raw_formula_text: str, *, inline: bool) -> dict[s
         "latex": symbolic_latex(raw_formula_text),
         "mathml": None,
         "inline": inline,
-        "provider": "symbolic-fallback",
+        "provider": "ocr-fallback",
         "raw_formula_text": raw_formula_text,
     }
 
@@ -360,7 +360,7 @@ def _inline_formula_blocks(
                 source_coords=SourceCoords(page=page_num, bbox=bbox),
                 provenance=ProvenanceRecord(
                     source_stage="formula_route",
-                    provider="symbolic-fallback",
+                    provider="ocr-fallback",
                     lineage=[parent_block_id],
                     metadata={
                         "route": "inline_heuristic",
@@ -590,6 +590,20 @@ def _write_structured_page(document: str, page_num: int, blocks: list[Structured
     )
 
 
+def _write_page_layout_page(document: str, page_num: int, blocks: list[StructuredBlock], profile_metadata: dict[str, object], path: Path) -> None:
+    _write_json(
+        path,
+        {
+            "doc_id": document,
+            "page": page_num,
+            "type": "PageLayout",
+            "blocks": [asdict(block) for block in blocks],
+            "reading_order": [block.block_id for block in sorted(blocks, key=lambda item: (item.reading_order, item.block_id))],
+            "metadata": profile_metadata,
+        },
+    )
+
+
 def _empty_layout_result(page_num: int) -> LayoutResult:
     return LayoutResult(page_id=f"page-{page_num:04d}", regions=[], layout_confidence=None)
 
@@ -602,9 +616,13 @@ def _write_layout_disabled_page(
     page_blocks: list[StructuredBlock],
     structured_dir: Path,
     page_mode: str,
+    page_layout: bool = False,
 ) -> None:
     structured_path = structured_dir / f"page_{page_num:04d}.json"
-    _write_structured_page(document, page_num, page_blocks, {"page_mode": page_mode, "layout_enabled": False}, structured_path)
+    if page_layout:
+        _write_page_layout_page(document, page_num, page_blocks, {"page_mode": page_mode, "layout_enabled": False}, structured_path)
+    else:
+        _write_structured_page(document, page_num, page_blocks, {"page_mode": page_mode, "layout_enabled": False}, structured_path)
     for block in page_blocks:
         cif.add_block(block)
     for artifact in _artifacts_from_blocks(page_blocks):
@@ -612,39 +630,55 @@ def _write_layout_disabled_page(
     set_status("structured", document, page_num, "done", str(structured_path))
 
 
+def _raw_block_bbox(raw_block: dict[str, object]) -> tuple[int, int, int, int] | None:
+    bbox = raw_block.get("bbox") if isinstance(raw_block.get("bbox"), dict) else {}
+    if not isinstance(bbox, dict):
+        return None
+    try:
+        return (
+            int(float(bbox.get("x0", 0))),
+            int(float(bbox.get("y0", 0))),
+            int(float(bbox.get("x1", 0))),
+            int(float(bbox.get("y1", 0))),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _page_region_type(raw_block: dict[str, object]) -> str:
+    candidate = str(raw_block.get("block_type", "text")).strip().lower()
+    if candidate in _REGION_TO_BLOCK_TYPE or candidate == "formula":
+        return candidate
+    return "text"
+
+
 def _ocr_result_to_page_blocks(document: str, page_num: int, result: OCRResult) -> list[StructuredBlock]:
     blocks: list[StructuredBlock] = []
     for idx, raw_block in enumerate(result.typed_content["blocks"], 1):
         text = str(raw_block.get("raw_text", "")).strip()
-        if not text:
+        region_type = _page_region_type(raw_block)
+        if not text and region_type != "figure":
             continue
-        bbox = raw_block.get("bbox") if isinstance(raw_block.get("bbox"), dict) else {}
-        source_bbox = None
-        if isinstance(bbox, dict):
-            try:
-                source_bbox = (
-                    int(float(bbox.get("x0", 0))),
-                    int(float(bbox.get("y0", 0))),
-                    int(float(bbox.get("x1", 0))),
-                    int(float(bbox.get("y1", 0))),
-                )
-            except (TypeError, ValueError):
-                source_bbox = None
+        content = _formula_fallback_contract(text, inline=False) if region_type == "formula" else _ocr_contract(region_type, [text] if text else [], {"blocks": [raw_block]})
         blocks.append(
             StructuredBlock(
                 block_id=f"{document}-page-{page_num:04d}-ocr-{idx:04d}",
                 doc_id=document,
-                block_type="TextBlock",
-                content={"type": "TextBlock", "text": text, "heading_level": None, "language": None},
+                block_type=_layout_region_to_block_type(region_type),
+                content=content,
                 section_path=[],
                 reading_order=idx,
                 page=page_num,
-                source_coords=SourceCoords(page=page_num, bbox=source_bbox),
+                source_coords=SourceCoords(page=page_num, bbox=_raw_block_bbox(raw_block)),
                 provenance=ProvenanceRecord(
                     source_stage="structured_extract",
                     provider=result.provider,
                     confidence=result.confidence,
-                    metadata={"ocr_mode": result.extraction_metadata.get("mode")},
+                    metadata={
+                        "ocr_mode": result.extraction_metadata.get("mode"),
+                        "region_type": region_type,
+                        "page_structured": True,
+                    },
                 ),
             )
         )
@@ -723,8 +757,10 @@ def extract_structured_document(
                 blocks=blocks,
                 metadata={"source_kind": profile.source_kind.value, "mime_type": profile.mime_type, "source_path": str(profile.source_path)},
             )
+            page_path = structured_dir / "page_0001.json"
+            _write_page_layout_page(document, 1, blocks, {"page_mode": profile.source_kind.value, "layout_enabled": False}, page_path)
             _write_json(structured_dir / "document.json", asdict(cif))
-            set_status("structured", document, 1, "done", str(structured_dir / "document.json"))
+            set_status("structured", document, 1, "done", str(page_path))
             return 1, 0, cif
         finally:
             with gpu_scheduler.claim("ocr"):
@@ -803,6 +839,7 @@ def extract_structured_document(
                         page_blocks=page_blocks,
                         structured_dir=structured_dir,
                         page_mode=page_mode,
+                        page_layout=True,
                     )
                     done += 1
             finally:

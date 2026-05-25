@@ -166,6 +166,20 @@ def _source_metadata(profile: DocumentProfile) -> dict[str, object]:
     return metadata
 
 
+def _normalize_row_objects(headers: list[str], rows: list[list[str]]) -> list[dict[str, str]]:
+    return [
+        {header: row[col_idx] if col_idx < len(row) else "" for col_idx, header in enumerate(headers)}
+        for row in rows
+    ]
+
+
+def _tabular_schema(headers: list[str], rows: list[dict[str, str]]) -> dict[str, object]:
+    return {
+        "columns": headers,
+        "row_count": len(rows),
+    }
+
+
 def _text_block(doc_id: str, idx: int, text: str, *, source_stage: str, provider: str, page: int = 1, heading_level: int | None = None, metadata: dict[str, object] | None = None) -> StructuredBlock:
     return StructuredBlock(
         block_id=f"{doc_id}-{source_stage}-{idx:04d}",
@@ -180,12 +194,30 @@ def _text_block(doc_id: str, idx: int, text: str, *, source_stage: str, provider
     )
 
 
-def _table_block(doc_id: str, idx: int, headers: list[str], rows: list[list[str]], *, source_stage: str, provider: str, page: int = 1, metadata: dict[str, object] | None = None) -> StructuredBlock:
+def _table_block(
+    doc_id: str,
+    idx: int,
+    headers: list[str],
+    rows: list[list[str]],
+    *,
+    source_stage: str,
+    provider: str,
+    page: int = 1,
+    metadata: dict[str, object] | None = None,
+    sheet_name: str | None = None,
+    include_schema: bool = False,
+) -> StructuredBlock:
+    row_objects = _normalize_row_objects(headers, rows)
+    content: dict[str, object] = {"type": "TableBlock", "headers": headers, "rows": row_objects, "caption": None}
+    if include_schema:
+        content["schema"] = _tabular_schema(headers, row_objects)
+    if sheet_name is not None:
+        content["sheet_name"] = sheet_name
     return StructuredBlock(
         block_id=f"{doc_id}-{source_stage}-{idx:04d}",
         doc_id=doc_id,
         block_type="TableBlock",
-        content={"type": "TableBlock", "headers": headers, "rows": rows, "caption": None, "text": _tabular_text(headers, rows)},
+        content=content,
         section_path=[],
         reading_order=idx,
         page=page,
@@ -365,7 +397,7 @@ def ingest_tabular_to_cif(source_path: Path) -> CanonicalIntermediateFormat:
         rows = [[cell.strip() for cell in row] for row in reader]
     headers = rows[0] if rows else []
     body = rows[1:] if len(rows) > 1 else []
-    block = _table_block(profile.doc_id, 1, headers, body, source_stage="tabular_ingest", provider="stdlib-csv", metadata={"delimiter": delimiter})
+    block = _table_block(profile.doc_id, 1, headers, body, source_stage="tabular_ingest", provider="stdlib-csv", metadata={"delimiter": delimiter}, include_schema=True)
     return CanonicalIntermediateFormat(doc_id=profile.doc_id, blocks=[block], metadata=_source_metadata(profile))
 
 
@@ -421,7 +453,7 @@ def ingest_xlsx_to_cif(source_path: Path) -> CanonicalIntermediateFormat:
                     parsed_rows.append([values.get(col, "") for col in range(max_col + 1)])
             headers = parsed_rows[0] if parsed_rows else []
             body = parsed_rows[1:] if len(parsed_rows) > 1 else []
-            blocks.append(_table_block(profile.doc_id, idx, headers, body, source_stage="xlsx_ingest", provider="zip-xml-reader", metadata={"sheet_path": sheet_name}))
+            blocks.append(_table_block(profile.doc_id, idx, headers, body, source_stage="xlsx_ingest", provider="zip-xml-reader", metadata={"sheet_path": sheet_name}, sheet_name=Path(sheet_name).stem))
     return CanonicalIntermediateFormat(doc_id=profile.doc_id, blocks=blocks, metadata=_source_metadata(profile))
 
 

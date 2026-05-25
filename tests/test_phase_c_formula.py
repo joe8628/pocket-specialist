@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import io
 from contextlib import contextmanager
 import tempfile
@@ -341,7 +342,7 @@ class PhaseCFormulaTests(unittest.TestCase):
 
         self.assertEqual(len(blocks), 1)
         self.assertEqual(blocks[0].content["type"], "FormulaBlock")
-        self.assertEqual(blocks[0].content["provider"], "symbolic-fallback")
+        self.assertEqual(blocks[0].content["provider"], "ocr-fallback")
         self.assertEqual(blocks[0].content["latex"], "E = mc^2")
         self.assertEqual(blocks[0].provenance.metadata["fallback_reason"], "formula service unavailable")
 
@@ -382,6 +383,7 @@ class PhaseCFormulaTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
+            structured_dir = root / "structured-out"
             settings = PipelineSettings.from_env(project_root=root)
             with patch("pocket_specialist.phases.extract.classify_document", return_value=profile), \
                  patch("pocket_specialist.phases.extract.get_settings", return_value=settings), \
@@ -395,7 +397,7 @@ class PhaseCFormulaTests(unittest.TestCase):
                  patch("pocket_specialist.phases.extract.should_process", return_value=True):
                 _, _, cif = extract_structured_document(
                     Path("/tmp/doc.pdf"),
-                    structured_output_dir=root / "structured-out",
+                    structured_output_dir=structured_dir,
                     layout_output_dir=root / "layout-out",
                 )
 
@@ -440,14 +442,7 @@ class PhaseCFormulaTests(unittest.TestCase):
                 ollama=base.ollama,
                 runtime=base.runtime,
             )
-            with patch("pocket_specialist.phases.extract.classify_document", return_value=profile), \
-                 patch("pocket_specialist.phases.extract.get_settings", return_value=settings), \
-                 patch("pocket_specialist.phases.extract.render_pdf_page_to_bytes", return_value=buffer.getvalue()), \
-                 patch("pocket_specialist.phases.extract.get_pdf_native_blocks", return_value=native_blocks), \
-                 patch("pocket_specialist.phases.extract.build_layout_provider", side_effect=AssertionError("layout should be disabled")), \
-                 patch("pocket_specialist.phases.extract.init_db"), \
-                 patch("pocket_specialist.phases.extract.set_status"), \
-                 patch("pocket_specialist.phases.extract.should_process", return_value=True):
+            with patch("pocket_specialist.phases.extract.classify_document", return_value=profile),                  patch("pocket_specialist.phases.extract.get_settings", return_value=settings),                  patch("pocket_specialist.phases.extract.render_pdf_page_to_bytes", return_value=buffer.getvalue()),                  patch("pocket_specialist.phases.extract.get_pdf_native_blocks", return_value=native_blocks),                  patch("pocket_specialist.phases.extract.build_layout_provider", side_effect=AssertionError("layout should be disabled")),                  patch("pocket_specialist.phases.extract.init_db"),                  patch("pocket_specialist.phases.extract.set_status"),                  patch("pocket_specialist.phases.extract.should_process", return_value=True):
                 done, failed, cif = extract_structured_document(
                     Path("/tmp/doc.pdf"),
                     structured_output_dir=root / "structured-out",
@@ -488,6 +483,7 @@ class PhaseCFormulaTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
+            structured_dir = root / "structured-out"
             base = PipelineSettings.from_env(project_root=root)
             settings = base.__class__(
                 paths=base.paths,
@@ -504,27 +500,24 @@ class PhaseCFormulaTests(unittest.TestCase):
                 ollama=base.ollama,
                 runtime=base.runtime,
             )
-            with patch("pocket_specialist.phases.extract.classify_document", return_value=profile), \
-                 patch("pocket_specialist.phases.extract.get_settings", return_value=settings), \
-                 patch("pocket_specialist.phases.extract.render_pdf_page_to_bytes", return_value=buffer.getvalue()), \
-                 patch("pocket_specialist.phases.extract.get_pdf_native_blocks", return_value=[]), \
-                 patch("pocket_specialist.phases.extract.build_layout_provider", side_effect=AssertionError("layout should be disabled")), \
-                 patch("pocket_specialist.phases.extract.build_primary_ocr_provider", return_value=provider), \
-                 patch("pocket_specialist.phases.extract.build_fallback_ocr_provider", return_value=None), \
-                 patch("pocket_specialist.phases.extract.init_db"), \
-                 patch("pocket_specialist.phases.extract.set_status"), \
-                 patch("pocket_specialist.phases.extract.should_process", return_value=True):
+            with patch("pocket_specialist.phases.extract.classify_document", return_value=profile),                  patch("pocket_specialist.phases.extract.get_settings", return_value=settings),                  patch("pocket_specialist.phases.extract.render_pdf_page_to_bytes", return_value=buffer.getvalue()),                  patch("pocket_specialist.phases.extract.get_pdf_native_blocks", return_value=[]),                  patch("pocket_specialist.phases.extract.build_layout_provider", side_effect=AssertionError("layout should be disabled")),                  patch("pocket_specialist.phases.extract.build_primary_ocr_provider", return_value=provider),                  patch("pocket_specialist.phases.extract.build_fallback_ocr_provider", return_value=None),                  patch("pocket_specialist.phases.extract.init_db"),                  patch("pocket_specialist.phases.extract.set_status"),                  patch("pocket_specialist.phases.extract.should_process", return_value=True):
                 done, failed, cif = extract_structured_document(
                     Path("/tmp/doc.pdf"),
-                    structured_output_dir=root / "structured-out",
+                    structured_output_dir=structured_dir,
                     layout_output_dir=root / "layout-out",
                 )
+
+            page_payload = json.loads((structured_dir / "page_0001.json").read_text(encoding="utf-8"))
 
         self.assertEqual(done, 1)
         self.assertEqual(failed, 0)
         self.assertEqual(provider.last_region_type, "page")
         self.assertEqual(cif.blocks[0].content["text"], "scanned page text")
         self.assertEqual(cif.metadata["layout_enabled"], False)
+        self.assertEqual(page_payload["type"], "PageLayout")
+        self.assertEqual(page_payload["metadata"]["layout_enabled"], False)
+        self.assertEqual(page_payload["blocks"][0]["content"]["text"], "scanned page text")
+        self.assertEqual(page_payload["reading_order"], [page_payload["blocks"][0]["block_id"]])
 
     def test_extract_structured_document_claims_gpu_scheduler_for_active_phase_b_c_resources(self) -> None:
         image = Image.new("RGB", (64, 32), "white")

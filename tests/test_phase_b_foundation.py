@@ -155,6 +155,8 @@ chroma_path = "./data/chroma"
             csv_cif = ingest_tabular_to_cif(csv_path)
             self.assertEqual(csv_cif.blocks[0].block_type, "TableBlock")
             self.assertEqual(csv_cif.blocks[0].content["headers"], ["name", "value"])
+            self.assertEqual(csv_cif.blocks[0].content["rows"], [{"name": "a", "value": "1"}])
+            self.assertEqual(csv_cif.blocks[0].content["schema"], {"columns": ["name", "value"], "row_count": 1})
 
             docx_path = root / "sample.docx"
             with zipfile.ZipFile(docx_path, "w") as archive:
@@ -173,7 +175,8 @@ chroma_path = "./data/chroma"
                 )
             xlsx_cif = ingest_xlsx_to_cif(xlsx_path)
             self.assertEqual(xlsx_cif.blocks[0].content["headers"], ["h1", "h2"])
-            self.assertEqual(xlsx_cif.blocks[0].content["rows"], [["v1", "v2"]])
+            self.assertEqual(xlsx_cif.blocks[0].content["rows"], [{"h1": "v1", "h2": "v2"}])
+            self.assertEqual(xlsx_cif.blocks[0].content["sheet_name"], "sheet1")
 
             epub_path = root / "sample.epub"
             with zipfile.ZipFile(epub_path, "w") as archive:
@@ -227,14 +230,20 @@ chroma_path = "./data/chroma"
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             image_path = root / "scan.png"
+            structured_dir = root / "structured"
             Image.new("RGB", (12, 12), "white").save(image_path)
             with patch("pocket_specialist.phases.extract.build_primary_ocr_provider", return_value=FakeOCRProvider()),                  patch("pocket_specialist.phases.extract.build_fallback_ocr_provider", return_value=None),                  patch("pocket_specialist.phases.extract.init_db"),                  patch("pocket_specialist.phases.extract.set_status"):
-                done, failed, cif = extract_structured_document(image_path, structured_output_dir=root / "structured", layout_output_dir=root / "layout")
+                done, failed, cif = extract_structured_document(image_path, structured_output_dir=structured_dir, layout_output_dir=root / "layout")
+
+            page_payload = json.loads((structured_dir / "page_0001.json").read_text(encoding="utf-8"))
 
         self.assertEqual(done, 1)
         self.assertEqual(failed, 0)
         self.assertEqual(cif.blocks[0].content["text"], "image text")
         self.assertEqual(cif.metadata["source_kind"], "image")
+        self.assertEqual(page_payload["type"], "PageLayout")
+        self.assertEqual(page_payload["blocks"][0]["content"]["text"], "image text")
+        self.assertEqual(page_payload["reading_order"], [page_payload["blocks"][0]["block_id"]])
 
 
 if __name__ == "__main__":
