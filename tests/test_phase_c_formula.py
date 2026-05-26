@@ -13,7 +13,7 @@ from PIL import Image
 
 from pocket_specialist.core.config import PipelineSettings
 from pocket_specialist.formula.providers import FormulaResult, UniMERNetFormulaExtractor
-from pocket_specialist.layout.providers import LayoutRegion, LayoutResult
+from pocket_specialist.layout.providers import LayoutRegion, LayoutResult, build_layout_provider
 from pocket_specialist.handlers.intake import DocumentProfile, NativeTextBlock, PDFContentType, SourceKind
 from pocket_specialist.formula.symbolic import inline_formula_candidates, looks_symbolic
 from pocket_specialist.phases.extract import _matched_layout_region_ids, _native_page_blocks, _ocr_page_blocks, extract_structured_document
@@ -584,6 +584,44 @@ class PhaseCFormulaTests(unittest.TestCase):
             provider.detect(buffer.getvalue())
 
         assert recorder.claims == ["layout"]
+
+    def test_pp_doclayout_v3_provider_detects_regions_via_transformers_pipeline(self) -> None:
+        class FakePipeline:
+            def __call__(self, image):
+                del image
+                return [
+                    {"label": "Text", "score": 0.91, "box": {"xmin": 1, "ymin": 2, "xmax": 10, "ymax": 12}},
+                    {"label": "Table", "score": 0.83, "box": {"xmin": 20, "ymin": 3, "xmax": 40, "ymax": 18}},
+                ]
+
+        recorder = ClaimRecorder()
+        image = Image.new("RGB", (24, 24), "white")
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+
+        fake_transformers = SimpleNamespace(__version__="5.5.4")
+
+        with patch("pocket_specialist.layout.providers._load_transformers_module", return_value=fake_transformers), \
+             patch("pocket_specialist.layout.providers._build_pp_doclayout_v3_pipeline", return_value=FakePipeline()), \
+             patch("pocket_specialist.layout.providers.gpu_scheduler", recorder):
+            provider = build_layout_provider("pp-doclayout-v3")
+            provider.load()
+            result = provider.detect(buffer.getvalue())
+
+        assert recorder.claims == ["layout"]
+        assert result.page_id == "page"
+        assert [region.region_type for region in result.regions] == ["text", "table"]
+        assert result.regions[0].bbox == (1, 2, 10, 12)
+        assert result.regions[0].metadata["provider"] == "pp-doclayout-v3"
+        assert result.regions[0].metadata["model_id"] == "PaddlePaddle/PP-DocLayoutV3_safetensors"
+
+    def test_pp_doclayout_v3_provider_rejects_old_transformers_versions(self) -> None:
+        fake_transformers = SimpleNamespace(__version__="4.57.6")
+
+        with patch("pocket_specialist.layout.providers._load_transformers_module", return_value=fake_transformers):
+            provider = build_layout_provider("pp-doclayout-v3")
+            with self.assertRaisesRegex(RuntimeError, "requires transformers >= 5.5.4; found 4.57.6"):
+                provider.load()
 
     def test_ollama_formula_client_claims_gpu_scheduler(self) -> None:
         session = FakeSession()

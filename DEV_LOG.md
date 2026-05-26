@@ -30,6 +30,40 @@ Current implementation line:
 - `feat/checkpoints`: checkpoint observation work. The requested branch name `feat:checkpoints` was not used because `:` is invalid in Git ref names.
 - `DAG-OCR-phase-c-unimernet`: Phase C formula-system work created from `feat/checkpoints`.
 
+## fix/review1 - pp-doclayout-v3 provider correction and dependency pinning
+
+This branch started as a response to a review finding about fictional `pp-doclayout-v3` support. That review finding turned out to be wrong: the model exists in Hugging Face Transformers, but the repo had no working adapter for it and the local environment was on a Transformers version too old to recognize the architecture.
+
+Key decisions:
+
+- Kept the `pp-doclayout-v3` path strictly Transformers-only. No Paddle, PaddleOCR, or other parallel runtime was introduced for this provider path.
+- Added a dedicated `PPDocLayoutV3LayoutProvider` in `src/pocket_specialist/layout/providers.py` and kept `SuryaLayoutProvider` as the separate implementation for the Surya path.
+- Loaded the model through the documented Transformers object-detection pipeline against `PaddlePaddle/PP-DocLayoutV3_safetensors`.
+- Added an explicit minimum-version guard for Transformers so old environments fail with a clear compatibility error instead of a vague auto-config crash.
+- Introduced small internal helpers around Transformers loading/pipeline construction so the provider can be tested without mocking the entire third-party package import path.
+
+Dependency correction:
+
+- `requirements.txt` was converted from loose minimum ranges to exact pins for the versions this branch actually expects.
+- The important corrective change is `transformers==5.5.4`. The previous local environment had `transformers==4.57.6`, which is within the old loose range but does not recognize `pp_doclayout_v3` at runtime.
+- The rest of the runtime/test stack was pinned to the versions currently in use in the project virtualenv to make the environment reproducible.
+
+Validation performed:
+
+- Focused provider tests were added/updated in `tests/test_phase_c_formula.py` to cover:
+  - successful `pp-doclayout-v3` provider construction and region normalization through the Transformers pipeline path
+  - explicit rejection of stale Transformers versions such as `4.57.6`
+- Ran `.venv/bin/python -m pytest tests/test_phase_c_formula.py -q -k "pp_doclayout_v3_provider"` with `2 passed`.
+- Upgraded the local virtualenv to the pinned requirements with `.venv/bin/pip install -r requirements.txt`.
+- Verified the upgraded environment was on `transformers 5.5.4`.
+- Performed a real provider initialization using the branch code from `src/`, confirmed `PPDocLayoutV3LayoutProvider` loaded successfully, then offloaded cleanly.
+- Performed a real `detect()` call on a blank image and confirmed the provider executed end to end and returned a `LayoutResult`.
+
+Important nuance:
+
+- The failure mode here was not “the model does not exist.” The actual problem was the mismatch between the codebase expectation and an overly broad Transformers version range.
+- The provider implementation now matches the real model path, and the dependency pin ensures the runtime can actually execute it instead of silently selecting an unsupported Transformers release.
+
 ## dffa67f - Refactor pipeline toward Phase A foundation
 
 This commit started the transition from the old Markdown-first, stage-specific OCR pipeline toward the v0.5.0 beta document-intelligence concept. The goal was not to rewrite every feature, but to establish the foundation layer required by the new spec while preserving enough compatibility to keep the existing pipeline runnable.
