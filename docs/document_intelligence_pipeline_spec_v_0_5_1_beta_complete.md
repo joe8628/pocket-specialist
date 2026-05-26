@@ -41,6 +41,8 @@ The architecture is explicitly designed around:
 
 Markdown exists only as a rendering/export layer.
 
+This is an architectural contract, not a feature inventory. The design intentionally avoids common OCR and agentic ingestion failures: model-centric coupling, markdown-as-structure, unmanaged GPU residency, happy-path-only pipeline diagrams, and vague operational boundaries.
+
 ---
 
 # 2. Core Architectural Principles
@@ -56,6 +58,8 @@ Markdown exists only as a rendering/export layer.
 | Provider isolation | OCR, layout, formula extraction, and embedding providers are independently swappable |
 | Operational resilience | Pipeline must degrade gracefully under subsystem failures |
 | Provenance preservation | Every extracted artifact retains source coordinates and lineage |
+
+These principles keep model behavior behind stable contracts. Providers may change, prompts may change, and rendering formats may change, but CIF, provenance, lifecycle rules, and retrieval contracts remain the system's durable boundaries.
 
 ---
 
@@ -141,6 +145,8 @@ This enables:
 
 Layout detection is a first-class subsystem.
 
+This separation is deliberate. OCR, layout understanding, formula extraction, chunking, retrieval, and rendering are different responsibilities with different failure modes. Collapsing them into a single "extract text" phase would make retries, validation, and downstream agent use much harder to reason about.
+
 ## 5.1 Responsibilities
 
 The layout layer owns:
@@ -154,6 +160,8 @@ The layout layer owns:
 - page segmentation
 
 OCR providers do not perform authoritative layout reconstruction except in degraded fallback modes.
+
+This prevents rendering or model output from becoming the source of structural truth. Layout defines regions and reading order; OCR extracts content within those scoped regions.
 
 ## 5.2 LayoutProvider Interface
 
@@ -203,6 +211,8 @@ OCR providers are interchangeable implementations behind a shared protocol.
 
 The pipeline never constructs provider prompts directly.
 
+Prompt ownership lives inside each provider implementation. Calling code supplies typed units and region intent, never prompt strings, which prevents provider assumptions from leaking upward into orchestration, validation, chunking, or retrieval.
+
 ## 6.1 Default OCR Providers
 
 | Provider | Runtime | Primary Use Case |
@@ -211,6 +221,8 @@ The pipeline never constructs provider prompts directly.
 | DeepSeek-OCR | Ollama / GGUF | Higher-accuracy extraction, complex layouts, multilingual documents |
 
 Both providers implement the shared `OCRProvider` protocol and emit the same validated structured contracts.
+
+This is a real provider abstraction: different model runtimes may produce different raw responses, but the pipeline only accepts normalized, validated contracts.
 
 The default deployment strategy is:
 
@@ -274,6 +286,8 @@ Two extraction strategies are supported.
 
 `PAGE_STRUCTURED` is a degraded fallback mode and should not be the primary extraction path.
 
+The primary path remains region-guided because OCR is not one problem. Prose OCR, table extraction, code extraction, figure grounding, key-value extraction, and layout reconstruction require different routing and validation semantics.
+
 ---
 
 # 7. Output Validation & Repair Layer
@@ -281,6 +295,8 @@ Two extraction strategies are supported.
 All model outputs pass through validation before entering CIF.
 
 This layer is mandatory.
+
+The pipeline assumes model outputs can be malformed, incomplete, or structurally inconsistent. Validation and repair make failure semantics explicit instead of treating ideal model output as an architectural assumption.
 
 ## 7.1 Responsibilities
 
@@ -320,6 +336,8 @@ Model Output
 
 Formula extraction is isolated from general OCR.
 
+Mathematical OCR is treated as a specialized subsystem rather than a harder case of generic text extraction. This preserves symbolic fidelity and keeps formula dependencies out of the main OCR runtime.
+
 ## 8.1 Default Formula Backend
 
 The default formula extraction backend is UniMERNet.
@@ -331,6 +349,8 @@ The default formula extraction backend is UniMERNet.
 | unimernet_tiny | ~441 MB | Speed-sensitive deployments |
 
 The formula extraction service runs in an isolated environment with PyTorch and Transformers dependencies separated from the main ingestion runtime.
+
+This isolation protects the main ingestion stack from framework drift and heavyweight dependency coupling. UniMERNet can be upgraded, replaced, or disabled without forcing the OCR, layout, chunking, or retrieval layers to inherit its runtime constraints.
 
 ## 8.2 FormulaExtractor Interface
 
@@ -383,6 +403,8 @@ If formula extraction fails:
 
 This preserves semantic provenance.
 
+Fallbacks degrade fidelity without erasing lineage. Even when symbolic extraction fails, downstream systems can distinguish OCR-derived formula text from canonical formula output.
+
 ---
 
 # 9. VRAM Lifecycle Management
@@ -390,6 +412,8 @@ This preserves semantic provenance.
 GPU ownership is deterministic.
 
 No model may remain resident between stages.
+
+GPU residency is an explicit lifecycle concern, not an incidental runtime side effect. Load/offload ownership, cleanup guarantees, and stage isolation are centralized so memory pressure, fragmentation, and failure cleanup paths are observable and testable.
 
 ## 9.1 Core Rule
 
@@ -405,6 +429,8 @@ class GPUScheduler:
 ```
 
 Only one GPU-heavy task category may execute simultaneously.
+
+This favors bounded peak memory and predictable recovery over opportunistic concurrency. Concurrency can still exist around CPU-bound graph work, but GPU-heavy stages have a single ownership boundary.
 
 ## 9.3 Lifecycle Sequence
 
@@ -429,6 +455,8 @@ Embedding Batch
     ↓
 Offload Embedder
 ```
+
+Implementations should enforce offload in cleanup paths, including exceptions. A typical stage should pair acquisition with deterministic release, for example via `try`/`finally`, so failed batches do not leave models resident.
 
 ## 9.4 OOM Recovery
 
@@ -489,6 +517,8 @@ All extracted content converges into CIF.
 
 CIF is the authoritative internal representation.
 
+All document types converge to CIF before chunking. This makes chunking format-agnostic, retrieval uniform, rendering deterministic, and storage stable across source formats and provider changes.
+
 ## 11.1 Core Guarantees
 
 - deterministic structure
@@ -496,6 +526,8 @@ CIF is the authoritative internal representation.
 - provenance retention
 - rendering independence
 - storage portability
+
+CIF captures the abstraction level needed by downstream agents: typed semantic blocks, reading order, section hierarchy, source coordinates, and provenance. It is intentionally richer than raw chunks and less presentation-specific than markdown.
 
 ## 11.2 StructuredBlock
 
@@ -546,6 +578,8 @@ Figure artifacts are externally stored.
 
 Binary payloads are never embedded inside CIF.
 
+This keeps CIF suitable for persistence, indexing, validation, and migration. Heavy artifacts remain addressable through storage references rather than inflating the canonical representation.
+
 ---
 
 # 12. Phase 3 — Structured Output Contracts
@@ -571,6 +605,8 @@ Binary payloads are never embedded inside CIF.
 
 Chunk serialization is explicit and strategy-based.
 
+Chunking is a retrieval serialization layer, not the document's canonical structure. It consumes CIF and emits task-specific views for embedding, agent use, and display without rewriting the source representation.
+
 ## 13.1 Serializer Interface
 
 ```python
@@ -587,6 +623,8 @@ class ChunkSerializer(Protocol):
 | content | embedding-oriented serialization |
 | content_structured | structured machine payload |
 | metadata | provenance/filtering |
+
+This separation preserves machine-consumable structure alongside embedding-friendly text. Agents can retrieve semantic context without losing the typed payloads, neighboring structure, and provenance required for tool use.
 
 ## 13.3 Embedding Rules
 
@@ -640,6 +678,8 @@ Resume behavior:
 
 This enables a document to resume from the last completed page/node in a graph-shaped workflow while retaining an auditable processing history.
 
+Lifecycle state is part of the architecture. The checkpoint layer gives the DAG failure semantics: retries are scoped to nodes, completed work is reusable, and recovery can happen without replaying unrelated extraction, chunking, or indexing work.
+
 ## 14.4 Large-Scale Considerations
 
 For larger deployments:
@@ -653,6 +693,8 @@ For larger deployments:
 # 15. Observability & Telemetry
 
 Observability is mandatory.
+
+The pipeline is expected to run under imperfect providers, mixed document quality, and constrained hardware. Metrics, traces, and structured logs are therefore part of the contract, not optional debugging aids.
 
 ## 15.1 Metrics
 
@@ -774,6 +816,8 @@ def list_documents(...): ...
 
 Retrieval interfaces are designed for structured agent/tool consumption.
 
+The retrieval surface is optimized for machine consumers, not only human chat answers. It preserves document maps, provenance, section hierarchy, typed structures, and renderable views so agents can inspect, cite, and operate on source-grounded data.
+
 ---
 
 # 20. Reference Project Structure
@@ -829,6 +873,8 @@ Reference deployment target:
 
 Because GPU-heavy stages are serialized, peak VRAM is bounded to a single active model plus runtime overhead.
 
+The reference hardware assumptions reinforce the lifecycle design: the system should remain viable on constrained local GPUs by controlling residency rather than assuming every model can stay loaded.
+
 ---
 
 # 22. Implementation Roadmap
@@ -841,6 +887,8 @@ Because GPU-heavy stages are serialized, peak VRAM is bounded to a single active
 - validation layer
 - GPU scheduler
 - typed CIF primitives
+
+Foundation work establishes the durable contracts first: provider boundaries, validation, GPU ownership, and CIF. This prevents later phases from becoming coupled to temporary model behavior or presentation formats.
 
 ## Phase B — Layout & OCR
 
@@ -872,6 +920,8 @@ Because GPU-heavy stages are serialized, peak VRAM is bounded to a single active
 - benchmarking
 - concurrency controls
 - evaluation corpus
+
+Hardening focuses on the remaining high-level risks: operational rigor, concurrency semantics, validation guarantees, and scale behavior. These are the natural next problems once the core abstraction boundaries are in place.
 
 ## Phase F — Scaling
 
@@ -910,6 +960,8 @@ This version formalizes several previously implicit architectural assumptions:
 - chunk serialization is strategy-based
 - concrete OCR providers are explicitly defined
 - operational configuration is standardized
+
+The resulting architecture has operational gravity: it describes how the system should behave under resource limits, provider failures, dependency drift, partial retries, and future migration pressure. The remaining open issues are therefore mostly hardening and scaling concerns rather than missing architectural foundations.
 
 This specification should be treated as the baseline for implementation planning and prototype stabilization.
 
