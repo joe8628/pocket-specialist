@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 from dataclasses import asdict
 from pathlib import Path
 
@@ -11,7 +12,9 @@ from pocket_specialist.storage.checkpoint import init_db, set_status, should_pro
 
 from pocket_specialist.core.cif import CanonicalIntermediateFormat, ProcessingArtifact, ProvenanceRecord, SourceCoords, StructuredBlock
 from pocket_specialist.core.config import get_settings
+from pocket_specialist.core.dag import DAGExecutor, TaskRunResult
 from pocket_specialist.core.gpu import gpu_scheduler
+from pocket_specialist.core.tasks import ExtractionTask, PageUnit
 from pocket_specialist.handlers.intake import (
     PDFContentType,
     SourceKind,
@@ -685,6 +688,406 @@ def _ocr_result_to_page_blocks(document: str, page_num: int, result: OCRResult) 
     return blocks
 
 
+class _LockedOCRProvider:
+    def __init__(self, provider: OCRProvider | None, lock: threading.Lock) -> None:
+        self._provider = provider
+        self._lock = lock
+
+    def extract(self, image_bytes: bytes, region_type: str):
+        if self._provider is None:
+            raise RuntimeError("OCR provider is not available")
+        with self._lock:
+            return self._provider.extract(image_bytes, region_type)
+
+
+class _LockedFormulaExtractor:
+    def __init__(self, extractor: FormulaExtractor, lock: threading.Lock) -> None:
+        self._extractor = extractor
+        self._lock = lock
+
+    def extract(self, image_bytes: bytes) -> FormulaResult:
+        with self._lock:
+            return self._extractor.extract(image_bytes)
+
+
+
+def _page_task(document: str, page_num: int, task_name: str, *, page_mode: str, dependencies: list[str] | None = None, resource: str = "cpu") -> tuple[ExtractionTask, PageUnit]:
+    task_id = f"{document}:{task_name}:{page_num:04d}"
+    return (
+        ExtractionTask(
+            task_id=task_id,
+            task_type=task_name,
+            dependencies=list(dependencies or []),
+            input_refs=[f"page:{page_num:04d}"],
+            resource_requirements={"resource": resource},
+        ),
+        PageUnit(
+            unit_id=f"{document}:page:{page_num:04d}",
+            doc_id=document,
+            metadata={"page": page_num, "page_mode": page_mode},
+        ),
+    )
+
+
+
+def _run_layout_disabled_pdf_graph(
+    *,
+    source_path: Path,
+    profile,
+    document: str,
+    settings,
+    structured_dir: Path,
+    cif: CanonicalIntermediateFormat,
+) -> tuple[int, int]:
+    page_modes = profile.metadata.get("page_modes", [])
+    tasks: list[ExtractionTask] = []
+    units: dict[str, PageUnit] = {}
+    for page_num in range(1, profile.page_count + 1):
+        if not should_process("structured", document, page_num):
+            continue
+        page_mode = page_modes[page_num - 1] if page_num - 1 < len(page_modes) else profile.pdf_content_type.value
+        task, unit = _page_task(document, page_num, "structured", page_mode=page_mode)
+        tasks.append(task)
+        units[task.task_id] = unit
+
+    if not tasks:
+        return 0, 0
+
+    cif_lock = threading.Lock()
+    ocr_setup_lock = threading.Lock()
+    ocr_call_lock = threading.Lock()
+    primary_provider: OCRProvider | None = None
+    fallback_provider: OCRProvider | None = None
+    ocr_loaded = False
+
+    def ensure_ocr_providers() -> tuple[OCRProvider, OCRProvider | None]:
+        nonlocal primary_provider, fallback_provider, ocr_loaded
+        with ocr_setup_lock:
+            if primary_provider is None:
+                primary_provider = build_primary_ocr_provider()
+                fallback_provider = build_fallback_ocr_provider()
+            if not ocr_loaded:
+                with gpu_scheduler.claim("ocr"):
+                    primary_provider.load()
+                if fallback_provider is not None and getattr(fallback_provider, "name", None) != getattr(primary_provider, "name", None):
+                    with gpu_scheduler.claim("ocr"):
+                        fallback_provider.load()
+                ocr_loaded = True
+        primary = _LockedOCRProvider(primary_provider, ocr_call_lock)
+        fallback = None
+        if fallback_provider is not None:
+            fallback = _LockedOCRProvider(fallback_provider, ocr_call_lock)
+        return primary, fallback
+
+    def run_task(task: ExtractionTask, unit: PageUnit) -> TaskRunResult:
+        del task
+        page_num = int(unit.metadata["page"])
+        page_mode = str(unit.metadata["page_mode"])
+        zoom = settings.rendering.zoom if page_mode == PDFContentType.DIGITAL.value else settings.rendering.scanned_pdf_zoom
+        image_bytes = render_pdf_page_to_bytes(source_path, page_num, zoom=zoom)
+        native_blocks = get_pdf_native_blocks(source_path, page_num)
+        structured_path = structured_dir / f"page_{page_num:04d}.json"
+        if native_blocks:
+            page_blocks = _native_page_blocks(
+                document,
+                page_num,
+                native_blocks,
+                _empty_layout_result(page_num),
+                page_image_bytes=image_bytes,
+                artifact_root=settings.paths.artifact_path,
+                project_root=settings.paths.project_root,
+            )
+            with cif_lock:
+                _write_layout_disabled_page(
+                    cif=cif,
+                    document=document,
+                    page_num=page_num,
+                    page_blocks=page_blocks,
+                    structured_dir=structured_dir,
+                    page_mode=PDFContentType.DIGITAL.value,
+                )
+        else:
+            primary, fallback = ensure_ocr_providers()
+            result = _extract_with_fallback(primary, fallback, image_bytes, "page")
+            page_blocks = _ocr_result_to_page_blocks(document, page_num, result)
+            with cif_lock:
+                _write_layout_disabled_page(
+                    cif=cif,
+                    document=document,
+                    page_num=page_num,
+                    page_blocks=page_blocks,
+                    structured_dir=structured_dir,
+                    page_mode=page_mode,
+                    page_layout=True,
+                )
+        return TaskRunResult(path=str(structured_path), metadata={"page_mode": page_mode, "layout_enabled": False})
+
+    executor = DAGExecutor()
+    result = executor.run(document=document, tasks=tasks, units=units, runner=run_task)
+
+    if ocr_loaded and primary_provider is not None:
+        with gpu_scheduler.claim("ocr"):
+            primary_provider.offload()
+        if fallback_provider is not None and fallback_provider is not primary_provider:
+            with gpu_scheduler.claim("ocr"):
+                fallback_provider.offload()
+
+    return len(result.completed_task_ids), len(result.failed_task_ids) + len(result.blocked_task_ids)
+
+
+
+def _run_layout_enabled_pdf_graph(
+    *,
+    source_path: Path,
+    profile,
+    document: str,
+    settings,
+    structured_dir: Path,
+    layout_dir: Path,
+    cif: CanonicalIntermediateFormat,
+) -> tuple[int, int]:
+    page_modes = profile.metadata.get("page_modes", [])
+    tasks: list[ExtractionTask] = []
+    units: dict[str, PageUnit] = {}
+    for page_num in range(1, profile.page_count + 1):
+        if not should_process("structured", document, page_num):
+            continue
+        page_mode = page_modes[page_num - 1] if page_num - 1 < len(page_modes) else profile.pdf_content_type.value
+        layout_task, layout_unit = _page_task(document, page_num, "layout", page_mode=page_mode, resource="layout")
+        structured_task, structured_unit = _page_task(document, page_num, "structured", page_mode=page_mode, dependencies=[layout_task.task_id])
+        tasks.extend([layout_task, structured_task])
+        units[layout_task.task_id] = layout_unit
+        units[structured_task.task_id] = structured_unit
+
+    if not tasks:
+        return 0, 0
+
+    state_lock = threading.Lock()
+    cif_lock = threading.Lock()
+    page_state: dict[int, dict[str, object]] = {}
+
+    layout_setup_lock = threading.Lock()
+    layout_call_lock = threading.Lock()
+    layout_provider = None
+    layout_loaded = False
+
+    ocr_setup_lock = threading.Lock()
+    ocr_call_lock = threading.Lock()
+    primary_provider: OCRProvider | None = None
+    fallback_provider: OCRProvider | None = None
+    ocr_loaded = False
+
+    formula_setup_lock = threading.Lock()
+    formula_call_lock = threading.Lock()
+    formula_extractor: FormulaExtractor | None = None
+    formula_loaded = False
+    formula_disabled = False
+
+    def ensure_layout_provider():
+        nonlocal layout_provider, layout_loaded
+        with layout_setup_lock:
+            if layout_provider is None:
+                layout_provider = build_layout_provider()
+            if not layout_loaded:
+                with gpu_scheduler.claim("layout"):
+                    layout_provider.load()
+                layout_loaded = True
+        return layout_provider
+
+    def ensure_ocr_providers() -> tuple[OCRProvider, OCRProvider | None]:
+        nonlocal primary_provider, fallback_provider, ocr_loaded
+        with ocr_setup_lock:
+            if primary_provider is None:
+                primary_provider = build_primary_ocr_provider()
+                fallback_provider = build_fallback_ocr_provider()
+            if not ocr_loaded:
+                with gpu_scheduler.claim("ocr"):
+                    primary_provider.load()
+                if fallback_provider is not None and getattr(fallback_provider, "name", None) != getattr(primary_provider, "name", None):
+                    with gpu_scheduler.claim("ocr"):
+                        fallback_provider.load()
+                ocr_loaded = True
+        primary = _LockedOCRProvider(primary_provider, ocr_call_lock)
+        fallback = None
+        if fallback_provider is not None:
+            fallback = _LockedOCRProvider(fallback_provider, ocr_call_lock)
+        return primary, fallback
+
+    def ensure_formula_extractor() -> FormulaExtractor | None:
+        nonlocal formula_extractor, formula_loaded, formula_disabled
+        if not settings.formula.enabled or formula_disabled:
+            return None
+        with formula_setup_lock:
+            if formula_disabled:
+                return None
+            if formula_extractor is None:
+                formula_extractor = build_formula_extractor()
+            if not formula_loaded and formula_extractor is not None:
+                try:
+                    formula_extractor.load()
+                except Exception:
+                    if not settings.formula.fallback_to_ocr:
+                        raise
+                    formula_disabled = True
+                    formula_extractor = None
+                    return None
+                formula_loaded = True
+        if formula_extractor is None:
+            return None
+        return _LockedFormulaExtractor(formula_extractor, formula_call_lock)
+
+    def run_task(task: ExtractionTask, unit: PageUnit) -> TaskRunResult:
+        page_num = int(unit.metadata["page"])
+        page_mode = str(unit.metadata["page_mode"])
+        if task.task_type == "layout":
+            zoom = settings.rendering.zoom if page_mode == PDFContentType.DIGITAL.value else settings.rendering.scanned_pdf_zoom
+            image_bytes = render_pdf_page_to_bytes(source_path, page_num, zoom=zoom)
+            provider = ensure_layout_provider()
+            with layout_call_lock:
+                layout_result = provider.detect(image_bytes)
+            layout_result.page_id = f"page-{page_num:04d}"
+            layout_path = layout_dir / f"page_{page_num:04d}.json"
+            _write_layout_page(layout_result, layout_path)
+            set_status("layout", document, page_num, "done", str(layout_path))
+            native_blocks = get_pdf_native_blocks(source_path, page_num)
+            with state_lock:
+                page_state[page_num] = {
+                    "image_bytes": image_bytes,
+                    "layout": layout_result,
+                    "native_blocks": native_blocks,
+                    "page_mode": page_mode,
+                }
+            return TaskRunResult(path=str(layout_path), metadata={"page_mode": page_mode})
+
+        with state_lock:
+            state = dict(page_state[page_num])
+        image_bytes = state["image_bytes"]
+        layout_result = state["layout"]
+        native_blocks = state["native_blocks"]
+        page_blocks: list[StructuredBlock]
+        if native_blocks:
+            page_blocks = _native_page_blocks(
+                document,
+                page_num,
+                native_blocks,
+                layout_result,
+                page_image_bytes=image_bytes,
+                artifact_root=settings.paths.artifact_path,
+                project_root=settings.paths.project_root,
+            )
+            matched_region_ids = _matched_layout_region_ids(native_blocks, layout_result)
+            regions = [region for region in layout_result.regions if region.region_id not in matched_region_ids]
+        else:
+            page_blocks = []
+            regions = list(layout_result.regions)
+
+        if regions:
+            primary, fallback = ensure_ocr_providers()
+            formula = ensure_formula_extractor() if any(region.region_type == "formula" for region in regions) else None
+            ocr_blocks = _ocr_page_blocks(
+                document,
+                page_num,
+                image_bytes,
+                layout_result,
+                primary,
+                fallback,
+                formula,
+                regions=regions,
+                artifact_root=settings.paths.artifact_path,
+                project_root=settings.paths.project_root,
+            )
+            page_blocks = sorted(page_blocks + ocr_blocks, key=lambda block: (block.reading_order, block.block_id))
+
+        structured_path = structured_dir / f"page_{page_num:04d}.json"
+        output_page_mode = PDFContentType.DIGITAL.value if native_blocks else PDFContentType.SCANNED.value
+        with cif_lock:
+            _write_structured_page(document, page_num, page_blocks, {"page_mode": output_page_mode}, structured_path)
+            for block in page_blocks:
+                cif.add_block(block)
+            for artifact in _artifacts_from_blocks(page_blocks):
+                cif.add_artifact(artifact)
+            set_status("structured", document, page_num, "done", str(structured_path))
+        return TaskRunResult(path=str(structured_path), metadata={"page_mode": output_page_mode})
+
+    executor = DAGExecutor()
+    result = executor.run(document=document, tasks=tasks, units=units, runner=run_task)
+
+    if layout_loaded and layout_provider is not None:
+        with gpu_scheduler.claim("layout"):
+            layout_provider.offload()
+    if ocr_loaded and primary_provider is not None:
+        with gpu_scheduler.claim("ocr"):
+            primary_provider.offload()
+        if fallback_provider is not None and fallback_provider is not primary_provider:
+            with gpu_scheduler.claim("ocr"):
+                fallback_provider.offload()
+    if formula_loaded and formula_extractor is not None:
+        formula_extractor.offload()
+
+    return len(result.completed_task_ids), len(result.failed_task_ids) + len(result.blocked_task_ids)
+
+
+
+def _run_layout_detection_graph(*, source_path: Path, profile, document: str, settings, layout_dir: Path) -> tuple[int, int, dict[int, LayoutResult]]:
+    page_modes = profile.metadata.get("page_modes", [])
+    tasks: list[ExtractionTask] = []
+    units: dict[str, PageUnit] = {}
+    for page_num in range(1, profile.page_count + 1):
+        if not should_process("layout", document, page_num):
+            continue
+        page_mode = page_modes[page_num - 1] if page_num - 1 < len(page_modes) else profile.pdf_content_type.value
+        task, unit = _page_task(document, page_num, "layout", page_mode=page_mode, resource="layout")
+        tasks.append(task)
+        units[task.task_id] = unit
+
+    if not tasks:
+        return 0, 0, {}
+
+    results: dict[int, LayoutResult] = {}
+    results_lock = threading.Lock()
+    provider_lock = threading.Lock()
+    setup_lock = threading.Lock()
+    provider = None
+    provider_loaded = False
+
+    def ensure_provider():
+        nonlocal provider, provider_loaded
+        with setup_lock:
+            if provider is None:
+                provider = build_layout_provider()
+            if not provider_loaded:
+                with gpu_scheduler.claim("layout"):
+                    provider.load()
+                provider_loaded = True
+        return provider
+
+    def run_task(task: ExtractionTask, unit: PageUnit) -> TaskRunResult:
+        del task
+        page_num = int(unit.metadata["page"])
+        page_mode = str(unit.metadata["page_mode"])
+        zoom = settings.rendering.zoom if page_mode == PDFContentType.DIGITAL.value else settings.rendering.scanned_pdf_zoom
+        image_bytes = render_pdf_page_to_bytes(source_path, page_num, zoom=zoom)
+        layout_provider = ensure_provider()
+        with provider_lock:
+            layout_result = layout_provider.detect(image_bytes)
+        layout_result.page_id = f"page-{page_num:04d}"
+        out_path = layout_dir / f"page_{page_num:04d}.json"
+        _write_layout_page(layout_result, out_path)
+        set_status("layout", document, page_num, "done", str(out_path))
+        with results_lock:
+            results[page_num] = layout_result
+        return TaskRunResult(path=str(out_path), metadata={"page_mode": page_mode})
+
+    executor = DAGExecutor()
+    result = executor.run(document=document, tasks=tasks, units=units, runner=run_task)
+
+    if provider_loaded and provider is not None:
+        with gpu_scheduler.claim("layout"):
+            provider.offload()
+
+    return len(result.completed_task_ids), len(result.failed_task_ids) + len(result.blocked_task_ids), results
+
+
 def extract_structured_document(
     source_path: Path,
     structured_output_dir: Path | None = None,
@@ -769,11 +1172,6 @@ def extract_structured_document(
                 with gpu_scheduler.claim("ocr"):
                     fallback_provider.offload()
 
-    page_layouts: dict[int, LayoutResult] = {}
-    page_images: dict[int, bytes] = {}
-    native_pages: set[int] = set()
-    page_base_blocks: dict[int, list[StructuredBlock]] = {}
-    supplemental_regions_by_page: dict[int, list[LayoutRegion]] = {}
     cif = CanonicalIntermediateFormat(
         doc_id=document,
         metadata={
@@ -784,178 +1182,27 @@ def extract_structured_document(
         },
     )
 
-    done = failed = 0
-    page_modes = profile.metadata.get("page_modes", [])
-
     if not settings.layout.enabled:
-        pages_needing_ocr: list[tuple[int, str]] = []
-        for page_num in range(1, profile.page_count + 1):
-            if not should_process("structured", document, page_num):
-                continue
-            page_mode = page_modes[page_num - 1] if page_num - 1 < len(page_modes) else profile.pdf_content_type.value
-            zoom = settings.rendering.zoom if page_mode == PDFContentType.DIGITAL.value else settings.rendering.scanned_pdf_zoom
-            image_bytes = render_pdf_page_to_bytes(source_path, page_num, zoom=zoom)
-            page_images[page_num] = image_bytes
-            native_blocks = get_pdf_native_blocks(source_path, page_num)
-            if native_blocks:
-                native_pages.add(page_num)
-                page_blocks = _native_page_blocks(
-                    document,
-                    page_num,
-                    native_blocks,
-                    _empty_layout_result(page_num),
-                    page_image_bytes=image_bytes,
-                    artifact_root=settings.paths.artifact_path,
-                    project_root=settings.paths.project_root,
-                )
-                _write_layout_disabled_page(
-                    cif=cif,
-                    document=document,
-                    page_num=page_num,
-                    page_blocks=page_blocks,
-                    structured_dir=structured_dir,
-                    page_mode=PDFContentType.DIGITAL.value,
-                )
-                done += 1
-            else:
-                pages_needing_ocr.append((page_num, page_mode))
-
-        if pages_needing_ocr:
-            primary_provider = build_primary_ocr_provider()
-            fallback_provider = build_fallback_ocr_provider()
-            with gpu_scheduler.claim("ocr"):
-                primary_provider.load()
-            if fallback_provider is not None and getattr(fallback_provider, "name", None) != getattr(primary_provider, "name", None):
-                with gpu_scheduler.claim("ocr"):
-                    fallback_provider.load()
-            try:
-                for page_num, page_mode in pages_needing_ocr:
-                    result = _extract_with_fallback(primary_provider, fallback_provider, page_images[page_num], "page")
-                    page_blocks = _ocr_result_to_page_blocks(document, page_num, result)
-                    _write_layout_disabled_page(
-                        cif=cif,
-                        document=document,
-                        page_num=page_num,
-                        page_blocks=page_blocks,
-                        structured_dir=structured_dir,
-                        page_mode=page_mode,
-                        page_layout=True,
-                    )
-                    done += 1
-            finally:
-                with gpu_scheduler.claim("ocr"):
-                    primary_provider.offload()
-                if fallback_provider is not None and fallback_provider is not primary_provider:
-                    with gpu_scheduler.claim("ocr"):
-                        fallback_provider.offload()
-
+        done, failed = _run_layout_disabled_pdf_graph(
+            source_path=source_path,
+            profile=profile,
+            document=document,
+            settings=settings,
+            structured_dir=structured_dir,
+            cif=cif,
+        )
         _write_json(structured_dir / "document.json", asdict(cif))
         return done, failed, cif
 
-    layout_provider = build_layout_provider()
-    with gpu_scheduler.claim("layout"):
-        layout_provider.load()
-    try:
-        for page_num in range(1, profile.page_count + 1):
-            if not should_process("structured", document, page_num):
-                continue
-            page_mode = page_modes[page_num - 1] if page_num - 1 < len(page_modes) else profile.pdf_content_type.value
-            zoom = settings.rendering.zoom if page_mode == PDFContentType.DIGITAL.value else settings.rendering.scanned_pdf_zoom
-            image_bytes = render_pdf_page_to_bytes(source_path, page_num, zoom=zoom)
-            page_images[page_num] = image_bytes
-            layout_result = layout_provider.detect(image_bytes)
-            layout_result.page_id = f"page-{page_num:04d}"
-            page_layouts[page_num] = layout_result
-            layout_path = layout_dir / f"page_{page_num:04d}.json"
-            _write_layout_page(layout_result, layout_path)
-            set_status("layout", document, page_num, "done", str(layout_path))
-            native_blocks = get_pdf_native_blocks(source_path, page_num)
-            if native_blocks:
-                native_pages.add(page_num)
-                page_blocks = _native_page_blocks(
-                    document,
-                    page_num,
-                    native_blocks,
-                    layout_result,
-                    page_image_bytes=page_images[page_num],
-                    artifact_root=settings.paths.artifact_path,
-                    project_root=settings.paths.project_root,
-                )
-                page_base_blocks[page_num] = page_blocks
-                matched_region_ids = _matched_layout_region_ids(native_blocks, layout_result)
-                uncovered_regions = [region for region in layout_result.regions if region.region_id not in matched_region_ids]
-                if uncovered_regions:
-                    supplemental_regions_by_page[page_num] = uncovered_regions
-                else:
-                    structured_path = structured_dir / f"page_{page_num:04d}.json"
-                    _write_structured_page(document, page_num, page_blocks, {"page_mode": PDFContentType.DIGITAL.value}, structured_path)
-                    for block in page_blocks:
-                        cif.add_block(block)
-                    for artifact in _artifacts_from_blocks(page_blocks):
-                        cif.add_artifact(artifact)
-                    set_status("structured", document, page_num, "done", str(structured_path))
-                    done += 1
-    finally:
-        with gpu_scheduler.claim("layout"):
-            layout_provider.offload()
-
-    scanned_pages = [page_num for page_num in range(1, profile.page_count + 1) if page_num not in native_pages and should_process("structured", document, page_num)]
-    ocr_pages = sorted(set(scanned_pages) | set(supplemental_regions_by_page))
-    if ocr_pages:
-        primary_provider = build_primary_ocr_provider()
-        fallback_provider = build_fallback_ocr_provider()
-        formula_needed = settings.formula.enabled and any(
-            region.region_type == "formula"
-            for page_num in ocr_pages
-            for region in (supplemental_regions_by_page.get(page_num) or page_layouts[page_num].regions)
-        )
-        formula_extractor = build_formula_extractor() if formula_needed else None
-        with gpu_scheduler.claim("ocr"):
-            primary_provider.load()
-        if fallback_provider is not None and getattr(fallback_provider, "name", None) != getattr(primary_provider, "name", None):
-            with gpu_scheduler.claim("ocr"):
-                fallback_provider.load()
-        if formula_extractor is not None:
-            try:
-                formula_extractor.load()
-            except Exception:
-                if not settings.formula.fallback_to_ocr:
-                    raise
-                formula_extractor = None
-        try:
-            for page_num in ocr_pages:
-                layout_result = page_layouts[page_num]
-                ocr_blocks = _ocr_page_blocks(
-                    document,
-                    page_num,
-                    page_images[page_num],
-                    layout_result,
-                    primary_provider,
-                    fallback_provider,
-                    formula_extractor,
-                    regions=supplemental_regions_by_page.get(page_num),
-                    artifact_root=settings.paths.artifact_path,
-                    project_root=settings.paths.project_root,
-                )
-                page_blocks = sorted(page_base_blocks.get(page_num, []) + ocr_blocks, key=lambda block: (block.reading_order, block.block_id))
-                structured_path = structured_dir / f"page_{page_num:04d}.json"
-                page_mode = PDFContentType.DIGITAL.value if page_num in native_pages else PDFContentType.SCANNED.value
-                _write_structured_page(document, page_num, page_blocks, {"page_mode": page_mode}, structured_path)
-                for block in page_blocks:
-                    cif.add_block(block)
-                for artifact in _artifacts_from_blocks(page_blocks):
-                    cif.add_artifact(artifact)
-                set_status("structured", document, page_num, "done", str(structured_path))
-                done += 1
-        finally:
-            with gpu_scheduler.claim("ocr"):
-                primary_provider.offload()
-            if fallback_provider is not None and fallback_provider is not primary_provider:
-                with gpu_scheduler.claim("ocr"):
-                    fallback_provider.offload()
-            if formula_extractor is not None:
-                formula_extractor.offload()
-
+    done, failed = _run_layout_enabled_pdf_graph(
+        source_path=source_path,
+        profile=profile,
+        document=document,
+        settings=settings,
+        structured_dir=structured_dir,
+        layout_dir=layout_dir,
+        cif=cif,
+    )
     _write_json(structured_dir / "document.json", asdict(cif))
     return done, failed, cif
 
@@ -974,28 +1221,13 @@ def detect_layout_document(
     layout_dir.mkdir(parents=True, exist_ok=True)
     init_db()
 
-    provider = build_layout_provider()
-    with gpu_scheduler.claim("layout"):
-        provider.load()
-    done = failed = 0
-    results: dict[int, LayoutResult] = {}
-    try:
-        page_modes = profile.metadata.get("page_modes", [])
-        for page_num in range(1, profile.page_count + 1):
-            page_mode = page_modes[page_num - 1] if page_num - 1 < len(page_modes) else profile.pdf_content_type.value
-            zoom = settings.rendering.zoom if page_mode == PDFContentType.DIGITAL.value else settings.rendering.scanned_pdf_zoom
-            image_bytes = render_pdf_page_to_bytes(source_path, page_num, zoom=zoom)
-            result = provider.detect(image_bytes)
-            result.page_id = f"page-{page_num:04d}"
-            results[page_num] = result
-            out_path = layout_dir / f"page_{page_num:04d}.json"
-            _write_layout_page(result, out_path)
-            set_status("layout", document, page_num, "done", str(out_path))
-            done += 1
-    finally:
-        with gpu_scheduler.claim("layout"):
-            provider.offload()
-
+    done, failed, results = _run_layout_detection_graph(
+        source_path=source_path,
+        profile=profile,
+        document=document,
+        settings=settings,
+        layout_dir=layout_dir,
+    )
     return done, failed, results
 
 
