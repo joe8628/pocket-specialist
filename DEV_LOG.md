@@ -90,6 +90,23 @@ Follow-up implications:
 - The active structured corpus flow is intentionally distinct from legacy `run-all`, which still drives the compatibility render/OCR/equations/correction/assemble pipeline.
 - Production-scale batch orchestration, queueing, and Phase E hardening remain out of scope for this change.
 
+
+## fix/review1 - repo-root corpus path correction
+
+This update fixed a path-resolution bug introduced by the structured corpus command work. When running the CLI with `PYTHONPATH=src`, `PipelineSettings.from_env()` derived the default project root from `Path(__file__).parents[2]`, which resolves to the package `src/` directory rather than the repository root. As a result, the default corpus path incorrectly became `src/RAG-corpus`.
+
+Key decisions:
+
+- Replaced the fragile parent-index root calculation with `_default_project_root()`, which walks upward from `core/config.py` until it finds the repository markers `pyproject.toml` and `src/pocket_specialist`.
+- Preserved explicit `project_root=` injection for tests and callers that intentionally override the root.
+- Added a regression test proving the default root is the repo root and that the default corpus directory resolves to `<repo>/RAG-corpus`.
+
+Validation performed:
+
+- `PYTHONPATH=src .venv/bin/python - <<'PY' ... PipelineSettings.from_env() ... PY` confirmed project root resolves to `/home/jjmr/github-repos/pocket-specialist` and corpus dir resolves to `/home/jjmr/github-repos/pocket-specialist/RAG-corpus`.
+- `PYTHONPATH=src .venv/bin/python -m pocket_specialist.cli extract-structured-corpus --enabled --dry-run --limit 1` confirmed the corpus scanner finds the repo-root PDF instead of looking under `src/`.
+- `PYTHONPATH=src .venv/bin/python -m pytest tests/test_phase_a_foundation.py::test_pipeline_settings_from_env_uses_project_root tests/test_phase_a_foundation.py::test_pipeline_settings_default_root_is_repo_root -q` passed with `2 passed`.
+
 ## dffa67f - Refactor pipeline toward Phase A foundation
 
 This commit started the transition from the old Markdown-first, stage-specific OCR pipeline toward the v0.5.0 beta document-intelligence concept. The goal was not to rewrite every feature, but to establish the foundation layer required by the new spec while preserving enough compatibility to keep the existing pipeline runnable.

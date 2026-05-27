@@ -26,6 +26,16 @@ def test_pipeline_settings_from_env_uses_project_root(tmp_path, monkeypatch):
     assert settings.paths.document_slug(Path("/tmp/My File.pdf")) == "my-file"
 
 
+def test_pipeline_settings_default_root_is_repo_root(monkeypatch):
+    monkeypatch.delenv("PIPELINE_CHECKPOINT_DIR", raising=False)
+    monkeypatch.delenv("PIPELINE_OUTPUT_DIR", raising=False)
+    monkeypatch.delenv("PIPELINE_CORPUS_DIR", raising=False)
+    settings = PipelineSettings.from_env()
+
+    assert settings.paths.project_root.name == "pocket-specialist"
+    assert settings.paths.corpus_dir == (settings.paths.project_root / "RAG-corpus").resolve()
+
+
 def test_output_validator_repairs_fenced_json():
     validator = OutputValidator()
     result = validator.parse_json("```json\n{\"blocks\": []}\n```")

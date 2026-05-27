@@ -40,6 +40,14 @@ def _nested_get(mapping: dict[str, Any], *keys: str, default: Any = None) -> Any
     return current
 
 
+def _default_project_root() -> Path:
+    start = Path(__file__).resolve()
+    for candidate in start.parents:
+        if (candidate / "pyproject.toml").exists() and (candidate / "src" / "pocket_specialist").is_dir():
+            return candidate
+    return start.parents[3]
+
+
 @dataclass(frozen=True)
 class PipelinePaths:
     project_root: Path
@@ -183,7 +191,7 @@ class PipelineSettings:
 
     @classmethod
     def from_env(cls, project_root: Path | None = None) -> "PipelineSettings":
-        root = (project_root or Path(__file__).resolve().parents[2]).resolve()
+        root = (project_root or _default_project_root()).resolve()
         config_path_env = os.getenv("PIPELINE_CONFIG")
         config_path = _resolve_path(root, config_path_env) if config_path_env else root / "pipeline.toml"
         config_data: dict[str, Any] = {}
