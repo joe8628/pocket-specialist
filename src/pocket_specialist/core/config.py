@@ -133,6 +133,11 @@ class ChunkingSettings:
 
 
 @dataclass(frozen=True)
+class BatchSettings:
+    structured_corpus_enabled: bool = False
+
+
+@dataclass(frozen=True)
 class StorageSettings:
     sqlite_path: Path
     artifact_path: Path
@@ -170,6 +175,7 @@ class PipelineSettings:
     embedding: EmbeddingSettings = field(default_factory=EmbeddingSettings)
     gpu: GPUSettings = field(default_factory=GPUSettings)
     chunking: ChunkingSettings = field(default_factory=ChunkingSettings)
+    batch: BatchSettings = field(default_factory=BatchSettings)
     storage: StorageSettings = field(default_factory=lambda: StorageSettings(Path("pipeline.db"), Path("artifacts"), Path("chroma")))
     equations: EquationSettings = field(default_factory=EquationSettings)
     ollama: OllamaSettings = field(default_factory=OllamaSettings)
@@ -241,6 +247,13 @@ class PipelineSettings:
             chunking=ChunkingSettings(
                 max_tokens=int(os.getenv("PIPELINE_CHUNK_MAX_TOKENS", str(_nested_get(config_data, "chunking", "max_tokens", default=512)))),
                 overlap_tokens=int(os.getenv("PIPELINE_CHUNK_OVERLAP_TOKENS", str(_nested_get(config_data, "chunking", "overlap_tokens", default=64)))),
+            ),
+            batch=BatchSettings(
+                structured_corpus_enabled=os.getenv(
+                    "PIPELINE_STRUCTURED_CORPUS_ENABLED",
+                    str(_nested_get(config_data, "batch", "structured_corpus_enabled", default=False)),
+                ).lower()
+                not in {"0", "false", "no"},
             ),
             storage=StorageSettings(sqlite_path=sqlite_path, artifact_path=artifact_path, chroma_path=chroma_path),
             equations=EquationSettings(

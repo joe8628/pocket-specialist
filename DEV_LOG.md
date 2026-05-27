@@ -64,6 +64,32 @@ Important nuance:
 - The failure mode here was not “the model does not exist.” The actual problem was the mismatch between the codebase expectation and an overly broad Transformers version range.
 - The provider implementation now matches the real model path, and the dependency pin ensures the runtime can actually execute it instead of silently selecting an unsupported Transformers release.
 
+
+## fix/review1 - structured corpus CLI and README refresh
+
+This update added a gated batch entry point for running the active structured extraction pipeline over corpus files without requiring a PDF path per command invocation.
+
+Key decisions:
+
+- Added `pocket-specialist extract-structured-corpus` as a separate command instead of changing `extract-structured`. The single-document command still requires an explicit source path, while the new command scans `RAG-corpus` or a caller-provided `--corpus-dir`.
+- Kept the corpus subroutine gated. It requires `--enabled`, `PIPELINE_STRUCTURED_CORPUS_ENABLED=1`, or `[batch].structured_corpus_enabled = true` so accidental batch model runs do not start just because files exist in `RAG-corpus`.
+- Reused `extract_structured_document()` directly rather than duplicating extraction logic. Corpus runs therefore write the same document-scoped `layout/` and `structured/` outputs as single-document structured extraction.
+- Added `[batch].structured_corpus_enabled = false` to `pipeline.toml` and a matching typed `BatchSettings` config section.
+- Refreshed `README.md` to remove stale Phase A/B-only language, remove claims that formula support is unimplemented, document current Phase A-C scope, and clarify the difference between active structured extraction and legacy compatibility commands.
+
+Validation performed:
+
+- `PYTHONPATH=src .venv/bin/python -m pocket_specialist.cli --help` confirmed the new command is exposed.
+- `PYTHONPATH=src .venv/bin/python -m pocket_specialist.cli extract-structured-corpus --help` confirmed the command options and gated behavior are visible.
+- `PYTHONPATH=src .venv/bin/python -m pocket_specialist.cli extract-structured-corpus` confirmed disabled mode exits cleanly with an enablement message.
+- `.venv/bin/python -m py_compile src/pocket_specialist/cli.py src/pocket_specialist/core/config.py` passed.
+- `PYTHONPATH=src .venv/bin/python -m pytest tests/test_phase_a_foundation.py::test_pipeline_settings_from_env_uses_project_root -q` passed.
+
+Follow-up implications:
+
+- The active structured corpus flow is intentionally distinct from legacy `run-all`, which still drives the compatibility render/OCR/equations/correction/assemble pipeline.
+- Production-scale batch orchestration, queueing, and Phase E hardening remain out of scope for this change.
+
 ## dffa67f - Refactor pipeline toward Phase A foundation
 
 This commit started the transition from the old Markdown-first, stage-specific OCR pipeline toward the v0.5.0 beta document-intelligence concept. The goal was not to rewrite every feature, but to establish the foundation layer required by the new spec while preserving enough compatibility to keep the existing pipeline runnable.

@@ -30,6 +30,9 @@ max_gpu_workers = 1
 max_tokens = 512
 overlap_tokens = 64
 
+[batch]
+structured_corpus_enabled = false
+
 [storage]
 sqlite_path = "./data/pipeline.db"
 artifact_path = "./data/artifacts"

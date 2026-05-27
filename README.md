@@ -2,74 +2,57 @@
 
 Local-first document intelligence pipeline for heterogeneous document ingestion, typed extraction, and retrieval-oriented downstream processing.
 
-This branch is being refactored against [docs/document_intelligence_pipeline_spec_v_0_5_1_beta_complete.md](/home/jjmr/github-repos/pocket-specialist/docs/document_intelligence_pipeline_spec_v_0_5_1_beta_complete.md:1). The current implementation target is **Phase B — Layout & OCR** from the May 2026 beta spec.
+This branch is being refactored against `docs/document_intelligence_pipeline_spec_v_0_5_1_beta_complete.md`. The current implementation covers the Phase A-C foundation for classification, layout-aware structured extraction, OCR provider routing, formula routing/fallbacks, CIF output, checkpointing, and GPU lifecycle controls. Phase D and Phase F are intentionally skipped for now, and Phase E hardening is not complete.
 
-## Phase A/B Scope
+## Current Scope
 
-Phase A/B establishes the architectural baseline and the first structured extraction path for the new system:
+Implemented in the active `src/pocket_specialist/` stack:
 
-- project scaffold for a DAG-oriented extraction pipeline
-- typed runtime configuration
-- OCR provider abstraction
-- output validation and repair layer
-- deterministic GPU scheduling
-- typed Canonical Intermediate Format (CIF) primitives
-- document classification for scanned PDFs, digital PDFs, and HTML
-- structured extraction output for HTML and PDF inputs
+- typed runtime configuration via `pipeline.toml` and environment overrides
+- document classification for PDF, HTML, TXT/Markdown, CSV/TSV, images, DOCX, ODT, XLSX, and EPUB
+- Canonical Intermediate Format (CIF) primitives with source coordinates and provenance
+- DAG-oriented extraction tasks with SQLite checkpoint and observation state
+- layout provider abstraction with PP-DocLayoutV3 through Transformers and Surya compatibility
+- OCR provider abstraction with Ollama-backed GLM/DeepSeek providers and Surya compatibility
+- region-guided PDF structured extraction with layout, OCR, table, figure, and formula routing
+- UniMERNet HTTP formula provider client plus symbolic/OCR fallback paths
+- document-scoped structured JSON, layout JSON, figure artifacts, and checkpoint state
+- gated corpus batch subroutine for running `extract-structured` over `RAG-corpus`
 
-The code layout now follows the spec terminology directly under `src/pocket_specialist/`. Stage-specific compatibility code is isolated in `compat/` while active Phase A/B subsystems live in `core/`, `handlers/`, `layout/`, `ocr/`, `phases/`, `storage/`, and `serializers/`.
-
-## Architectural Direction
-
-The new spec changes the repo from a Markdown-first OCR pipeline into a structured document intelligence system with these rules:
-
-- typed intermediates are the authoritative internal state
-- OCR performs extraction, not final semantic interpretation
-- layout is first-class and separate from OCR
-- execution is graph-shaped, not purely linear
-- GPU ownership is explicit and serialized
-- providers are isolated behind protocols
-- Markdown is a rendering/export layer, not storage
-- provenance must be preserved on extracted artifacts
-
-## Current Foundation Modules
-
-Phase A/B foundation code lives under `src/pocket_specialist/` and currently includes:
-
-- `core/config.py`: typed settings and path management
-- `core/tasks.py`: extraction tasks and strongly typed processing units
-- `handlers/intake.py`: document classification and CIF ingestion for supported source types
-- `layout/providers.py`: layout provider protocol and default routing
-- `ocr/providers.py`: `OCRProvider` protocol, Ollama providers, and Surya compatibility adapter
-- `phases/extract.py`: Phase B structured extraction orchestration
-- `core/validation.py`: JSON parsing, repair, and schema gatekeeping
-- `core/gpu.py`: serialized GPU access and cache release hooks
-- `core/cif.py`: CIF blocks, artifacts, source coordinates, and provenance
+Compatibility commands for the older render/OCR/equations/correction/assemble flow still exist under `src/pocket_specialist/compat/`, but new structured extraction work should target `extract-structured` and `extract-structured-corpus`.
 
 ## Repository Layout
 
 ```text
 src/pocket_specialist/
-  core/
-  handlers/
-  layout/
-  ocr/
-  phases/
-  storage/
-  serializers/
-  compat/
-services/
-  formula_extractor/
-scripts/
-docs/
+  core/          # config, CIF, DAG, GPU, validation, processing units
+  handlers/      # intake, classification, native format ingestion
+  layout/        # layout provider protocol and adapters
+  ocr/           # OCR provider protocol and adapters
+  formula/       # UniMERNet client/service, symbolic formula fallback
+  phases/        # structured extraction orchestration
+  storage/       # SQLite checkpoint and DAG observation store
+  serializers/   # Markdown compatibility assembly
+  compat/        # legacy render/OCR/equations/correction commands
+docs/            # architecture specs and review notes
+tests/           # unit and integration-style coverage
+RAG-corpus/      # default corpus input directory
+checkpoints/     # default document-scoped intermediate outputs
+output/          # default compatibility final outputs
+data/            # default SQLite DB, artifacts, and local stores
 ```
+
+`services/` and `scripts/` are currently placeholders only.
 
 ## Runtime Requirements
 
 - Python 3.11+
-- CUDA-capable GPU for Surya-backed OCR paths
-- Local filesystem access for checkpoints and artifacts
-- Optional Ollama runtime for legacy correction paths that have not been removed yet
+- Local filesystem access for checkpoints, structured outputs, and artifacts
+- Transformers for PP-DocLayoutV3 layout detection
+- PyTorch/TorchVision for local model execution paths
+- Ollama for the default GLM/DeepSeek OCR providers
+- Optional CUDA-capable GPU for accelerated layout/OCR/formula paths
+- Optional UniMERNet formula service when formula extraction is enabled
 
 ## Install
 
@@ -79,73 +62,141 @@ python3 -m venv .venv
 ./.venv/bin/pip install -e .
 ```
 
-Surya model weights download on first use.
+If the package is not installed editable in the active environment, run commands with `PYTHONPATH=src`:
 
-## Current CLI Surface
+```bash
+PYTHONPATH=src .venv/bin/python -m pocket_specialist.cli --help
+```
 
-The installed CLI exposes compatibility commands plus the Phase B structured extraction path:
+## CLI
+
+The current CLI exposes both the active structured extraction path and legacy compatibility commands:
 
 ```bash
 pocket-specialist --help
+pocket-specialist extract-structured <document>
+pocket-specialist extract-structured-corpus --enabled
+pocket-specialist layout <pdf>
+pocket-specialist status [--pdf <pdf> | --doc <doc-slug>]
+pocket-specialist reset [--pdf <pdf> | --doc <doc-slug>] [--stage <stage>] --yes
+
+# compatibility pipeline
 pocket-specialist render <pdf>
 pocket-specialist ocr <pdf>
 pocket-specialist equations <pdf>
 pocket-specialist correct <pdf>
 pocket-specialist assemble <pdf>
 pocket-specialist run <pdf>
-pocket-specialist extract-structured <pdf-or-html>
+pocket-specialist run-all [corpus-dir]
 ```
 
-Commands with older names are compatibility entry points around spec-aligned subsystems. New work should depend on the `src/pocket_specialist/` package layout, not root-level wrappers or the retired `pipeline/` package.
+For a single document:
 
-## Checkpoint Observation Layer
+```bash
+pocket-specialist extract-structured /path/to/file.pdf
+```
 
-Checkpointing is now modeled as DAG node observations on top of SQLite:
+For automatic corpus processing from `RAG-corpus`:
 
-- `dag_node_state` stores the current `(document, page, node)` status used for resume decisions.
-- `dag_observations` stores append-only events for starts, completions, failures, and stage compatibility updates.
-- Observation metadata follows the existing task/unit/provenance contract: `doc_id`, `unit_id`, `task_id`, `task_type`, `source_stage`, and optional artifact metadata such as `artifact_uri`.
-- Existing stage checkpoints still work and mirror their updates into DAG node state.
-- `pocket-specialist status` reports both stage summaries and DAG node summaries.
+```bash
+pocket-specialist extract-structured-corpus --enabled
+```
 
-## Configuration Model
+You can also scan another directory:
 
-Runtime configuration now centers on typed settings in `src/pocket_specialist/core/config.py` and `pipeline.toml`, with environment-variable overrides for paths and key runtime values.
+```bash
+pocket-specialist extract-structured-corpus --enabled --corpus-dir /path/to/corpus
+```
+
+The corpus subroutine is gated by design. Enable it per run with `--enabled`, or persist the toggle with `[batch].structured_corpus_enabled = true` / `PIPELINE_STRUCTURED_CORPUS_ENABLED=1`.
+
+## Outputs
+
+Default structured extraction outputs are document-scoped:
+
+```text
+checkpoints/<doc-slug>/layout/page_0001.json
+checkpoints/<doc-slug>/structured/page_0001.json
+checkpoints/<doc-slug>/structured/document.json
+data/artifacts/<doc-slug>/figures/<block-id>.png
+data/pipeline.db
+```
+
+`layout/page_*.json` contains layout regions, bounding boxes, confidence, and reading order. `structured/page_*.json` contains per-page structured blocks. `structured/document.json` contains the full CIF aggregate returned by `extract-structured`.
+
+The older compatibility pipeline writes these outputs:
+
+```text
+checkpoints/<doc-slug>/rendered/page_0001.png
+checkpoints/<doc-slug>/ocr/page_0001.json
+checkpoints/<doc-slug>/equations/page_0001.json
+checkpoints/<doc-slug>/crops/page_0001_eq_*.png
+checkpoints/<doc-slug>/corrected/page_0001.md
+output/<doc-slug>/<doc-slug>.md
+output/<doc-slug>/<doc-slug>.json
+```
+
+## Configuration
+
+Runtime configuration is loaded from `pipeline.toml`, with environment-variable overrides for key settings.
 
 Examples:
 
 ```bash
 export PIPELINE_CHECKPOINT_DIR=/data/checkpoints
 export PIPELINE_OUTPUT_DIR=/data/output
-export PIPELINE_OCR_PROVIDER=surya
-export PIPELINE_OLLAMA_MODEL=qwen2.5vl:3b
+export PIPELINE_DB_PATH=/data/pipeline.db
+export PIPELINE_LAYOUT_PROVIDER=pp-doclayout-v3
+export PIPELINE_OCR_PROVIDER=glm-ocr
+export PIPELINE_OCR_FALLBACK_PROVIDER=deepseek-ocr
+export PIPELINE_STRUCTURED_CORPUS_ENABLED=1
 ```
+
+Relevant defaults in `pipeline.toml`:
+
+```toml
+[layout]
+provider = "pp-doclayout-v3"
+enabled = true
+
+[ocr]
+provider = "glm-ocr"
+fallback_provider = "deepseek-ocr"
+
+[formula]
+enabled = true
+fallback_to_ocr = true
+
+[batch]
+structured_corpus_enabled = false
+
+[storage]
+sqlite_path = "./data/pipeline.db"
+artifact_path = "./data/artifacts"
+chroma_path = "./data/chroma"
+```
+
+## Checkpoints And Status
+
+Checkpointing uses SQLite tables for legacy stage state plus DAG node observations:
+
+- `dag_node_state` stores current `(document, page, node)` status for resume decisions.
+- `dag_observations` stores append-only node events.
+- Stage tables preserve compatibility with `render`, `ocr`, `layout`, `equations`, `correction`, and `structured` status.
+- `pocket-specialist status` reports both stage summaries and DAG node summaries.
+- `pocket-specialist reset` removes document-scoped output files and clears checkpoint rows for the selected stage and later stages.
 
 ## Testing
 
 ```bash
-./.venv/bin/python -m pytest
+PYTHONPATH=src .venv/bin/python -m pytest
 ```
 
-Focused unit coverage currently exercises the Phase A foundation and Phase B intake/extraction paths.
+Focused tests cover config, DAG/checkpoint behavior, intake, structured extraction, OCR retry behavior, and formula routing.
 
-## Status
+## Known Gaps
 
-Implemented in Phase A/B:
-
-- typed configuration scaffold
-- OCR provider abstraction baseline
-- mandatory validation layer primitives
-- GPU scheduler baseline
-- CIF data primitives
-- upgraded package layout under `src/pocket_specialist/`
-- scanned/digital PDF and HTML intake classification
-- layout provider abstraction baseline
-- structured extraction document output
-
-Not yet implemented from the spec:
-
-- production-grade region-guided OCR routing
-- formula subsystem implementation
-- chunk serialization and retrieval APIs
-- phase-wide hardening and scaling features
+- Phase E production hardening is not complete.
+- Phase D and Phase F are intentionally out of the current implementation scope.
+- Retrieval/indexing modules are placeholders and are not wired into a production retrieval flow.
+- The compatibility `run` pipeline is separate from the active `extract-structured` pipeline.

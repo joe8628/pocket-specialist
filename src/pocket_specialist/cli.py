@@ -174,6 +174,89 @@ def extract_structured(
         raise typer.Exit(1)
 
 
+@app.command(name="extract-structured-corpus")
+def extract_structured_corpus(
+    corpus_dir: Path = typer.Option(None, "--corpus-dir", help="Corpus directory to scan (default: RAG-corpus)."),
+    output_root: Path = typer.Option(None, "--output-root", help="Root for structured JSON outputs. Defaults to checkpoints/<doc>/structured."),
+    layout_output_root: Path = typer.Option(None, "--layout-output-root", help="Root for layout JSON outputs. Defaults to checkpoints/<doc>/layout."),
+    enabled: bool = typer.Option(False, "--enabled", help="Enable this gated batch subroutine for the current run."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="List matching files without running extraction."),
+    recursive: bool = typer.Option(True, "--recursive/--flat", help="Scan corpus subdirectories recursively."),
+    limit: int = typer.Option(None, "--limit", min=1, help="Maximum number of files to process."),
+    stop_on_error: bool = typer.Option(False, "--stop-on-error", help="Stop at the first failed document."),
+) -> None:
+    """Run extract-structured for supported files found in the corpus directory."""
+    from pocket_specialist.core.config import get_settings, layout_dir_for, structured_dir_for
+    from pocket_specialist.handlers.intake import classify_document
+    from pocket_specialist.phases.extract import extract_structured_document
+
+    settings = get_settings()
+    if not enabled and not settings.batch.structured_corpus_enabled:
+        typer.echo(
+            "Structured corpus extraction is disabled. Use --enabled, "
+            "PIPELINE_STRUCTURED_CORPUS_ENABLED=1, or [batch].structured_corpus_enabled=true."
+        )
+        raise typer.Exit()
+
+    root = (corpus_dir or settings.paths.corpus_dir).resolve()
+    if not root.exists() or not root.is_dir():
+        typer.echo(f"Corpus directory does not exist: {root}", err=True)
+        raise typer.Exit(1)
+
+    supported_suffixes = {
+        ".pdf", ".html", ".htm", ".txt", ".log", ".md", ".markdown",
+        ".csv", ".tsv", ".png", ".jpg", ".jpeg", ".tif", ".tiff",
+        ".docx", ".odt", ".xlsx", ".epub",
+    }
+    iterator = root.rglob("*") if recursive else root.glob("*")
+    candidates = sorted(path for path in iterator if path.is_file() and path.suffix.lower() in supported_suffixes)
+    if limit is not None:
+        candidates = candidates[:limit]
+
+    if not candidates:
+        typer.echo(f"No supported files found in {root}.")
+        raise typer.Exit()
+
+    typer.echo(f"Structured corpus extraction: {len(candidates)} file(s) from {root}")
+    if dry_run:
+        for source_path in candidates:
+            typer.echo(f"  DRY-RUN {source_path}")
+        raise typer.Exit()
+
+    completed = 0
+    failed_docs = 0
+    for index, source_path in enumerate(candidates, 1):
+        typer.echo(f"\n[{index}/{len(candidates)}] {source_path.name}")
+        try:
+            profile = classify_document(source_path)
+            structured_target = (output_root / profile.doc_id) if output_root is not None else structured_dir_for(profile.doc_id)
+            layout_target = (layout_output_root / profile.doc_id) if layout_output_root is not None else layout_dir_for(profile.doc_id)
+            done, failed, cif = extract_structured_document(
+                source_path,
+                structured_output_dir=structured_target,
+                layout_output_dir=layout_target,
+            )
+            typer.echo(
+                f"  done={done} failed={failed} blocks={len(cif.blocks)} "
+                f"structured={structured_target / 'document.json'} layout={layout_target}"
+            )
+            if failed:
+                failed_docs += 1
+                if stop_on_error:
+                    raise typer.Exit(1)
+            else:
+                completed += 1
+        except Exception as exc:
+            failed_docs += 1
+            typer.echo(f"  failed: {exc}", err=True)
+            if stop_on_error:
+                raise typer.Exit(1) from exc
+
+    typer.echo(f"\nStructured corpus extraction complete: {completed} succeeded, {failed_docs} failed.")
+    if failed_docs:
+        raise typer.Exit(1)
+
+
 # ── Layout And Formula Enrichment ──────────────────────────────────────────────
 
 @app.command()
