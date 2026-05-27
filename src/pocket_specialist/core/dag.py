@@ -8,7 +8,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 import os
 import threading
-from typing import Callable, Protocol
+from pathlib import Path
+from typing import Protocol
 
 from pocket_specialist.core.config import get_settings
 from pocket_specialist.core.tasks import ExtractionTask, ProcessingUnit
@@ -33,6 +34,10 @@ class TaskRunner(Protocol):
     def __call__(self, task: ExtractionTask, unit: ProcessingUnit) -> TaskRunResult | None: ...
 
 
+class CheckpointResumeHandler(Protocol):
+    def __call__(self, task: ExtractionTask, unit: ProcessingUnit, checkpoint: object) -> bool: ...
+
+
 @dataclass(slots=True)
 class _TaskState:
     task: ExtractionTask
@@ -51,7 +56,7 @@ class DAGExecutor:
         settings = get_settings()
         self.max_workers = max_workers or max(1, min(32, (os.cpu_count() or 1) + 4))
         self.max_retries = settings.runtime.max_retries if max_retries is None else max_retries
-        self.default_resource_limits = {"layout": 1, "ocr": 1, "formula": 1, **(default_resource_limits or {})}
+        self.default_resource_limits = {"layout": 1, "ocr": 1, "formula": 1, "cpu": self.max_workers, **(default_resource_limits or {})}
         self._resource_semaphores: dict[str, threading.Semaphore] = {}
         self._resource_lock = threading.Lock()
 
@@ -62,6 +67,7 @@ class DAGExecutor:
         tasks: list[ExtractionTask],
         units: dict[str, ProcessingUnit],
         runner: TaskRunner,
+        resume: CheckpointResumeHandler | None = None,
     ) -> GraphExecutionResult:
         states = self._validate_and_prepare(tasks, units)
         dependents = self._dependents(states)
@@ -69,16 +75,19 @@ class DAGExecutor:
         failed: set[str] = set()
         skipped: set[str] = set()
         blocked: set[str] = set()
+        force_rerun: set[str] = set()
         unresolved: dict[str, int] = {}
         ready: deque[str] = deque()
 
         for task_id, state in states.items():
-            checkpoint_status = self._checkpoint_status(document, state)
+            checkpoint_status = self._checkpoint_status(document, state, resume)
             if checkpoint_status == "done":
                 completed.add(task_id)
                 skipped.add(task_id)
             elif checkpoint_status == "failed":
                 failed.add(task_id)
+            elif checkpoint_status == "stale":
+                force_rerun.add(task_id)
 
         for task_id, state in states.items():
             if task_id in completed or task_id in failed:
@@ -98,7 +107,7 @@ class DAGExecutor:
                     task_id = ready.popleft()
                     if task_id in blocked or task_id in failed or task_id in completed:
                         continue
-                    future = pool.submit(self._run_task, document, states[task_id], runner)
+                    future = pool.submit(self._run_task, document, states[task_id], runner, task_id in force_rerun)
                     in_flight[future] = task_id
 
                 if not in_flight:
@@ -157,18 +166,31 @@ class DAGExecutor:
                 dependents[dependency].append(task_id)
         return dependents
 
-    def _checkpoint_status(self, document: str, state: _TaskState) -> str | None:
+    def _checkpoint_status(
+        self,
+        document: str,
+        state: _TaskState,
+        resume: CheckpointResumeHandler | None,
+    ) -> str | None:
         page = _unit_page(state.unit)
         node_state = get_node_state(document, page, state.task.task_id)
         if node_state is None:
             return None
         if node_state.status == "done":
+            if not _checkpoint_artifact_exists(node_state.path):
+                return "stale"
+            if resume is not None:
+                try:
+                    if not resume(state.task, state.unit, node_state):
+                        return "stale"
+                except Exception:
+                    return "stale"
             return "done"
         if node_state.status == "failed" and not should_process_node(document, page, state.task.task_id, max_retries=state.retry_limit):
             return "failed"
         return None
 
-    def _run_task(self, document: str, state: _TaskState, runner: TaskRunner) -> tuple[str, str]:
+    def _run_task(self, document: str, state: _TaskState, runner: TaskRunner, force_rerun: bool = False) -> tuple[str, str]:
         page = _unit_page(state.unit)
         metadata = {
             **state.unit.metadata,
@@ -182,7 +204,8 @@ class DAGExecutor:
             "source_stage": state.task.task_type,
         }
 
-        while should_process_node(document, page, state.task.task_id, max_retries=state.retry_limit):
+        while force_rerun or should_process_node(document, page, state.task.task_id, max_retries=state.retry_limit):
+            force_rerun = False
             record_node_start(document, page, state.task.task_id, metadata=metadata)
             try:
                 with self._resource_claim(state.task):
@@ -243,6 +266,12 @@ class DAGExecutor:
                 continue
             blocked.add(dependent)
             queue.extend(dependents.get(dependent, []))
+
+
+def _checkpoint_artifact_exists(path: str | None) -> bool:
+    if not path:
+        return True
+    return Path(path).exists()
 
 
 def _resource_name(task: ExtractionTask) -> str | None:

@@ -13,9 +13,10 @@ from PIL import Image
 
 from pocket_specialist.core.config import PipelineSettings
 from pocket_specialist.formula.providers import FormulaResult, UniMERNetFormulaExtractor
-from pocket_specialist.layout.providers import LayoutRegion, LayoutResult, build_layout_provider
+from pocket_specialist.layout.providers import LayoutRegion, LayoutResult, SuryaLayoutProvider, build_layout_provider
 from pocket_specialist.handlers.intake import DocumentProfile, NativeTextBlock, PDFContentType, SourceKind
 from pocket_specialist.formula.symbolic import inline_formula_candidates, looks_symbolic
+from pocket_specialist.ocr.providers import OllamaOCRProvider, SuryaOCRProvider
 from pocket_specialist.phases.extract import _matched_layout_region_ids, _native_page_blocks, _ocr_page_blocks, extract_structured_document
 
 
@@ -401,12 +402,79 @@ class PhaseCFormulaTests(unittest.TestCase):
                     layout_output_dir=root / "layout-out",
                 )
 
-        self.assertEqual(len(cif.blocks), 1)
-        self.assertEqual(cif.blocks[0].block_type, "FigureBlock")
-        self.assertEqual(len(cif.artifacts), 1)
-        self.assertEqual(cif.artifacts[0].artifact_type, "figure")
-        self.assertEqual(cif.artifacts[0].uri, cif.blocks[0].content["artifact_uri"])
-        self.assertTrue((settings.paths.project_root / cif.artifacts[0].uri).exists())
+            self.assertEqual(len(cif.blocks), 1)
+            self.assertEqual(cif.blocks[0].block_type, "FigureBlock")
+            self.assertEqual(len(cif.artifacts), 1)
+            self.assertEqual(cif.artifacts[0].artifact_type, "figure")
+            self.assertEqual(cif.artifacts[0].uri, cif.blocks[0].content["artifact_uri"])
+            self.assertTrue((settings.paths.project_root / cif.artifacts[0].uri).exists())
+
+    def test_extract_structured_document_rehydrates_skipped_layout_checkpoint_for_structured_task(self) -> None:
+        from pocket_specialist.storage import checkpoint
+
+        image = Image.new("RGB", (64, 32), "white")
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        profile = DocumentProfile(
+            doc_id="doc",
+            source_path=Path("/tmp/doc.pdf"),
+            source_kind=SourceKind.PDF,
+            mime_type="application/pdf",
+            pdf_content_type=PDFContentType.DIGITAL,
+            page_count=1,
+            text_extractable=True,
+            metadata={"page_modes": [PDFContentType.DIGITAL.value]},
+        )
+        native_blocks = [NativeTextBlock(text="native paragraph", bbox=(0, 0, 30, 10), block_no=0)]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            layout_dir = root / "layout-out"
+            structured_dir = root / "structured-out"
+            layout_dir.mkdir(parents=True)
+            layout_path = layout_dir / "page_0001.json"
+            layout_path.write_text(
+                json.dumps(
+                    {
+                        "page_id": "page-0001",
+                        "regions": [
+                            {
+                                "region_id": "region-0001",
+                                "region_type": "text",
+                                "bbox": [0, 0, 30, 10],
+                                "confidence": 0.97,
+                                "reading_order": 0,
+                                "metadata": {"provider": "fixture"},
+                            }
+                        ],
+                        "layout_confidence": 0.97,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            settings = PipelineSettings.from_env(project_root=root)
+            with patch.object(checkpoint, "DB_PATH", root / "pipeline.db"):
+                checkpoint.init_db()
+                checkpoint.record_node_done("doc", 1, "doc:layout:0001", path=str(layout_path), metadata={"task_type": "layout"})
+                with patch("pocket_specialist.phases.extract.classify_document", return_value=profile), \
+                     patch("pocket_specialist.phases.extract.get_settings", return_value=settings), \
+                     patch("pocket_specialist.phases.extract.render_pdf_page_to_bytes", return_value=buffer.getvalue()), \
+                     patch("pocket_specialist.phases.extract.get_pdf_native_blocks", return_value=native_blocks), \
+                     patch("pocket_specialist.phases.extract.build_layout_provider", side_effect=AssertionError("layout should resume from checkpoint")), \
+                     patch("pocket_specialist.phases.extract.build_primary_ocr_provider", return_value=UnusedOCRProvider()), \
+                     patch("pocket_specialist.phases.extract.build_fallback_ocr_provider", return_value=None):
+                    done, failed, cif = extract_structured_document(
+                        Path("/tmp/doc.pdf"),
+                        structured_output_dir=structured_dir,
+                        layout_output_dir=layout_dir,
+                    )
+
+            page_payload = json.loads((structured_dir / "page_0001.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(done, 1)
+        self.assertEqual(failed, 0)
+        self.assertEqual(cif.blocks[0].content["text"], "native paragraph")
+        self.assertEqual(page_payload["blocks"][0]["content"]["text"], "native paragraph")
 
     def test_extract_structured_document_skips_layout_provider_when_disabled_for_digital_pdf(self) -> None:
         image = Image.new("RGB", (64, 32), "white")
@@ -563,7 +631,8 @@ class PhaseCFormulaTests(unittest.TestCase):
                     layout_output_dir=root / "layout-out",
                 )
 
-        assert recorder.claims == ["layout", "layout", "ocr", "ocr"]
+        assert recorder.claims.count("layout") == 2
+        assert recorder.claims.count("ocr") == 2
 
     def test_layout_provider_detect_claims_gpu_scheduler(self) -> None:
         class FakePredictor:
@@ -590,8 +659,8 @@ class PhaseCFormulaTests(unittest.TestCase):
             def __call__(self, image):
                 del image
                 return [
-                    {"label": "Text", "score": 0.91, "box": {"xmin": 1, "ymin": 2, "xmax": 10, "ymax": 12}},
                     {"label": "Table", "score": 0.83, "box": {"xmin": 20, "ymin": 3, "xmax": 40, "ymax": 18}},
+                    {"label": "Text", "score": 0.91, "box": {"xmin": 1, "ymin": 2, "xmax": 10, "ymax": 12}},
                 ]
 
         recorder = ClaimRecorder()
@@ -622,6 +691,38 @@ class PhaseCFormulaTests(unittest.TestCase):
             provider = build_layout_provider("pp-doclayout-v3")
             with self.assertRaisesRegex(RuntimeError, "requires transformers >= 5.5.4; found 4.57.6"):
                 provider.load()
+
+    def test_provider_import_failures_raise_runtime_errors(self) -> None:
+        with patch.dict("sys.modules", {"surya.foundation": None}):
+            with self.assertRaisesRegex(RuntimeError, "surya-ocr is not installed"):
+                SuryaLayoutProvider().load()
+            with self.assertRaisesRegex(RuntimeError, "surya-ocr is not installed"):
+                SuryaOCRProvider().load()
+
+    def test_ollama_ocr_retries_repairable_malformed_json_with_constrained_prompt(self) -> None:
+        class OCRSession:
+            def __init__(self) -> None:
+                self.posts: list[tuple[str, object]] = []
+
+            def post(self, url, json=None, timeout=None):
+                del timeout
+                self.posts.append((url, json))
+                raw = '{"blocks": []' if len(self.posts) == 1 else '{"blocks": []}'
+                return FakeResponse({"response": raw})
+
+            def close(self) -> None:
+                return None
+
+        session = OCRSession()
+        with patch("pocket_specialist.ocr.providers.requests.Session", return_value=session):
+            provider = OllamaOCRProvider("glm-ocr")
+            provider.load()
+            result = provider.extract(b"image-bytes", "text")
+
+        self.assertEqual(len(session.posts), 2)
+        self.assertEqual(result.extraction_metadata["attempt_count"], 2)
+        self.assertEqual(result.extraction_metadata["retry_strategy"], "constrained_prompt")
+        self.assertEqual(result.typed_content["blocks"], [])
 
     def test_ollama_formula_client_claims_gpu_scheduler(self) -> None:
         session = FakeSession()

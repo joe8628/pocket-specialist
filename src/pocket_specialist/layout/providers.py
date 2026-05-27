@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import gc
 import io
-import sys
 from types import ModuleType
 from dataclasses import dataclass, field
 from typing import Protocol
@@ -81,9 +80,8 @@ def _parse_version(version_text: str) -> tuple[int, ...]:
 def _load_transformers_module() -> ModuleType:
     try:
         import transformers
-    except ImportError:
-        print("Error: transformers is not installed. Run: pip install transformers", file=sys.stderr)
-        sys.exit(1)
+    except ImportError as exc:
+        raise RuntimeError("transformers is not installed. Run: pip install transformers") from exc
     return transformers
 
 
@@ -95,6 +93,21 @@ def _normalize_layout_label(provider_label: str) -> str:
     normalized = provider_label.strip().lower().replace("-", "_").replace(" ", "_")
     compact = normalized.replace("_", "")
     return _LAYOUT_LABEL_MAP.get(normalized, _LAYOUT_LABEL_MAP.get(compact, normalized))
+
+
+def _layout_box(raw_region: object) -> tuple[int, int, int, int]:
+    box = raw_region.get("box", {}) if isinstance(raw_region, dict) else {}
+    return (
+        int(float(box.get("xmin", 0))),
+        int(float(box.get("ymin", 0))),
+        int(float(box.get("xmax", 0))),
+        int(float(box.get("ymax", 0))),
+    )
+
+
+def _reading_order_key(raw_region: object) -> tuple[int, int, int, int]:
+    x0, y0, x1, y1 = _layout_box(raw_region)
+    return (y0, x0, y1, x1)
 
 
 class PPDocLayoutV3LayoutProvider:
@@ -136,12 +149,8 @@ class PPDocLayoutV3LayoutProvider:
 
         regions: list[LayoutRegion] = []
         confidences: list[float] = []
-        for idx, raw_region in enumerate(raw_regions, 1):
-            box = raw_region.get("box", {}) if isinstance(raw_region, dict) else {}
-            x0 = int(float(box.get("xmin", 0)))
-            y0 = int(float(box.get("ymin", 0)))
-            x1 = int(float(box.get("xmax", 0)))
-            y1 = int(float(box.get("ymax", 0)))
+        for idx, raw_region in enumerate(sorted(raw_regions, key=_reading_order_key), 1):
+            x0, y0, x1, y1 = _layout_box(raw_region)
             provider_label = str(raw_region.get("label", "text")) if isinstance(raw_region, dict) else "text"
             confidence = float(raw_region.get("score", 0.0)) if isinstance(raw_region, dict) else 0.0
             confidences.append(confidence)
@@ -183,9 +192,8 @@ class SuryaLayoutProvider:
             from surya.foundation import FoundationPredictor
             from surya.layout import LayoutPredictor
             from surya.settings import settings
-        except ImportError:
-            print("Error: surya-ocr is not installed. Run: pip install surya-ocr", file=sys.stderr)
-            sys.exit(1)
+        except ImportError as exc:
+            raise RuntimeError("surya-ocr is not installed. Run: pip install surya-ocr") from exc
 
         self._foundation = FoundationPredictor(checkpoint=settings.LAYOUT_MODEL_CHECKPOINT)
         self._predictor = LayoutPredictor(self._foundation)

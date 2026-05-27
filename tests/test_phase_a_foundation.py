@@ -187,6 +187,8 @@ def test_dag_executor_retries_failed_task_and_then_runs_dependent(tmp_path):
 def test_dag_executor_skips_checkpointed_task_and_still_runs_dependent(tmp_path):
     from pocket_specialist.storage import checkpoint
 
+    layout_path = tmp_path / "layout.json"
+    layout_path.write_text("{}", encoding="utf-8")
     layout_task = ExtractionTask(task_id="doc:layout:0001", task_type="layout", resource_requirements={"resource": "layout"})
     structured_task = ExtractionTask(task_id="doc:structured:0001", task_type="structured", dependencies=[layout_task.task_id])
     units = {
@@ -202,12 +204,70 @@ def test_dag_executor_skips_checkpointed_task_and_still_runs_dependent(tmp_path)
 
     with patch.object(checkpoint, "DB_PATH", tmp_path / "pipeline.db"):
         checkpoint.init_db()
-        checkpoint.record_node_done("doc", 1, layout_task.task_id, path="/tmp/layout.json", metadata={"task_type": "layout"})
+        checkpoint.record_node_done("doc", 1, layout_task.task_id, path=str(layout_path), metadata={"task_type": "layout"})
         result = DAGExecutor(max_workers=2, max_retries=2).run(document="doc", tasks=[layout_task, structured_task], units=units, runner=runner)
 
     assert seen == [structured_task.task_id]
     assert result.skipped_task_ids == [layout_task.task_id]
     assert result.completed_task_ids == [structured_task.task_id]
+
+
+def test_dag_executor_reruns_done_checkpoint_when_artifact_is_missing(tmp_path):
+    from pocket_specialist.storage import checkpoint
+
+    task = ExtractionTask(task_id="doc:structured:0001", task_type="structured")
+    units = {task.task_id: PageUnit(unit_id="doc:page:0001", doc_id="doc", metadata={"page": 1})}
+    seen: list[str] = []
+    output_path = tmp_path / "fresh.json"
+
+    def runner(current: ExtractionTask, unit: PageUnit) -> TaskRunResult:
+        del unit
+        seen.append(current.task_id)
+        output_path.write_text("{}", encoding="utf-8")
+        return TaskRunResult(path=str(output_path))
+
+    with patch.object(checkpoint, "DB_PATH", tmp_path / "pipeline.db"):
+        checkpoint.init_db()
+        checkpoint.record_node_done("doc", 1, task.task_id, path=str(tmp_path / "missing.json"), metadata={"task_type": "structured"})
+        result = DAGExecutor(max_workers=1, max_retries=1).run(document="doc", tasks=[task], units=units, runner=runner)
+        state = checkpoint.get_node_state("doc", 1, task.task_id)
+
+    assert seen == [task.task_id]
+    assert result.completed_task_ids == [task.task_id]
+    assert result.skipped_task_ids == []
+    assert state is not None and state.path == str(output_path)
+
+
+def test_dag_executor_reruns_done_checkpoint_when_resume_handler_rejects_it(tmp_path):
+    from pocket_specialist.storage import checkpoint
+
+    stale_path = tmp_path / "stale.json"
+    stale_path.write_text("{}", encoding="utf-8")
+    fresh_path = tmp_path / "fresh.json"
+    task = ExtractionTask(task_id="doc:structured:0001", task_type="structured")
+    units = {task.task_id: PageUnit(unit_id="doc:page:0001", doc_id="doc", metadata={"page": 1})}
+    seen: list[str] = []
+
+    def runner(current: ExtractionTask, unit: PageUnit) -> TaskRunResult:
+        del unit
+        seen.append(current.task_id)
+        fresh_path.write_text("{}", encoding="utf-8")
+        return TaskRunResult(path=str(fresh_path))
+
+    with patch.object(checkpoint, "DB_PATH", tmp_path / "pipeline.db"):
+        checkpoint.init_db()
+        checkpoint.record_node_done("doc", 1, task.task_id, path=str(stale_path), metadata={"task_type": "structured"})
+        result = DAGExecutor(max_workers=1, max_retries=1).run(
+            document="doc",
+            tasks=[task],
+            units=units,
+            runner=runner,
+            resume=lambda current, unit, state: False,
+        )
+
+    assert seen == [task.task_id]
+    assert result.completed_task_ids == [task.task_id]
+    assert result.skipped_task_ids == []
 
 
 def test_dag_executor_allows_cpu_parallelism_and_serializes_layout_resource(tmp_path):

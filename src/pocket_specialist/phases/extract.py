@@ -8,7 +8,7 @@ import threading
 from dataclasses import asdict
 from pathlib import Path
 
-from pocket_specialist.storage.checkpoint import init_db, set_status, should_process
+from pocket_specialist.storage.checkpoint import DAGNodeState, init_db, set_status, should_process
 
 from pocket_specialist.core.cif import CanonicalIntermediateFormat, ProcessingArtifact, ProvenanceRecord, SourceCoords, StructuredBlock
 from pocket_specialist.core.config import get_settings
@@ -607,6 +607,105 @@ def _write_page_layout_page(document: str, page_num: int, blocks: list[Structure
     )
 
 
+def _layout_result_from_payload(payload: dict[str, object]) -> LayoutResult:
+    regions_payload = payload.get("regions")
+    regions: list[LayoutRegion] = []
+    if isinstance(regions_payload, list):
+        for idx, item in enumerate(regions_payload, 1):
+            if not isinstance(item, dict):
+                continue
+            bbox_obj = item.get("bbox")
+            if not isinstance(bbox_obj, list | tuple) or len(bbox_obj) != 4:
+                continue
+            regions.append(
+                LayoutRegion(
+                    region_id=str(item.get("region_id") or f"region-{idx:04d}"),
+                    region_type=str(item.get("region_type") or "text"),
+                    bbox=tuple(int(float(value)) for value in bbox_obj),
+                    confidence=float(item.get("confidence") or 0.0),
+                    reading_order=int(item.get("reading_order") or idx - 1),
+                    metadata=item.get("metadata") if isinstance(item.get("metadata"), dict) else {},
+                )
+            )
+    confidence = payload.get("layout_confidence")
+    return LayoutResult(
+        page_id=str(payload.get("page_id") or "page"),
+        regions=regions,
+        layout_confidence=float(confidence) if confidence is not None else None,
+    )
+
+
+def _source_coords_from_payload(payload: object) -> SourceCoords | None:
+    if not isinstance(payload, dict):
+        return None
+    bbox_obj = payload.get("bbox")
+    bbox = None
+    if isinstance(bbox_obj, list | tuple) and len(bbox_obj) == 4:
+        bbox = tuple(int(float(value)) for value in bbox_obj)
+    return SourceCoords(
+        page=int(payload["page"]) if isinstance(payload.get("page"), int) else None,
+        bbox=bbox,
+        polygons=payload.get("polygons") if isinstance(payload.get("polygons"), list) else None,
+    )
+
+
+def _provenance_from_payload(payload: object) -> ProvenanceRecord:
+    if not isinstance(payload, dict):
+        return ProvenanceRecord(source_stage="structured_extract")
+    lineage = payload.get("lineage")
+    metadata = payload.get("metadata")
+    return ProvenanceRecord(
+        source_stage=str(payload.get("source_stage") or "structured_extract"),
+        provider=str(payload["provider"]) if payload.get("provider") is not None else None,
+        confidence=float(payload["confidence"]) if payload.get("confidence") is not None else None,
+        lineage=[str(item) for item in lineage] if isinstance(lineage, list) else [],
+        metadata=metadata if isinstance(metadata, dict) else {},
+    )
+
+
+def _structured_block_from_payload(payload: dict[str, object]) -> StructuredBlock:
+    section_path = payload.get("section_path")
+    content = payload.get("content")
+    return StructuredBlock(
+        block_id=str(payload["block_id"]),
+        doc_id=str(payload["doc_id"]),
+        block_type=str(payload["block_type"]),
+        content=content if isinstance(content, dict) else {},
+        section_path=[str(item) for item in section_path] if isinstance(section_path, list) else [],
+        reading_order=int(payload.get("reading_order") or 0),
+        page=int(payload["page"]) if isinstance(payload.get("page"), int) else None,
+        source_coords=_source_coords_from_payload(payload.get("source_coords")),
+        provenance=_provenance_from_payload(payload.get("provenance")),
+    )
+
+
+def _load_structured_page_blocks(path: Path) -> list[StructuredBlock]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("structured page checkpoint is not an object")
+    raw_blocks = payload.get("blocks")
+    if not isinstance(raw_blocks, list):
+        raise ValueError("structured page checkpoint is missing blocks")
+    return [_structured_block_from_payload(block) for block in raw_blocks if isinstance(block, dict)]
+
+
+def _add_blocks_to_cif(cif: CanonicalIntermediateFormat, blocks: list[StructuredBlock]) -> None:
+    existing = {block.block_id for block in cif.blocks}
+    for block in blocks:
+        if block.block_id not in existing:
+            cif.add_block(block)
+            existing.add(block.block_id)
+    existing_artifacts = {artifact.uri for artifact in cif.artifacts}
+    for artifact in _artifacts_from_blocks(blocks):
+        if artifact.uri not in existing_artifacts:
+            cif.add_artifact(artifact)
+            existing_artifacts.add(artifact.uri)
+
+
+def _checkpoint_path_matches(checkpoint: DAGNodeState, expected_path: Path) -> bool:
+    return checkpoint.path == str(expected_path) and expected_path.exists()
+
+
 def _empty_layout_result(page_num: int) -> LayoutResult:
     return LayoutResult(page_id=f"page-{page_num:04d}", regions=[], layout_confidence=None)
 
@@ -743,10 +842,9 @@ def _run_layout_disabled_pdf_graph(
     tasks: list[ExtractionTask] = []
     units: dict[str, PageUnit] = {}
     for page_num in range(1, profile.page_count + 1):
-        if not should_process("structured", document, page_num):
-            continue
         page_mode = page_modes[page_num - 1] if page_num - 1 < len(page_modes) else profile.pdf_content_type.value
         task, unit = _page_task(document, page_num, "structured", page_mode=page_mode)
+        unit.metadata["checkpoint_path"] = str(structured_dir / f"page_{page_num:04d}.json")
         tasks.append(task)
         units[task.task_id] = unit
 
@@ -778,6 +876,16 @@ def _run_layout_disabled_pdf_graph(
         if fallback_provider is not None:
             fallback = _LockedOCRProvider(fallback_provider, ocr_call_lock)
         return primary, fallback
+
+    def resume_task(task: ExtractionTask, unit: PageUnit, checkpoint: DAGNodeState) -> bool:
+        del task
+        expected_path = Path(str(unit.metadata["checkpoint_path"]))
+        if not _checkpoint_path_matches(checkpoint, expected_path):
+            return False
+        blocks = _load_structured_page_blocks(expected_path)
+        with cif_lock:
+            _add_blocks_to_cif(cif, blocks)
+        return True
 
     def run_task(task: ExtractionTask, unit: PageUnit) -> TaskRunResult:
         del task
@@ -823,7 +931,7 @@ def _run_layout_disabled_pdf_graph(
         return TaskRunResult(path=str(structured_path), metadata={"page_mode": page_mode, "layout_enabled": False})
 
     executor = DAGExecutor()
-    result = executor.run(document=document, tasks=tasks, units=units, runner=run_task)
+    result = executor.run(document=document, tasks=tasks, units=units, runner=run_task, resume=resume_task)
 
     if ocr_loaded and primary_provider is not None:
         with gpu_scheduler.claim("ocr"):
@@ -832,7 +940,9 @@ def _run_layout_disabled_pdf_graph(
             with gpu_scheduler.claim("ocr"):
                 fallback_provider.offload()
 
-    return len(result.completed_task_ids), len(result.failed_task_ids) + len(result.blocked_task_ids)
+    structured_done = [task_id for task_id in result.completed_task_ids + result.skipped_task_ids if ":structured:" in task_id]
+    structured_failed = [task_id for task_id in result.failed_task_ids + result.blocked_task_ids if ":structured:" in task_id]
+    return len(structured_done), len(structured_failed)
 
 
 
@@ -850,11 +960,11 @@ def _run_layout_enabled_pdf_graph(
     tasks: list[ExtractionTask] = []
     units: dict[str, PageUnit] = {}
     for page_num in range(1, profile.page_count + 1):
-        if not should_process("structured", document, page_num):
-            continue
         page_mode = page_modes[page_num - 1] if page_num - 1 < len(page_modes) else profile.pdf_content_type.value
         layout_task, layout_unit = _page_task(document, page_num, "layout", page_mode=page_mode, resource="layout")
         structured_task, structured_unit = _page_task(document, page_num, "structured", page_mode=page_mode, dependencies=[layout_task.task_id])
+        layout_unit.metadata["checkpoint_path"] = str(layout_dir / f"page_{page_num:04d}.json")
+        structured_unit.metadata["checkpoint_path"] = str(structured_dir / f"page_{page_num:04d}.json")
         tasks.extend([layout_task, structured_task])
         units[layout_task.task_id] = layout_unit
         units[structured_task.task_id] = structured_unit
@@ -936,6 +1046,35 @@ def _run_layout_enabled_pdf_graph(
             return None
         return _LockedFormulaExtractor(formula_extractor, formula_call_lock)
 
+    def resume_task(task: ExtractionTask, unit: PageUnit, checkpoint: DAGNodeState) -> bool:
+        page_num = int(unit.metadata["page"])
+        page_mode = str(unit.metadata["page_mode"])
+        expected_path = Path(str(unit.metadata["checkpoint_path"]))
+        if not _checkpoint_path_matches(checkpoint, expected_path):
+            return False
+        if task.task_type == "layout":
+            payload = json.loads(expected_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                return False
+            layout_result = _layout_result_from_payload(payload)
+            zoom = settings.rendering.zoom if page_mode == PDFContentType.DIGITAL.value else settings.rendering.scanned_pdf_zoom
+            image_bytes = render_pdf_page_to_bytes(source_path, page_num, zoom=zoom)
+            native_blocks = get_pdf_native_blocks(source_path, page_num)
+            with state_lock:
+                page_state[page_num] = {
+                    "image_bytes": image_bytes,
+                    "layout": layout_result,
+                    "native_blocks": native_blocks,
+                    "page_mode": page_mode,
+                }
+            return True
+        if task.task_type == "structured":
+            blocks = _load_structured_page_blocks(expected_path)
+            with cif_lock:
+                _add_blocks_to_cif(cif, blocks)
+            return True
+        return False
+
     def run_task(task: ExtractionTask, unit: PageUnit) -> TaskRunResult:
         page_num = int(unit.metadata["page"])
         page_mode = str(unit.metadata["page_mode"])
@@ -1010,7 +1149,7 @@ def _run_layout_enabled_pdf_graph(
         return TaskRunResult(path=str(structured_path), metadata={"page_mode": output_page_mode})
 
     executor = DAGExecutor()
-    result = executor.run(document=document, tasks=tasks, units=units, runner=run_task)
+    result = executor.run(document=document, tasks=tasks, units=units, runner=run_task, resume=resume_task)
 
     if layout_loaded and layout_provider is not None:
         with gpu_scheduler.claim("layout"):
@@ -1024,7 +1163,9 @@ def _run_layout_enabled_pdf_graph(
     if formula_loaded and formula_extractor is not None:
         formula_extractor.offload()
 
-    return len(result.completed_task_ids), len(result.failed_task_ids) + len(result.blocked_task_ids)
+    structured_done = [task_id for task_id in result.completed_task_ids + result.skipped_task_ids if ":structured:" in task_id]
+    structured_failed = [task_id for task_id in result.failed_task_ids + result.blocked_task_ids if ":structured:" in task_id]
+    return len(structured_done), len(structured_failed)
 
 
 

@@ -6,7 +6,6 @@ import base64
 import gc
 import io
 import json
-import sys
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -166,7 +165,7 @@ class OllamaOCRProvider:
         response.raise_for_status()
         body = response.json()
         raw_response = str(body.get("response", "")).strip()
-        parse_result = self._validator.parse_json(raw_response)
+        parse_result = self._validator.parse_json(raw_response, repair=constrained)
         if parse_result.value is None:
             raise OutputValidationError(parse_result.issues)
         typed_content = self._validator.require(parse_result.value, _validate_ocr_payload)
@@ -248,9 +247,8 @@ class SuryaOCRProvider:
             from surya.foundation import FoundationPredictor
             from surya.recognition import RecognitionPredictor
             from surya.settings import settings
-        except ImportError:
-            print("Error: surya-ocr is not installed. Run: pip install surya-ocr", file=sys.stderr)
-            sys.exit(1)
+        except ImportError as exc:
+            raise RuntimeError("surya-ocr is not installed. Run: pip install surya-ocr") from exc
 
         self._det_predictor = DetectionPredictor()
         self._foundation = FoundationPredictor(checkpoint=settings.RECOGNITION_MODEL_CHECKPOINT)
