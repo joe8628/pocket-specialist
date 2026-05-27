@@ -23,6 +23,8 @@ import torch
 from PIL import Image
 
 from pocket_specialist.core.config import EQUATION_CONF_THRESHOLD, FOOTER_STRIP_RATIO, HEADER_STRIP_RATIO, crops_dir_for, equations_dir_for, ocr_dir_for, render_dir_for
+from pocket_specialist.core.dev_checkpoints import write_development_artifact, write_development_checkpoint
+from pocket_specialist.core.progress import model_status, phase_complete, phase_error, phase_start, phase_validation, progress_bar
 from pocket_specialist.storage.checkpoint import get_status, init_db, set_status, should_process
 from pocket_specialist.core.models import BlockType, TextBlock
 
@@ -194,6 +196,8 @@ def enrich_document(
 ) -> tuple[int, int]:
     """Run Surya layout detection then Texify on equation crops. Returns (done, failed)."""
 
+    phase_start("equations", document)
+
     def _pnum(p: Path) -> int:
         return int(p.stem.split("_")[1])
 
@@ -226,21 +230,26 @@ def enrich_document(
             to_process.append(jp)
 
     if not to_process:
+        phase_complete("equations", f"all pages already processed ({skipped} done, {pre_failed} failed)")
         print(f"Equations: all pages already processed ({skipped} done).")
         return 0, pre_failed
 
+    phase_validation("equations", f"queued {len(to_process)} page(s) output={equations_dir} crops={crops_dir}")
     equations_dir.mkdir(parents=True, exist_ok=True)
     crops_dir.mkdir(parents=True, exist_ok=True)
     init_db()
 
     # ── Phase 1: Surya layout detection + reading order across all pages ─────────
+    model_status("equations-layout", "loading Surya Layout Predictor")
     print("Loading Surya Layout Predictor (GPU)...")
     layout_predictor, layout_foundation = _load_layout()
     print("Surya Layout predictor loaded.")
+    model_status("equations-layout", "loaded")
 
     layout_by_page: dict[int, list] = {}
-    for jp in to_process:
+    for layout_index, jp in enumerate(to_process, 1):
         pn = _pnum(jp)
+        progress_bar("equations-layout", layout_index, len(to_process), f"page {pn}")
         png = render_dir / f"page_{pn:04d}.png"
         if not png.exists():
             layout_by_page[pn] = []
@@ -257,19 +266,23 @@ def enrich_document(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     print("  Surya Layout predictor unloaded from GPU.")
+    model_status("equations-layout", "unloaded")
 
     # ── Phase 2: Surya LaTeX OCR on equation crops ───────────────────────────
+    model_status("equations-latex", "loading Surya LaTeX OCR")
     print("Loading Surya LaTeX OCR (GPU)...")
     latex_predictor, latex_foundation = _load_latex_ocr()
     from surya.common.surya.schema import TaskNames
     print("Surya LaTeX OCR loaded.")
+    model_status("equations-latex", "loaded")
 
     # Collect all crops across all pages first, then run one batched inference.
     page_data: list[tuple[int, dict, list[TextBlock], list[int], list[Image.Image], list[tuple[int, str]]]] = []
     all_crops: list[Image.Image] = []
 
-    for jp in to_process:
+    for crop_index, jp in enumerate(to_process, 1):
         pn = _pnum(jp)
+        progress_bar("equations-crops", crop_index, len(to_process), f"page {pn}")
         png = render_dir / f"page_{pn:04d}.png"
         raw = json.loads(jp.read_text())
         blocks = [TextBlock.from_dict(b) for b in raw["blocks"]]
@@ -289,6 +302,7 @@ def enrich_document(
                     crop = _crop_equation(page_image, block)
                     crop_path = crops_dir / f"page_{pn:04d}_eq_{len(eq_crops):02d}.png"
                     crop.save(str(crop_path))
+                    write_development_artifact(document, "equations", crop_path.name, crop_path)
                     eq_crops.append(crop)
                     eq_indices.append(idx)
 
@@ -312,11 +326,13 @@ def enrich_document(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     print("  Surya LaTeX OCR unloaded from GPU.")
+    model_status("equations-latex", "unloaded")
 
     # Write output JSONs
     done = failed = 0
     crop_offset = 0
-    for pn, raw, blocks, eq_indices, eq_crops, pending_tags in page_data:
+    for output_index, (pn, raw, blocks, eq_indices, eq_crops, pending_tags) in enumerate(page_data, 1):
+        progress_bar("equations-output", output_index, len(page_data), f"page {pn}")
         try:
             for i, idx in enumerate(eq_indices):
                 latex = latex_list[crop_offset + i]
@@ -333,6 +349,13 @@ def enrich_document(
             out_path.write_text(json.dumps(out, indent=2, ensure_ascii=False))
 
             set_status("equations", document, pn, "done", str(out_path))
+            write_development_checkpoint(
+                document,
+                "equations",
+                page=pn,
+                summary={"output": str(out_path), "equation_crops": len(eq_crops)},
+                artifacts={out_path.name: out_path},
+            )
             done += 1
             print(f"  [equations] page {pn} → {out_path.name}  ({len(eq_crops)} equations extracted)")
 

@@ -13,7 +13,9 @@ from pocket_specialist.storage.checkpoint import DAGNodeState, init_db, set_stat
 from pocket_specialist.core.cif import CanonicalIntermediateFormat, ProcessingArtifact, ProvenanceRecord, SourceCoords, StructuredBlock
 from pocket_specialist.core.config import get_settings
 from pocket_specialist.core.dag import DAGExecutor, TaskRunResult
+from pocket_specialist.core.dev_checkpoints import write_development_artifact, write_development_checkpoint
 from pocket_specialist.core.gpu import gpu_scheduler
+from pocket_specialist.core.progress import model_status, phase_complete, phase_error, phase_start, phase_validation, progress_bar
 from pocket_specialist.core.tasks import ExtractionTask, PageUnit
 from pocket_specialist.handlers.intake import (
     PDFContentType,
@@ -49,6 +51,46 @@ _REGION_TO_BLOCK_TYPE = {
 }
 
 _OCR_REGION_TYPES = {"text", "heading", "table", "code", "key_value", "list", "footer", "header", "figure"}
+
+
+def _block_type_counts(blocks: list[StructuredBlock]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for block in blocks:
+        counts[block.block_type] = counts.get(block.block_type, 0) + 1
+    return counts
+
+
+def _layout_region_counts(layout: LayoutResult) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for region in layout.regions:
+        counts[region.region_type] = counts.get(region.region_type, 0) + 1
+    return counts
+
+
+def _profile_summary(profile) -> dict[str, object]:
+    return {
+        "source_kind": profile.source_kind.value,
+        "source_path": str(profile.source_path),
+        "mime_type": profile.mime_type,
+        "page_count": profile.page_count,
+        "pdf_content_type": profile.pdf_content_type.value,
+        "text_extractable": profile.text_extractable,
+        "metadata": profile.metadata,
+    }
+
+
+def _document_checkpoint(document: str, stage: str, cif: CanonicalIntermediateFormat, document_path: Path) -> None:
+    write_development_checkpoint(
+        document,
+        stage,
+        summary={
+            "output": str(document_path),
+            "block_count": len(cif.blocks),
+            "artifact_count": len(cif.artifacts),
+            "block_types": _block_type_counts(cif.blocks),
+        },
+        artifacts={document_path.name: document_path},
+    )
 
 
 _TABLE_HEADER_SPLIT_RE = re.compile(r"\s{2,}")
@@ -477,6 +519,7 @@ def _ocr_page_blocks(
         if region.region_type == "formula":
             block_index += 1
             crop_bytes = crop_region_image(image_bytes, region.bbox)
+            write_development_artifact(document, "formula", f"page_{page_num:04d}_{region.region_id}.png", crop_bytes)
             formula_result: FormulaResult | None = None
             formula_error: str | None = None
             if settings.formula.enabled and formula_extractor is not None:
@@ -517,6 +560,7 @@ def _ocr_page_blocks(
             continue
 
         crop_bytes = crop_region_image(image_bytes, region.bbox)
+        write_development_artifact(document, "ocr", f"page_{page_num:04d}_{region.region_id}.png", crop_bytes)
         result = _extract_with_fallback(primary_provider, fallback_provider, crop_bytes, region.region_type)
         texts = [str(block["raw_text"]).strip() for block in result.typed_content["blocks"] if str(block["raw_text"]).strip()]
         if not texts and region.region_type != "figure":
@@ -730,6 +774,18 @@ def _write_layout_disabled_page(
     for artifact in _artifacts_from_blocks(page_blocks):
         cif.add_artifact(artifact)
     set_status("structured", document, page_num, "done", str(structured_path))
+    write_development_checkpoint(
+        document,
+        "structured",
+        page=page_num,
+        summary={
+            "output": str(structured_path),
+            "page_mode": page_mode,
+            "block_count": len(page_blocks),
+            "block_types": _block_type_counts(page_blocks),
+        },
+        artifacts={structured_path.name: structured_path},
+    )
 
 
 def _raw_block_bbox(raw_block: dict[str, object]) -> tuple[int, int, int, int] | None:
@@ -849,8 +905,10 @@ def _run_layout_disabled_pdf_graph(
         units[task.task_id] = unit
 
     if not tasks:
+        phase_validation("structured", "no pages require processing")
         return 0, 0
 
+    phase_validation("structured", f"queued {len(tasks)} page task(s) with layout disabled")
     cif_lock = threading.Lock()
     ocr_setup_lock = threading.Lock()
     ocr_call_lock = threading.Lock()
@@ -865,12 +923,15 @@ def _run_layout_disabled_pdf_graph(
                 primary_provider = build_primary_ocr_provider()
                 fallback_provider = build_fallback_ocr_provider()
             if not ocr_loaded:
+                model_status("ocr", f"loading primary provider {getattr(primary_provider, 'name', primary_provider.__class__.__name__)}")
                 with gpu_scheduler.claim("ocr"):
                     primary_provider.load()
                 if fallback_provider is not None and getattr(fallback_provider, "name", None) != getattr(primary_provider, "name", None):
+                    model_status("ocr", f"loading fallback provider {getattr(fallback_provider, 'name', fallback_provider.__class__.__name__)}")
                     with gpu_scheduler.claim("ocr"):
                         fallback_provider.load()
                 ocr_loaded = True
+                model_status("ocr", "providers loaded")
         primary = _LockedOCRProvider(primary_provider, ocr_call_lock)
         fallback = None
         if fallback_provider is not None:
@@ -891,9 +952,18 @@ def _run_layout_disabled_pdf_graph(
         del task
         page_num = int(unit.metadata["page"])
         page_mode = str(unit.metadata["page_mode"])
+        progress_bar("structured-render", page_num, profile.page_count, f"page {page_num} render")
         zoom = settings.rendering.zoom if page_mode == PDFContentType.DIGITAL.value else settings.rendering.scanned_pdf_zoom
         image_bytes = render_pdf_page_to_bytes(source_path, page_num, zoom=zoom)
+        write_development_checkpoint(
+            document,
+            "render",
+            page=page_num,
+            summary={"page_mode": page_mode, "zoom": zoom, "bytes": len(image_bytes)},
+            artifacts={f"page_{page_num:04d}.png": image_bytes},
+        )
         native_blocks = get_pdf_native_blocks(source_path, page_num)
+        progress_bar("structured", page_num, profile.page_count, f"page {page_num} structured")
         structured_path = structured_dir / f"page_{page_num:04d}.json"
         if native_blocks:
             page_blocks = _native_page_blocks(
@@ -916,7 +986,19 @@ def _run_layout_disabled_pdf_graph(
                 )
         else:
             primary, fallback = ensure_ocr_providers()
+            progress_bar("structured-ocr", page_num, profile.page_count, f"page {page_num} OCR")
             result = _extract_with_fallback(primary, fallback, image_bytes, "page")
+            write_development_checkpoint(
+                document,
+                "ocr",
+                page=page_num,
+                summary={
+                    "region_type": "page",
+                    "provider": result.provider,
+                    "block_count": len(result.typed_content.get("blocks", [])),
+                    "latency_ms": getattr(result, "latency_ms", None),
+                },
+            )
             page_blocks = _ocr_result_to_page_blocks(document, page_num, result)
             with cif_lock:
                 _write_layout_disabled_page(
@@ -928,15 +1010,18 @@ def _run_layout_disabled_pdf_graph(
                     page_mode=page_mode,
                     page_layout=True,
                 )
+        progress_bar("structured", page_num, profile.page_count, f"page {page_num} structured")
         return TaskRunResult(path=str(structured_path), metadata={"page_mode": page_mode, "layout_enabled": False})
 
     executor = DAGExecutor()
     result = executor.run(document=document, tasks=tasks, units=units, runner=run_task, resume=resume_task)
 
     if ocr_loaded and primary_provider is not None:
+        model_status("ocr", "offloading primary provider")
         with gpu_scheduler.claim("ocr"):
             primary_provider.offload()
         if fallback_provider is not None and fallback_provider is not primary_provider:
+            model_status("ocr", "offloading fallback provider")
             with gpu_scheduler.claim("ocr"):
                 fallback_provider.offload()
 
@@ -970,8 +1055,10 @@ def _run_layout_enabled_pdf_graph(
         units[structured_task.task_id] = structured_unit
 
     if not tasks:
+        phase_validation("structured", "no pages require processing")
         return 0, 0
 
+    phase_validation("structured", f"queued {len(tasks)} DAG task(s) for {profile.page_count} page(s)")
     state_lock = threading.Lock()
     cif_lock = threading.Lock()
     page_state: dict[int, dict[str, object]] = {}
@@ -999,9 +1086,11 @@ def _run_layout_enabled_pdf_graph(
             if layout_provider is None:
                 layout_provider = build_layout_provider()
             if not layout_loaded:
+                model_status("layout", f"loading provider {getattr(layout_provider, 'name', layout_provider.__class__.__name__)}")
                 with gpu_scheduler.claim("layout"):
                     layout_provider.load()
                 layout_loaded = True
+                model_status("layout", "provider loaded")
         return layout_provider
 
     def ensure_ocr_providers() -> tuple[OCRProvider, OCRProvider | None]:
@@ -1011,12 +1100,15 @@ def _run_layout_enabled_pdf_graph(
                 primary_provider = build_primary_ocr_provider()
                 fallback_provider = build_fallback_ocr_provider()
             if not ocr_loaded:
+                model_status("ocr", f"loading primary provider {getattr(primary_provider, 'name', primary_provider.__class__.__name__)}")
                 with gpu_scheduler.claim("ocr"):
                     primary_provider.load()
                 if fallback_provider is not None and getattr(fallback_provider, "name", None) != getattr(primary_provider, "name", None):
+                    model_status("ocr", f"loading fallback provider {getattr(fallback_provider, 'name', fallback_provider.__class__.__name__)}")
                     with gpu_scheduler.claim("ocr"):
                         fallback_provider.load()
                 ocr_loaded = True
+                model_status("ocr", "providers loaded")
         primary = _LockedOCRProvider(primary_provider, ocr_call_lock)
         fallback = None
         if fallback_provider is not None:
@@ -1034,6 +1126,7 @@ def _run_layout_enabled_pdf_graph(
                 formula_extractor = build_formula_extractor()
             if not formula_loaded and formula_extractor is not None:
                 try:
+                    model_status("formula", f"loading extractor {formula_extractor.__class__.__name__}")
                     formula_extractor.load()
                 except Exception:
                     if not settings.formula.fallback_to_ocr:
@@ -1042,6 +1135,7 @@ def _run_layout_enabled_pdf_graph(
                     formula_extractor = None
                     return None
                 formula_loaded = True
+                model_status("formula", "extractor loaded")
         if formula_extractor is None:
             return None
         return _LockedFormulaExtractor(formula_extractor, formula_call_lock)
@@ -1079,14 +1173,34 @@ def _run_layout_enabled_pdf_graph(
         page_num = int(unit.metadata["page"])
         page_mode = str(unit.metadata["page_mode"])
         if task.task_type == "layout":
+            progress_bar("layout", page_num, profile.page_count, f"page {page_num} layout")
             zoom = settings.rendering.zoom if page_mode == PDFContentType.DIGITAL.value else settings.rendering.scanned_pdf_zoom
             image_bytes = render_pdf_page_to_bytes(source_path, page_num, zoom=zoom)
+            write_development_checkpoint(
+                document,
+                "render",
+                page=page_num,
+                summary={"page_mode": page_mode, "zoom": zoom, "bytes": len(image_bytes)},
+                artifacts={f"page_{page_num:04d}.png": image_bytes},
+            )
             provider = ensure_layout_provider()
             with layout_call_lock:
                 layout_result = provider.detect(image_bytes)
             layout_result.page_id = f"page-{page_num:04d}"
             layout_path = layout_dir / f"page_{page_num:04d}.json"
             _write_layout_page(layout_result, layout_path)
+            write_development_checkpoint(
+                document,
+                "layout",
+                page=page_num,
+                summary={
+                    "output": str(layout_path),
+                    "region_count": len(layout_result.regions),
+                    "region_types": _layout_region_counts(layout_result),
+                    "layout_confidence": layout_result.layout_confidence,
+                },
+                artifacts={layout_path.name: layout_path},
+            )
             set_status("layout", document, page_num, "done", str(layout_path))
             native_blocks = get_pdf_native_blocks(source_path, page_num)
             with state_lock:
@@ -1122,6 +1236,7 @@ def _run_layout_enabled_pdf_graph(
 
         if regions:
             primary, fallback = ensure_ocr_providers()
+            progress_bar("ocr", page_num, profile.page_count, f"page {page_num} region OCR")
             formula = ensure_formula_extractor() if any(region.region_type == "formula" for region in regions) else None
             ocr_blocks = _ocr_page_blocks(
                 document,
@@ -1135,6 +1250,28 @@ def _run_layout_enabled_pdf_graph(
                 artifact_root=settings.paths.artifact_path,
                 project_root=settings.paths.project_root,
             )
+            write_development_checkpoint(
+                document,
+                "ocr",
+                page=page_num,
+                summary={
+                    "region_count": len([region for region in regions if region.region_type != "formula"]),
+                    "block_count": len([block for block in ocr_blocks if block.provenance.source_stage == "structured_extract"]),
+                    "block_types": _block_type_counts(ocr_blocks),
+                },
+            )
+            formula_region_count = len([region for region in regions if region.region_type == "formula"])
+            if formula_region_count:
+                progress_bar("formula", page_num, profile.page_count, f"page {page_num} formula regions")
+                write_development_checkpoint(
+                    document,
+                    "formula",
+                    page=page_num,
+                    summary={
+                        "region_count": formula_region_count,
+                        "formula_blocks": len([block for block in ocr_blocks if block.block_type == "FormulaBlock"]),
+                    },
+                )
             page_blocks = sorted(page_blocks + ocr_blocks, key=lambda block: (block.reading_order, block.block_id))
 
         structured_path = structured_dir / f"page_{page_num:04d}.json"
@@ -1146,21 +1283,37 @@ def _run_layout_enabled_pdf_graph(
             for artifact in _artifacts_from_blocks(page_blocks):
                 cif.add_artifact(artifact)
             set_status("structured", document, page_num, "done", str(structured_path))
+            write_development_checkpoint(
+                document,
+                "structured",
+                page=page_num,
+                summary={
+                    "output": str(structured_path),
+                    "page_mode": output_page_mode,
+                    "block_count": len(page_blocks),
+                    "block_types": _block_type_counts(page_blocks),
+                },
+                artifacts={structured_path.name: structured_path},
+            )
         return TaskRunResult(path=str(structured_path), metadata={"page_mode": output_page_mode})
 
     executor = DAGExecutor()
     result = executor.run(document=document, tasks=tasks, units=units, runner=run_task, resume=resume_task)
 
     if layout_loaded and layout_provider is not None:
+        model_status("layout", "offloading provider")
         with gpu_scheduler.claim("layout"):
             layout_provider.offload()
     if ocr_loaded and primary_provider is not None:
+        model_status("ocr", "offloading primary provider")
         with gpu_scheduler.claim("ocr"):
             primary_provider.offload()
         if fallback_provider is not None and fallback_provider is not primary_provider:
+            model_status("ocr", "offloading fallback provider")
             with gpu_scheduler.claim("ocr"):
                 fallback_provider.offload()
     if formula_loaded and formula_extractor is not None:
+        model_status("formula", "offloading extractor")
         formula_extractor.offload()
 
     structured_done = [task_id for task_id in result.completed_task_ids + result.skipped_task_ids if ":structured:" in task_id]
@@ -1208,12 +1361,31 @@ def _run_layout_detection_graph(*, source_path: Path, profile, document: str, se
         page_mode = str(unit.metadata["page_mode"])
         zoom = settings.rendering.zoom if page_mode == PDFContentType.DIGITAL.value else settings.rendering.scanned_pdf_zoom
         image_bytes = render_pdf_page_to_bytes(source_path, page_num, zoom=zoom)
+        write_development_checkpoint(
+            document,
+            "render",
+            page=page_num,
+            summary={"page_mode": page_mode, "zoom": zoom, "bytes": len(image_bytes)},
+            artifacts={f"page_{page_num:04d}.png": image_bytes},
+        )
         layout_provider = ensure_provider()
         with provider_lock:
             layout_result = layout_provider.detect(image_bytes)
         layout_result.page_id = f"page-{page_num:04d}"
         out_path = layout_dir / f"page_{page_num:04d}.json"
         _write_layout_page(layout_result, out_path)
+        write_development_checkpoint(
+            document,
+            "layout",
+            page=page_num,
+            summary={
+                "output": str(out_path),
+                "region_count": len(layout_result.regions),
+                "region_types": _layout_region_counts(layout_result),
+                "layout_confidence": layout_result.layout_confidence,
+            },
+            artifacts={out_path.name: out_path},
+        )
         set_status("layout", document, page_num, "done", str(out_path))
         with results_lock:
             results[page_num] = layout_result
@@ -1236,53 +1408,77 @@ def extract_structured_document(
 ) -> tuple[int, int, CanonicalIntermediateFormat]:
     profile = classify_document(source_path)
     document = profile.doc_id
+    phase_start("structured", f"{source_path}")
+    phase_validation("intake", f"document={document} type={profile.source_kind.value} pages={profile.page_count}")
     settings = get_settings()
     structured_dir = structured_output_dir or settings.paths.structured_dir_for(document)
     layout_dir = layout_output_dir or settings.paths.layout_dir_for(document)
     structured_dir.mkdir(parents=True, exist_ok=True)
     layout_dir.mkdir(parents=True, exist_ok=True)
     init_db()
+    write_development_checkpoint(document, "intake", summary=_profile_summary(profile))
 
     if profile.source_kind == SourceKind.HTML:
         cif = ingest_html_to_cif(source_path)
-        _write_json(structured_dir / "document.json", asdict(cif))
-        set_status("structured", document, 1, "done", str(structured_dir / "document.json"))
+        document_path = structured_dir / "document.json"
+        _write_json(document_path, asdict(cif))
+        _document_checkpoint(document, "structured", cif, document_path)
+        set_status("structured", document, 1, "done", str(document_path))
+        phase_complete("structured", f"1 done, 0 failed, blocks={len(cif.blocks)}")
         return 1, 0, cif
 
     if profile.source_kind in {SourceKind.TEXT, SourceKind.MARKDOWN}:
         cif = ingest_text_to_cif(source_path)
-        _write_json(structured_dir / "document.json", asdict(cif))
-        set_status("structured", document, 1, "done", str(structured_dir / "document.json"))
+        document_path = structured_dir / "document.json"
+        _write_json(document_path, asdict(cif))
+        _document_checkpoint(document, "structured", cif, document_path)
+        set_status("structured", document, 1, "done", str(document_path))
+        phase_complete("structured", f"1 done, 0 failed, blocks={len(cif.blocks)}")
         return 1, 0, cif
 
     if profile.source_kind in {SourceKind.CSV, SourceKind.TSV}:
         cif = ingest_tabular_to_cif(source_path)
-        _write_json(structured_dir / "document.json", asdict(cif))
-        set_status("structured", document, 1, "done", str(structured_dir / "document.json"))
+        document_path = structured_dir / "document.json"
+        _write_json(document_path, asdict(cif))
+        _document_checkpoint(document, "structured", cif, document_path)
+        set_status("structured", document, 1, "done", str(document_path))
+        phase_complete("structured", f"1 done, 0 failed, blocks={len(cif.blocks)}")
         return 1, 0, cif
 
     if profile.source_kind == SourceKind.DOCX:
         cif = ingest_docx_to_cif(source_path)
-        _write_json(structured_dir / "document.json", asdict(cif))
-        set_status("structured", document, 1, "done", str(structured_dir / "document.json"))
+        document_path = structured_dir / "document.json"
+        _write_json(document_path, asdict(cif))
+        _document_checkpoint(document, "structured", cif, document_path)
+        set_status("structured", document, 1, "done", str(document_path))
+        phase_complete("structured", f"1 done, 0 failed, blocks={len(cif.blocks)}")
         return 1, 0, cif
 
     if profile.source_kind == SourceKind.ODT:
         cif = ingest_odt_to_cif(source_path)
-        _write_json(structured_dir / "document.json", asdict(cif))
-        set_status("structured", document, 1, "done", str(structured_dir / "document.json"))
+        document_path = structured_dir / "document.json"
+        _write_json(document_path, asdict(cif))
+        _document_checkpoint(document, "structured", cif, document_path)
+        set_status("structured", document, 1, "done", str(document_path))
+        phase_complete("structured", f"1 done, 0 failed, blocks={len(cif.blocks)}")
         return 1, 0, cif
 
     if profile.source_kind == SourceKind.XLSX:
         cif = ingest_xlsx_to_cif(source_path)
-        _write_json(structured_dir / "document.json", asdict(cif))
-        set_status("structured", document, 1, "done", str(structured_dir / "document.json"))
+        document_path = structured_dir / "document.json"
+        _write_json(document_path, asdict(cif))
+        _document_checkpoint(document, "structured", cif, document_path)
+        set_status("structured", document, 1, "done", str(document_path))
+        phase_complete("structured", f"1 done, 0 failed, blocks={len(cif.blocks)}")
         return 1, 0, cif
 
     if profile.source_kind == SourceKind.EPUB:
         cif = ingest_epub_to_cif(source_path)
-        _write_json(structured_dir / "document.json", asdict(cif))
-        set_status("structured", document, 1, "done", str(structured_dir / "document.json"))
+        document_path = structured_dir / "document.json"
+        _write_json(document_path, asdict(cif))
+        _document_checkpoint(document, "structured", cif, document_path)
+        set_status("structured", document, 1, "done", str(document_path))
+        phase_complete("structured", f"1 done, 0 failed, blocks={len(cif.blocks)}")
         return 1, 0, cif
 
     if profile.source_kind == SourceKind.IMAGE:
@@ -1294,7 +1490,20 @@ def extract_structured_document(
             with gpu_scheduler.claim("ocr"):
                 fallback_provider.load()
         try:
-            result = _extract_with_fallback(primary_provider, fallback_provider, source_path.read_bytes(), "page")
+            image_bytes = source_path.read_bytes()
+            result = _extract_with_fallback(primary_provider, fallback_provider, image_bytes, "page")
+            write_development_checkpoint(
+                document,
+                "ocr",
+                page=1,
+                summary={
+                    "region_type": "page",
+                    "provider": result.provider,
+                    "block_count": len(result.typed_content.get("blocks", [])),
+                    "latency_ms": getattr(result, "latency_ms", None),
+                },
+                artifacts={source_path.name: image_bytes},
+            )
             blocks = _ocr_result_to_page_blocks(document, 1, result)
             cif = CanonicalIntermediateFormat(
                 doc_id=document,
@@ -1303,8 +1512,18 @@ def extract_structured_document(
             )
             page_path = structured_dir / "page_0001.json"
             _write_page_layout_page(document, 1, blocks, {"page_mode": profile.source_kind.value, "layout_enabled": False}, page_path)
-            _write_json(structured_dir / "document.json", asdict(cif))
+            write_development_checkpoint(
+                document,
+                "structured",
+                page=1,
+                summary={"output": str(page_path), "block_count": len(blocks), "block_types": _block_type_counts(blocks)},
+                artifacts={page_path.name: page_path},
+            )
+            document_path = structured_dir / "document.json"
+            _write_json(document_path, asdict(cif))
+            _document_checkpoint(document, "structured", cif, document_path)
             set_status("structured", document, 1, "done", str(page_path))
+            phase_complete("structured", f"1 done, 0 failed, blocks={len(cif.blocks)}")
             return 1, 0, cif
         finally:
             with gpu_scheduler.claim("ocr"):
@@ -1332,7 +1551,13 @@ def extract_structured_document(
             structured_dir=structured_dir,
             cif=cif,
         )
-        _write_json(structured_dir / "document.json", asdict(cif))
+        document_path = structured_dir / "document.json"
+        _write_json(document_path, asdict(cif))
+        _document_checkpoint(document, "structured", cif, document_path)
+        if failed:
+            phase_error("structured", f"{done} done, {failed} failed")
+        else:
+            phase_complete("structured", f"{done} done, {failed} failed, blocks={len(cif.blocks)}")
         return done, failed, cif
 
     done, failed = _run_layout_enabled_pdf_graph(
@@ -1344,7 +1569,13 @@ def extract_structured_document(
         layout_dir=layout_dir,
         cif=cif,
     )
-    _write_json(structured_dir / "document.json", asdict(cif))
+    document_path = structured_dir / "document.json"
+    _write_json(document_path, asdict(cif))
+    _document_checkpoint(document, "structured", cif, document_path)
+    if failed:
+        phase_error("structured", f"{done} done, {failed} failed")
+    else:
+        phase_complete("structured", f"{done} done, {failed} failed, blocks={len(cif.blocks)}")
     return done, failed, cif
 
 
@@ -1353,6 +1584,8 @@ def detect_layout_document(
     layout_output_dir: Path | None = None,
 ) -> tuple[int, int, dict[int, LayoutResult]]:
     profile = classify_document(source_path)
+    phase_start("layout", f"{source_path}")
+    phase_validation("layout", f"document={profile.doc_id} type={profile.source_kind.value} pages={profile.page_count}")
     if profile.source_kind != SourceKind.PDF:
         raise ValueError("Layout detection currently supports PDF sources only")
 
@@ -1369,6 +1602,10 @@ def detect_layout_document(
         settings=settings,
         layout_dir=layout_dir,
     )
+    if failed:
+        phase_error("layout", f"{done} done, {failed} failed")
+    else:
+        phase_complete("layout", f"{done} done, {failed} failed")
     return done, failed, results
 
 

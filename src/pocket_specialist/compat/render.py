@@ -8,6 +8,8 @@ from typing import cast
 import fitz  # PyMuPDF
 
 from pocket_specialist.core.config import RENDER_ZOOM, document_slug, render_dir_for
+from pocket_specialist.core.dev_checkpoints import write_development_checkpoint
+from pocket_specialist.core.progress import phase_complete, phase_error, phase_start, phase_validation, progress_bar
 from pocket_specialist.storage.checkpoint import get_status, init_db, set_status, should_process
 
 
@@ -41,6 +43,7 @@ def render_pdf(
         sys.exit(1)
 
     document = document_slug(pdf_path)
+    phase_start("render", str(pdf_path))
     output_dir = output_dir or render_dir_for(document)
     output_dir.mkdir(parents=True, exist_ok=True)
     init_db()
@@ -58,6 +61,7 @@ def render_pdf(
 
     total = len(doc)
     end = min(end_page, total) if end_page else total
+    phase_validation("render", f"document={document} pages={start_page}-{end} output={output_dir}")
 
     if start_page < 1 or start_page > total:
         print(f"Error: start_page {start_page} out of range (1–{total}).", file=sys.stderr)
@@ -66,7 +70,9 @@ def render_pdf(
 
     done = failed = skipped = 0
 
+    total_pages = end - start_page + 1
     for page_num in range(start_page, end + 1):
+        progress_bar("render", page_num - start_page + 1, total_pages, f"page {page_num}")
         if not should_process("render", document, page_num):
             status, attempts = get_status("render", document, page_num)
             if status == "done":
@@ -79,6 +85,13 @@ def render_pdf(
         try:
             out_path = render_page(doc, page_num, output_dir, zoom)
             set_status("render", document, page_num, "done", str(out_path))
+            write_development_checkpoint(
+                document,
+                "render",
+                page=page_num,
+                summary={"output": str(out_path), "zoom": zoom},
+                artifacts={out_path.name: out_path},
+            )
             done += 1
             print(f"  [render] page {page_num}/{end} → {out_path.name}")
         except Exception as exc:

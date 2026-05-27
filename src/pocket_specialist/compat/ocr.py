@@ -18,6 +18,8 @@ from PIL import Image
 
 from pocket_specialist.core.config import ocr_dir_for, render_dir_for
 from pocket_specialist.storage.checkpoint import get_status, init_db, set_status, should_process
+from pocket_specialist.core.dev_checkpoints import write_development_checkpoint
+from pocket_specialist.core.progress import model_status, phase_complete, phase_error, phase_start, phase_validation, progress_bar
 from pocket_specialist.core.gpu import gpu_scheduler
 from pocket_specialist.ocr.providers import SuryaOCRProvider
 from pocket_specialist.core.models import TextBlock
@@ -36,6 +38,7 @@ def ocr_pages(
 ) -> tuple[int, int]:
     """Run OCR on rendered PNGs for one document. Returns (done, failed)."""
 
+    phase_start("ocr", document)
     render_dir = render_dir or render_dir_for(document)
     ocr_dir = ocr_dir or ocr_dir_for(document)
 
@@ -49,6 +52,7 @@ def ocr_pages(
         pngs = [path for path in pngs if lo <= _pnum(path) <= hi]
 
     ocr_dir.mkdir(parents=True, exist_ok=True)
+    phase_validation("ocr", f"input_pages={len(pngs)} render_dir={render_dir} output={ocr_dir}")
     init_db()
 
     to_process: list[Path] = []
@@ -72,12 +76,16 @@ def ocr_pages(
     provider = SuryaOCRProvider()
     done = failed = 0
 
+    model_status("ocr", "loading provider")
     print("Loading OCR provider (GPU)...")
     with gpu_scheduler.claim("ocr"):
         provider.load()
         print(f"OCR provider loaded: {provider.name}.")
+        model_status("ocr", f"provider loaded: {provider.name}")
 
-        for png in to_process:
+        total_pages = len(to_process)
+        for index, png in enumerate(to_process, 1):
+            progress_bar("ocr", index, total_pages, f"page {_pnum(png)}")
             page_num = _pnum(png)
             try:
                 image = Image.open(png).convert("RGB")
@@ -100,6 +108,18 @@ def ocr_pages(
                 out_path.write_text(json.dumps(record, indent=2, ensure_ascii=False))
 
                 set_status("ocr", document, page_num, "done", str(out_path))
+                write_development_checkpoint(
+                    document,
+                    "ocr",
+                    page=page_num,
+                    summary={
+                        "output": str(out_path),
+                        "provider": result.provider,
+                        "block_count": len(ordered),
+                        "latency_ms": getattr(result, "latency_ms", None),
+                    },
+                    artifacts={out_path.name: out_path, png.name: png},
+                )
                 done += 1
                 print(
                     f"  [ocr] page {page_num} → {out_path.name}  "

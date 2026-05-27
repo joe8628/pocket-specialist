@@ -16,6 +16,8 @@ import requests
 
 from pocket_specialist.core.config import OLLAMA_BASE, OLLAMA_MODEL, correction_dir_for, crops_dir_for, equations_dir_for
 from pocket_specialist.storage.checkpoint import get_status, init_db, set_status, should_process
+from pocket_specialist.core.dev_checkpoints import write_development_checkpoint
+from pocket_specialist.core.progress import model_status, phase_complete, phase_error, phase_start, phase_validation, progress_bar
 from pocket_specialist.serializers.markdown import _deduplicate, _format_blocks_as_markdown, _unwrap_spurious_containers
 from pocket_specialist.core.models import BlockType, TextBlock
 
@@ -504,6 +506,7 @@ def correct_pages(
     def _pnum(p: Path) -> int:
         return int(p.stem.split("_")[1])
 
+    phase_start("correction", document)
     equations_dir = equations_dir or equations_dir_for(document)
     correction_dir = correction_dir or correction_dir_for(document)
     crops_dir = crops_dir or crops_dir_for(document)
@@ -537,6 +540,7 @@ def correct_pages(
             to_process.append(jp)
 
     if not to_process:
+        phase_validation("correction", "no pages eligible after checkpoint/crop filtering")
         parts = []
         if skipped:
             parts.append(f"{skipped} already done")
@@ -544,9 +548,13 @@ def correct_pages(
             parts.append(f"{skipped_no_crops} without equation crops")
         summary = ", ".join(parts) if parts else "0 pages eligible"
         print(f"Correction: no pages eligible ({summary}).")
+        phase_complete("correction", f"0 done, {pre_failed} failed")
         return 0, pre_failed
 
+    phase_validation("correction", f"queued {len(to_process)} page(s) model={model} output={correction_dir}")
+    model_status("correction", f"checking Ollama model {model}")
     _check_ollama(model)
+    model_status("correction", f"model available: {model}")
     correction_dir.mkdir(parents=True, exist_ok=True)
     crops_dir = crops_dir.resolve()
     init_db()
@@ -564,6 +572,13 @@ def correct_pages(
         out_path = correction_dir / f"page_{pn:04d}.md"
         out_path.write_text(markdown, encoding="utf-8")
         set_status("correction", document, pn, "done", str(out_path))
+        write_development_checkpoint(
+            document,
+            "correction",
+            page=pn,
+            summary={"output": str(out_path), "line_count": markdown.count("\n") + 1},
+            artifacts={out_path.name: out_path},
+        )
         done += 1
         lines = markdown.count("\n") + 1
         print(f"  [correction] page {pn} → {out_path.name}  ({lines} lines)")
@@ -572,11 +587,13 @@ def correct_pages(
         nonlocal failed
         set_status("correction", document, pn, "failed")
         failed += 1
+        phase_error("correction", f"page {pn}: {exc}")
         print(f"  [correction] page {pn}: FAILED — {exc}")
 
     if max_parallel == 1:
-        for jp in to_process:
+        for index, jp in enumerate(to_process, 1):
             pn = _pnum(jp)
+            progress_bar("correction", index, len(to_process), f"page {pn}")
             try:
                 result_pn, markdown = _correct_page_job(jp, model, crops_dir)
                 _commit_success(result_pn, markdown)
@@ -585,8 +602,11 @@ def correct_pages(
     else:
         with ThreadPoolExecutor(max_workers=max_parallel) as executor:
             future_to_page = {executor.submit(_correct_page_job, jp, model, crops_dir): _pnum(jp) for jp in to_process}
+            completed_pages = 0
             for future in as_completed(future_to_page):
                 pn = future_to_page[future]
+                completed_pages += 1
+                progress_bar("correction", completed_pages, len(to_process), f"page {pn}")
                 try:
                     result_pn, markdown = future.result()
                     _commit_success(result_pn, markdown)

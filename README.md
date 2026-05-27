@@ -124,6 +124,23 @@ data/pipeline.db
 
 `layout/page_*.json` contains layout regions, bounding boxes, confidence, and reading order. `structured/page_*.json` contains per-page structured blocks. `structured/document.json` contains the full CIF aggregate returned by `extract-structured`.
 
+Development-only status output is printed during ingestion phases. It includes `[START]`, `[VALIDATION]`, `[MODEL]`, `[PROGRESS]`, `[COMPLETED]`, and `[ERROR]` messages for script and model processing. Final command output now also includes `elapsed=<duration>` and `finished_at=<local ISO timestamp>` so ingestion runs can be benchmarked from the terminal log. This is implemented as temporary development instrumentation and should be removed before release with the development checkpoints.
+
+Development-only checkpoints are also written after ingestion stages. These are temporary debugging breadcrumbs intended to be removed before release, not disabled as a runtime feature:
+
+```text
+checkpoints/<doc-slug>/_dev_checkpoints/intake/document.md
+checkpoints/<doc-slug>/_dev_checkpoints/render/page_0001.md
+checkpoints/<doc-slug>/_dev_checkpoints/render/artifacts/page_0001.png
+checkpoints/<doc-slug>/_dev_checkpoints/layout/page_0001.md
+checkpoints/<doc-slug>/_dev_checkpoints/ocr/page_0001.md
+checkpoints/<doc-slug>/_dev_checkpoints/formula/page_0001.md
+checkpoints/<doc-slug>/_dev_checkpoints/structured/page_0001.md
+checkpoints/<doc-slug>/_dev_checkpoints/structured/document.md
+```
+
+Each stage folder owns its own `artifacts/` subfolder for debug copies such as page renderings, layout JSON, OCR crops, formula crops, equation crops, and structured JSON snapshots.
+
 The older compatibility pipeline writes these outputs:
 
 ```text

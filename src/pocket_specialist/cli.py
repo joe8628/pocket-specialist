@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 
 import typer
@@ -53,6 +55,22 @@ def _resume_state(document: str) -> tuple[str | None, int | None]:
         if pages:
             return stage, max(pages)
     return None, None
+
+def _format_duration(elapsed_seconds: float) -> str:
+    total_seconds = int(elapsed_seconds)
+    h, rem = divmod(total_seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m {s}s"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
+def _benchmark_stamp(started_at: float) -> str:
+    finished_at = datetime.now().isoformat(timespec="seconds")
+    return f"elapsed={_format_duration(time.monotonic() - started_at)} finished_at={finished_at}"
+
 
 
 # ── Corpus Intake ──────────────────────────────────────────────────────────────
@@ -138,10 +156,11 @@ def layout_detect(
     from pocket_specialist.core.config import layout_dir_for
     from pocket_specialist.phases.extract import detect_layout_document
 
+    started_at = time.monotonic()
     pdf_path = pdf.resolve()
     document = _doc_slug(pdf_path)
     done, failed, _ = detect_layout_document(pdf_path, layout_output_dir=output_dir or layout_dir_for(document))
-    typer.echo(f"Layout detection complete: {done} done, {failed} failed.")
+    typer.echo(f"Layout detection complete: {done} done, {failed} failed. {_benchmark_stamp(started_at)}")
     if failed:
         raise typer.Exit(1)
 
@@ -157,6 +176,7 @@ def extract_structured(
     from pocket_specialist.handlers.intake import classify_document
     from pocket_specialist.phases.extract import extract_structured_document
 
+    started_at = time.monotonic()
     source_path = source.resolve()
     profile = classify_document(source_path)
     structured_target = output_dir or structured_dir_for(profile.doc_id)
@@ -168,7 +188,8 @@ def extract_structured(
     )
     typer.echo(
         f"Structured extraction complete: {done} done, {failed} failed. "
-        f"Blocks: {len(cif.blocks)}. Output: {structured_target / 'document.json'}"
+        f"Blocks: {len(cif.blocks)}. Output: {structured_target / 'document.json'} "
+        f"{_benchmark_stamp(started_at)}"
     )
     if failed:
         raise typer.Exit(1)
@@ -217,6 +238,7 @@ def extract_structured_corpus(
         typer.echo(f"No supported files found in {root}.")
         raise typer.Exit()
 
+    started_at = time.monotonic()
     typer.echo(f"Structured corpus extraction: {len(candidates)} file(s) from {root}")
     if dry_run:
         for source_path in candidates:
@@ -252,7 +274,10 @@ def extract_structured_corpus(
             if stop_on_error:
                 raise typer.Exit(1) from exc
 
-    typer.echo(f"\nStructured corpus extraction complete: {completed} succeeded, {failed_docs} failed.")
+    typer.echo(
+        f"\nStructured corpus extraction complete: {completed} succeeded, {failed_docs} failed. "
+        f"{_benchmark_stamp(started_at)}"
+    )
     if failed_docs:
         raise typer.Exit(1)
 
@@ -356,8 +381,6 @@ def _run_pipeline(
     parallel_pages: int = 1,
 ) -> None:
     """Run the current compatibility pipeline for a single PDF."""
-    import time
-
     from pocket_specialist.core.config import correction_dir_for, crops_dir_for, equations_dir_for, ocr_dir_for, output_dir_for, render_dir_for
     from pocket_specialist.serializers.markdown import assemble_document
     from pocket_specialist.compat.export import correct_pages
@@ -417,11 +440,7 @@ def _run_pipeline(
         equations_dir=equations_dir,
     )
 
-    elapsed = time.monotonic() - t0
-    h, rem = divmod(int(elapsed), 3600)
-    m, s = divmod(rem, 60)
-    duration = f"{h}h {m}m {s}s" if h else f"{m}m {s}s" if m else f"{s}s"
-    typer.echo(f"\nTotal time: {duration}  ({pdf_path.name})")
+    typer.echo(f"\nTotal time: {_benchmark_stamp(t0)}  ({pdf_path.name})")
 
 
 @app.command()
@@ -483,6 +502,7 @@ def run_all(
         typer.echo(f"No PDFs found in {target}.", err=True)
         raise typer.Exit(1)
 
+    run_all_started_at = time.monotonic()
     typer.echo(f"=== Corpus intake: normalize filenames ({len(pdfs)} files) ===")
     rename_corpus(target, manifest_path=CHECKPOINT_DIR / "rename_manifest.json")
     pdfs = sorted(p for p in target.glob("*.pdf") if p.exists())
@@ -503,7 +523,7 @@ def run_all(
             parallel_pages=parallel_pages,
         )
 
-    typer.echo(f"\nDone. Processed {len(pdfs)} PDFs.")
+    typer.echo(f"\nDone. Processed {len(pdfs)} PDFs. {_benchmark_stamp(run_all_started_at)}")
 
 
 # ── Status + Reset ────────────────────────────────────────────────────────────

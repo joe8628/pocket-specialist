@@ -107,6 +107,46 @@ Validation performed:
 - `PYTHONPATH=src .venv/bin/python -m pocket_specialist.cli extract-structured-corpus --enabled --dry-run --limit 1` confirmed the corpus scanner finds the repo-root PDF instead of looking under `src/`.
 - `PYTHONPATH=src .venv/bin/python -m pytest tests/test_phase_a_foundation.py::test_pipeline_settings_from_env_uses_project_root tests/test_phase_a_foundation.py::test_pipeline_settings_default_root_is_repo_root -q` passed with `2 passed`.
 
+
+## fix/review1 - development ingestion checkpoints
+
+This update added temporary development checkpoints for stage-level ingestion debugging. These checkpoints are intentionally filesystem breadcrumbs that should be removed before release rather than converted into a permanent disabled feature flag.
+
+Key decisions:
+
+- Added `src/pocket_specialist/core/dev_checkpoints.py` as the development-only writer for markdown summaries and stage-scoped debug artifacts.
+- Wrote checkpoints under `checkpoints/<doc>/_dev_checkpoints/<stage>/` so they are isolated from release checkpoint state and from normal structured outputs.
+- Added an `artifacts/` subfolder inside each stage directory. Page renderings, layout JSON snapshots, OCR crops, formula crops, equation crops, structured page JSON, and document CIF snapshots can be copied there for inspection.
+- Wired checkpoints into the active `extract-structured` pipeline after intake, render, layout, OCR, formula, and structured stages.
+- Wired the same checkpoint writer into compatibility render/OCR/equations/correction stages so legacy debugging artifacts use the same directory convention.
+
+Validation performed:
+
+- `.venv/bin/python -m py_compile src/pocket_specialist/core/dev_checkpoints.py src/pocket_specialist/phases/extract.py src/pocket_specialist/compat/render.py src/pocket_specialist/compat/ocr.py src/pocket_specialist/compat/enrichment.py src/pocket_specialist/compat/export.py` passed.
+- `PYTHONPATH=src .venv/bin/python -m pytest tests/test_phase_a_foundation.py tests/test_phase_b_foundation.py -q` passed with `23 passed`.
+
+Follow-up implications:
+
+- These files are intentionally noisy and development-only. Remove `core/dev_checkpoints.py` and the call sites before release instead of adding a runtime off switch.
+
+
+## fix/review1 - development phase progress and validation output
+
+This update added temporary status output for ingestion debugging. Like the development checkpoint writer, this is intended to be removed before release rather than hidden behind a permanent runtime flag.
+
+Key decisions:
+
+- Added `src/pocket_specialist/core/progress.py` with simple `[START]`, `[VALIDATION]`, `[MODEL]`, `[PROGRESS]`, `[COMPLETED]`, and `[ERROR]` messages.
+- Instrumented the active `extract-structured` path so intake, render, layout, OCR, formula, and structured stages report progress and terminal status.
+- Instrumented compatibility render/OCR/equations/correction stages with the same status convention so all currently exposed ingestion paths provide visible progress.
+- Kept the implementation dependency-free and intentionally simple so the whole layer can be removed cleanly before release.
+
+Validation performed:
+
+- `.venv/bin/python -m py_compile src/pocket_specialist/core/progress.py src/pocket_specialist/core/dev_checkpoints.py src/pocket_specialist/phases/extract.py src/pocket_specialist/compat/render.py src/pocket_specialist/compat/ocr.py src/pocket_specialist/compat/enrichment.py src/pocket_specialist/compat/export.py` passed.
+- `PYTHONPATH=src .venv/bin/python -m pytest tests/test_phase_b_foundation.py tests/test_phase_c_formula.py -q` passed with `30 passed, 1 warning`.
+- The broader Phase A-C run surfaced an existing GPU file-lock timeout test failure in `test_gpu_scheduler_claim_times_out_when_lock_is_held`; extraction-focused tests are clean.
+
 ## dffa67f - Refactor pipeline toward Phase A foundation
 
 This commit started the transition from the old Markdown-first, stage-specific OCR pipeline toward the v0.5.0 beta document-intelligence concept. The goal was not to rewrite every feature, but to establish the foundation layer required by the new spec while preserving enough compatibility to keep the existing pipeline runnable.
@@ -517,3 +557,9 @@ Section 4 DAG resume and provider hardening follow-up:
 - Test work was done under the repository `.venv` after an initial mistake using system `python3`, which hid available pytest dependencies. Focused coverage was added for stale DAG artifacts, rejected resume hooks, skipped layout rehydration, PP-DocLayout reading order, provider import errors, and Ollama OCR constrained retry after repairable malformed JSON.
 - Existing tests also exposed two stale assumptions caused by moving PDF extraction onto the DAG executor. GPU claim ordering is no longer a stable contract because layout offload can happen after OCR work while the graph owns provider lifecycle, so that assertion now checks required claim counts. A figure artifact assertion was also moved inside its temporary directory lifetime so it validates the actual artifact before cleanup removes it.
 - Verification run with `.venv/bin/python`: `python -m py_compile src/pocket_specialist/core/dag.py src/pocket_specialist/phases/extract.py tests/test_phase_a_foundation.py tests/test_phase_c_formula.py` passed; focused pytest `tests/test_phase_a_foundation.py tests/test_phase_c_formula.py -q` passed with `34 passed`; full pytest initially reported one timing-sensitive GPU lock timeout but the failing test passed on immediate isolated rerun.
+
+Development benchmark timing follow-up:
+
+- Added benchmark-friendly final completion stamps to ingestion-facing CLI commands. `layout`, `extract-structured`, `extract-structured-corpus`, single-document `run`, and corpus `run-all` now report both elapsed wall-clock duration and a concrete local `finished_at` timestamp in their final output.
+- Kept the formatter shared inside `cli.py` so the benchmark output shape stays consistent across single-file and batch commands while remaining easy to remove with the rest of the development-only instrumentation before release.
+- Updated README development instrumentation notes to mention the final `elapsed=` and `finished_at=` fields.
