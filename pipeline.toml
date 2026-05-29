@@ -1,22 +1,32 @@
 [pipeline]
 version = "0.5.1-beta"
 
+[rendering]
+zoom = 2.0
+scanned_pdf_zoom = 4.1666666667
+max_dpi = 300
+
 [ocr]
 provider = "glm-ocr"
 fallback_provider = "deepseek-ocr"
 ollama_base_url = "http://localhost:11434"
 timeout_seconds = 60
 batch_size = 4
+page_fallback_region_threshold = 12
+max_parallel_requests = 1
+skip_residual_text_regions_for_native_pdf = true
 
 [layout]
-provider = "pp-doclayout-v3"
+provider = "surya-layout-service"
 enabled = true
+base_url = "http://localhost:8002"
 
 [formula]
 enabled = true
 base_url = "http://localhost:8001"
 model_size = "base"
 fallback_to_ocr = true
+defer = false
 
 [embedding]
 provider = "nomic-embed-text"

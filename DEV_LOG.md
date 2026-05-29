@@ -147,6 +147,52 @@ Validation performed:
 - `PYTHONPATH=src .venv/bin/python -m pytest tests/test_phase_b_foundation.py tests/test_phase_c_formula.py -q` passed with `30 passed, 1 warning`.
 - The broader Phase A-C run surfaced an existing GPU file-lock timeout test failure in `test_gpu_scheduler_claim_times_out_when_lock_is_held`; extraction-focused tests are clean.
 
+## fix/review1 - Surya layout service isolation
+
+This update removes the in-process Surya layout adapter as the primary Surya path and replaces it with an isolated HTTP microservice.
+
+Key decisions:
+
+- Replaced the main-runtime `SuryaLayoutProvider` with `SuryaLayoutServiceProvider` in `src/pocket_specialist/layout/providers.py`.
+- Added `src/pocket_specialist/layout/service.py` as the isolated Surya layout server with `POST /load`, `POST /detect`, `POST /offload`, and `GET /health`.
+- Added a dedicated service dependency file at `services/surya_layout_service/requirements.txt` so Surya can pin its own compatible `transformers` version independently of the main pipeline runtime.
+- Added `layout.base_url` to typed config and environment loading, with `http://localhost:8002` as the default service endpoint.
+- Added `pocket-specialist serve-surya-layout` so the service can be started through the repo CLI instead of remembering the module path.
+- Kept `pp-doclayout-v3` fully in-process and Transformers-backed; only the Surya layout path was isolated.
+
+Validation performed:
+
+- `.venv/bin/python -m py_compile src/pocket_specialist/layout/providers.py src/pocket_specialist/layout/service.py src/pocket_specialist/core/config.py src/pocket_specialist/cli.py src/pocket_specialist/phases/extract.py` passed.
+- `PYTHONPATH=src .venv/bin/python - <<'PY' ... build_layout_provider(...) ... PY` confirmed provider alias resolution for `pp-doclayout-v3`, `surya-layout-service`, `surya-layout`, and `surya`.
+
+Important nuance:
+
+- This change isolates Surya dependency compatibility from the main runtime, but it does not by itself prove the Surya layout model quality on your documents. The service wiring is in place; comparative provider evaluation still has to happen against real pages.
+
+
+## fix/review1 - render DPI cap and phase validation
+
+This update makes render resolution explicit in DPI terms and adds a configurable upper bound for rendered page images.
+
+Key decisions:
+
+- Kept existing zoom-based internals for PyMuPDF rendering but moved the public control surface to a proper DPI path.
+- Added `rendering.max_dpi` to typed config and `pipeline.toml` so page rasterization can be capped consistently across CLI runs and pipeline stages.
+- Added config helpers to convert between zoom and DPI and to clamp requested render DPI before rasterization.
+- Updated `pocket-specialist render` to accept `--dpi`, while preserving `--zoom` as a lower-level override path.
+- Updated render-phase validation/checkpoint metadata to record the effective DPI, not just the raw zoom factor.
+
+Validation performed:
+
+- `.venv/bin/python -m py_compile src/pocket_specialist/core/config.py src/pocket_specialist/handlers/intake.py src/pocket_specialist/compat/render.py src/pocket_specialist/cli.py` passed.
+- Rendered page 1 of `RAG-corpus/unknown_2018_mpphys-many-particle-simulation-package.pdf` at `192` DPI and confirmed output size `1588 x 2246`, consistent with the source page dimensions.
+- Re-ran render with `PIPELINE_RENDER_MAX_DPI=192` and requested `--dpi 300`; validation output confirmed the effective render DPI was clamped to `192`.
+
+Follow-up implication:
+
+- Render checkpoint state is keyed by document slug rather than output directory. Re-render validation on the same document may require a reset or a copied filename if you want a fresh render pass without touching existing checkpoints.
+
+
 ## dffa67f - Refactor pipeline toward Phase A foundation
 
 This commit started the transition from the old Markdown-first, stage-specific OCR pipeline toward the v0.5.0 beta document-intelligence concept. The goal was not to rewrite every feature, but to establish the foundation layer required by the new spec while preserving enough compatibility to keep the existing pipeline runnable.
@@ -563,3 +609,19 @@ Development benchmark timing follow-up:
 - Added benchmark-friendly final completion stamps to ingestion-facing CLI commands. `layout`, `extract-structured`, `extract-structured-corpus`, single-document `run`, and corpus `run-all` now report both elapsed wall-clock duration and a concrete local `finished_at` timestamp in their final output.
 - Kept the formatter shared inside `cli.py` so the benchmark output shape stays consistent across single-file and batch commands while remaining easy to remove with the rest of the development-only instrumentation before release.
 - Updated README development instrumentation notes to mention the final `elapsed=` and `finished_at=` fields.
+
+Development page and region timing follow-up:
+
+- Added explicit `[PAGE START]` and `[PAGE COMPLETE]` timing messages around layout, structured, and OCR page stages in the active PDF extraction paths.
+- Added `[REGION START]` and `[REGION COMPLETE]` timing messages inside layout-guided OCR/formula region processing so a long page shows which detected region is currently consuming time.
+- Updated README development instrumentation notes to document the page/region timing messages.
+- Validation performed: `.venv/bin/python -m py_compile src/pocket_specialist/core/progress.py src/pocket_specialist/phases/extract.py` passed.
+
+OCR throughput tuning follow-up:
+
+- Added OCR speed controls to runtime configuration: `ocr.page_fallback_region_threshold`, `ocr.max_parallel_requests`, `ocr.skip_residual_text_regions_for_native_pdf`, and `formula.defer`.
+- Layout-guided digital PDF extraction now skips unmatched residual native-text-like regions by default, keeping OCR focused on table, figure, formula, code, and key-value residual regions.
+- Scanned/no-native pages with many OCR/formula regions can now use page-level OCR fallback instead of per-region Ollama calls when the configurable threshold is reached.
+- OCR calls are now gated by `ocr.max_parallel_requests`; setting it above 1 also bypasses the cross-process GPU file lock for OCR only, while layout/formula remain serialized.
+- Formula extraction can now be deferred with `formula.defer=true`, and disabled/deferred formula regions no longer trigger symbolic OCR fallback.
+- Fallback OCR provider loading is now lazy in the active extraction paths: the fallback provider is built and loaded only when primary OCR extraction fails.

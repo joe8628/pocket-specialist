@@ -15,7 +15,7 @@ from pocket_specialist.core.config import get_settings
 from pocket_specialist.core.dag import DAGExecutor, TaskRunResult
 from pocket_specialist.core.dev_checkpoints import write_development_artifact, write_development_checkpoint
 from pocket_specialist.core.gpu import gpu_scheduler
-from pocket_specialist.core.progress import model_status, phase_complete, phase_error, phase_start, phase_validation, progress_bar
+from pocket_specialist.core.progress import model_status, page_stage_complete, page_stage_start, phase_complete, phase_error, phase_start, phase_validation, progress_bar, region_stage_complete, region_stage_start, start_timer
 from pocket_specialist.core.tasks import ExtractionTask, PageUnit
 from pocket_specialist.handlers.intake import (
     PDFContentType,
@@ -51,6 +51,21 @@ _REGION_TO_BLOCK_TYPE = {
 }
 
 _OCR_REGION_TYPES = {"text", "heading", "table", "code", "key_value", "list", "footer", "header", "figure"}
+_DIGITAL_NATIVE_RESIDUAL_OCR_TYPES = {"table", "figure", "formula", "code", "key_value"}
+
+
+def _should_use_page_level_ocr(settings, regions: list[LayoutRegion]) -> bool:
+    threshold = int(getattr(settings.ocr, "page_fallback_region_threshold", 0) or 0)
+    if threshold <= 0:
+        return False
+    ocr_region_count = len([region for region in regions if region.region_type in _OCR_REGION_TYPES or region.region_type == "formula"])
+    return ocr_region_count >= threshold
+
+
+def _filter_native_pdf_residual_regions(settings, regions: list[LayoutRegion]) -> list[LayoutRegion]:
+    if not getattr(settings.ocr, "skip_residual_text_regions_for_native_pdf", True):
+        return regions
+    return [region for region in regions if region.region_type in _DIGITAL_NATIVE_RESIDUAL_OCR_TYPES]
 
 
 def _block_type_counts(blocks: list[StructuredBlock]) -> dict[str, int]:
@@ -65,6 +80,14 @@ def _layout_region_counts(layout: LayoutResult) -> dict[str, int]:
     for region in layout.regions:
         counts[region.region_type] = counts.get(region.region_type, 0) + 1
     return counts
+
+
+def _layout_checkpoint_artifacts(layout_path: Path, image_bytes: bytes, layout_result: LayoutResult, provider_name: str) -> dict[str, object]:
+    provider_slug = provider_name.strip().lower().replace(" ", "-").replace("_", "-")
+    artifacts: dict[str, object] = {f"{layout_path.stem}_{provider_slug}.json": layout_path}
+    for region in layout_result.regions:
+        artifacts[f"{layout_path.stem}_{provider_slug}_{region.region_id}_{region.region_type}.png"] = crop_region_image(image_bytes, region.bbox)
+    return artifacts
 
 
 def _profile_summary(profile) -> dict[str, object]:
@@ -514,15 +537,28 @@ def _ocr_page_blocks(
     blocks: list[StructuredBlock] = []
     block_index = 0
     settings = get_settings()
-    for region in sorted(regions or layout.regions, key=lambda item: item.reading_order):
+    ordered_regions = sorted(regions or layout.regions, key=lambda item: item.reading_order)
+    ocr_total = len([region for region in ordered_regions if region.region_type in _OCR_REGION_TYPES])
+    formula_total = len([region for region in ordered_regions if region.region_type == "formula"])
+    ocr_current = 0
+    formula_current = 0
+    for region in ordered_regions:
         block_type = _layout_region_to_block_type(region.region_type)
         if region.region_type == "formula":
+            formula_current += 1
+            region_started_at = start_timer()
+            region_stage_start(page_num, "formula", formula_current, formula_total, region.region_id, region.region_type)
             block_index += 1
             crop_bytes = crop_region_image(image_bytes, region.bbox)
             write_development_artifact(document, "formula", f"page_{page_num:04d}_{region.region_id}.png", crop_bytes)
             formula_result: FormulaResult | None = None
             formula_error: str | None = None
-            if settings.formula.enabled and formula_extractor is not None:
+            formula_deferred = getattr(settings.formula, "defer", False)
+            if not settings.formula.enabled:
+                formula_error = "formula extraction disabled"
+            elif formula_deferred:
+                formula_error = "formula extraction deferred"
+            elif formula_extractor is not None:
                 try:
                     formula_result = formula_extractor.extract(crop_bytes)
                 except Exception as exc:
@@ -530,7 +566,12 @@ def _ocr_page_blocks(
                     if not settings.formula.fallback_to_ocr:
                         raise
 
-            raw_formula_text = "" if formula_result is not None else _extract_formula_symbolic_fallback(primary_provider, fallback_provider, crop_bytes)
+            if formula_result is not None:
+                raw_formula_text = ""
+            elif settings.formula.enabled and not formula_deferred and settings.formula.fallback_to_ocr:
+                raw_formula_text = _extract_formula_symbolic_fallback(primary_provider, fallback_provider, crop_bytes)
+            else:
+                raw_formula_text = ""
             content = _formula_contract(formula_result) if formula_result is not None else _formula_fallback_contract(raw_formula_text, inline=False)
             blocks.append(
                 StructuredBlock(
@@ -555,15 +596,20 @@ def _ocr_page_blocks(
                     ),
                 )
             )
+            region_stage_complete(page_num, "formula", formula_current, formula_total, region.region_id, region.region_type, region_started_at)
             continue
         if region.region_type not in _OCR_REGION_TYPES:
             continue
 
+        ocr_current += 1
+        region_started_at = start_timer()
+        region_stage_start(page_num, "ocr", ocr_current, ocr_total, region.region_id, region.region_type)
         crop_bytes = crop_region_image(image_bytes, region.bbox)
         write_development_artifact(document, "ocr", f"page_{page_num:04d}_{region.region_id}.png", crop_bytes)
         result = _extract_with_fallback(primary_provider, fallback_provider, crop_bytes, region.region_type)
         texts = [str(block["raw_text"]).strip() for block in result.typed_content["blocks"] if str(block["raw_text"]).strip()]
         if not texts and region.region_type != "figure":
+            region_stage_complete(page_num, "ocr", ocr_current, ocr_total, region.region_id, region.region_type, region_started_at)
             continue
         block_index += 1
         block_id = f"{document}-page-{page_num:04d}-ocr-{block_index:04d}"
@@ -613,6 +659,7 @@ def _ocr_page_blocks(
                     provider=result.provider,
                 )
             )
+        region_stage_complete(page_num, "ocr", ocr_current, ocr_total, region.region_id, region.region_type, region_started_at)
     return blocks
 
 
@@ -844,15 +891,26 @@ def _ocr_result_to_page_blocks(document: str, page_num: int, result: OCRResult) 
 
 
 class _LockedOCRProvider:
-    def __init__(self, provider: OCRProvider | None, lock: threading.Lock) -> None:
+    def __init__(self, provider: OCRProvider | None, gate) -> None:
         self._provider = provider
-        self._lock = lock
+        self._gate = gate
 
     def extract(self, image_bytes: bytes, region_type: str):
         if self._provider is None:
             raise RuntimeError("OCR provider is not available")
-        with self._lock:
+        with self._gate:
             return self._provider.extract(image_bytes, region_type)
+
+
+class _LazyFallbackOCRProvider:
+    def __init__(self, get_provider) -> None:
+        self._get_provider = get_provider
+
+    def extract(self, image_bytes: bytes, region_type: str):
+        provider = self._get_provider()
+        if provider is None:
+            raise RuntimeError("Fallback OCR provider is not available")
+        return provider.extract(image_bytes, region_type)
 
 
 class _LockedFormulaExtractor:
@@ -911,32 +969,41 @@ def _run_layout_disabled_pdf_graph(
     phase_validation("structured", f"queued {len(tasks)} page task(s) with layout disabled")
     cif_lock = threading.Lock()
     ocr_setup_lock = threading.Lock()
-    ocr_call_lock = threading.Lock()
+    ocr_call_gate = threading.BoundedSemaphore(max(1, settings.ocr.max_parallel_requests))
     primary_provider: OCRProvider | None = None
     fallback_provider: OCRProvider | None = None
     ocr_loaded = False
+    fallback_loaded = False
+
+    def ensure_fallback_provider() -> OCRProvider | None:
+        nonlocal fallback_provider, fallback_loaded
+        with ocr_setup_lock:
+            if fallback_provider is None:
+                fallback_provider = build_fallback_ocr_provider()
+            if fallback_provider is None:
+                return None
+            if primary_provider is not None and getattr(fallback_provider, "name", None) == getattr(primary_provider, "name", None):
+                return _LockedOCRProvider(primary_provider, ocr_call_gate)
+            if not fallback_loaded:
+                model_status("ocr", f"loading fallback provider {getattr(fallback_provider, 'name', fallback_provider.__class__.__name__)}")
+                with gpu_scheduler.claim("ocr"):
+                    fallback_provider.load()
+                fallback_loaded = True
+                model_status("ocr", "fallback provider loaded")
+        return _LockedOCRProvider(fallback_provider, ocr_call_gate)
 
     def ensure_ocr_providers() -> tuple[OCRProvider, OCRProvider | None]:
-        nonlocal primary_provider, fallback_provider, ocr_loaded
+        nonlocal primary_provider, ocr_loaded
         with ocr_setup_lock:
             if primary_provider is None:
                 primary_provider = build_primary_ocr_provider()
-                fallback_provider = build_fallback_ocr_provider()
             if not ocr_loaded:
                 model_status("ocr", f"loading primary provider {getattr(primary_provider, 'name', primary_provider.__class__.__name__)}")
                 with gpu_scheduler.claim("ocr"):
                     primary_provider.load()
-                if fallback_provider is not None and getattr(fallback_provider, "name", None) != getattr(primary_provider, "name", None):
-                    model_status("ocr", f"loading fallback provider {getattr(fallback_provider, 'name', fallback_provider.__class__.__name__)}")
-                    with gpu_scheduler.claim("ocr"):
-                        fallback_provider.load()
                 ocr_loaded = True
-                model_status("ocr", "providers loaded")
-        primary = _LockedOCRProvider(primary_provider, ocr_call_lock)
-        fallback = None
-        if fallback_provider is not None:
-            fallback = _LockedOCRProvider(fallback_provider, ocr_call_lock)
-        return primary, fallback
+                model_status("ocr", "primary provider loaded")
+        return _LockedOCRProvider(primary_provider, ocr_call_gate), _LazyFallbackOCRProvider(ensure_fallback_provider)
 
     def resume_task(task: ExtractionTask, unit: PageUnit, checkpoint: DAGNodeState) -> bool:
         del task
@@ -952,6 +1019,8 @@ def _run_layout_disabled_pdf_graph(
         del task
         page_num = int(unit.metadata["page"])
         page_mode = str(unit.metadata["page_mode"])
+        page_started_at = start_timer()
+        page_stage_start(page_num, "structured", f"layout=disabled mode={page_mode}")
         progress_bar("structured-render", page_num, profile.page_count, f"page {page_num} render")
         zoom = settings.rendering.zoom if page_mode == PDFContentType.DIGITAL.value else settings.rendering.scanned_pdf_zoom
         image_bytes = render_pdf_page_to_bytes(source_path, page_num, zoom=zoom)
@@ -986,8 +1055,11 @@ def _run_layout_disabled_pdf_graph(
                 )
         else:
             primary, fallback = ensure_ocr_providers()
+            ocr_started_at = start_timer()
+            page_stage_start(page_num, "OCR", "full page")
             progress_bar("structured-ocr", page_num, profile.page_count, f"page {page_num} OCR")
             result = _extract_with_fallback(primary, fallback, image_bytes, "page")
+            page_stage_complete(page_num, "OCR", ocr_started_at, f"blocks={len(result.typed_content.get('blocks', []))}")
             write_development_checkpoint(
                 document,
                 "ocr",
@@ -1011,6 +1083,7 @@ def _run_layout_disabled_pdf_graph(
                     page_layout=True,
                 )
         progress_bar("structured", page_num, profile.page_count, f"page {page_num} structured")
+        page_stage_complete(page_num, "structured", page_started_at, f"blocks={len(page_blocks)}")
         return TaskRunResult(path=str(structured_path), metadata={"page_mode": page_mode, "layout_enabled": False})
 
     executor = DAGExecutor()
@@ -1020,7 +1093,7 @@ def _run_layout_disabled_pdf_graph(
         model_status("ocr", "offloading primary provider")
         with gpu_scheduler.claim("ocr"):
             primary_provider.offload()
-        if fallback_provider is not None and fallback_provider is not primary_provider:
+        if fallback_loaded and fallback_provider is not None and fallback_provider is not primary_provider:
             model_status("ocr", "offloading fallback provider")
             with gpu_scheduler.claim("ocr"):
                 fallback_provider.offload()
@@ -1069,10 +1142,11 @@ def _run_layout_enabled_pdf_graph(
     layout_loaded = False
 
     ocr_setup_lock = threading.Lock()
-    ocr_call_lock = threading.Lock()
+    ocr_call_gate = threading.BoundedSemaphore(max(1, settings.ocr.max_parallel_requests))
     primary_provider: OCRProvider | None = None
     fallback_provider: OCRProvider | None = None
     ocr_loaded = False
+    fallback_loaded = False
 
     formula_setup_lock = threading.Lock()
     formula_call_lock = threading.Lock()
@@ -1093,31 +1167,39 @@ def _run_layout_enabled_pdf_graph(
                 model_status("layout", "provider loaded")
         return layout_provider
 
+    def ensure_fallback_provider() -> OCRProvider | None:
+        nonlocal fallback_provider, fallback_loaded
+        with ocr_setup_lock:
+            if fallback_provider is None:
+                fallback_provider = build_fallback_ocr_provider()
+            if fallback_provider is None:
+                return None
+            if primary_provider is not None and getattr(fallback_provider, "name", None) == getattr(primary_provider, "name", None):
+                return _LockedOCRProvider(primary_provider, ocr_call_gate)
+            if not fallback_loaded:
+                model_status("ocr", f"loading fallback provider {getattr(fallback_provider, 'name', fallback_provider.__class__.__name__)}")
+                with gpu_scheduler.claim("ocr"):
+                    fallback_provider.load()
+                fallback_loaded = True
+                model_status("ocr", "fallback provider loaded")
+        return _LockedOCRProvider(fallback_provider, ocr_call_gate)
+
     def ensure_ocr_providers() -> tuple[OCRProvider, OCRProvider | None]:
-        nonlocal primary_provider, fallback_provider, ocr_loaded
+        nonlocal primary_provider, ocr_loaded
         with ocr_setup_lock:
             if primary_provider is None:
                 primary_provider = build_primary_ocr_provider()
-                fallback_provider = build_fallback_ocr_provider()
             if not ocr_loaded:
                 model_status("ocr", f"loading primary provider {getattr(primary_provider, 'name', primary_provider.__class__.__name__)}")
                 with gpu_scheduler.claim("ocr"):
                     primary_provider.load()
-                if fallback_provider is not None and getattr(fallback_provider, "name", None) != getattr(primary_provider, "name", None):
-                    model_status("ocr", f"loading fallback provider {getattr(fallback_provider, 'name', fallback_provider.__class__.__name__)}")
-                    with gpu_scheduler.claim("ocr"):
-                        fallback_provider.load()
                 ocr_loaded = True
-                model_status("ocr", "providers loaded")
-        primary = _LockedOCRProvider(primary_provider, ocr_call_lock)
-        fallback = None
-        if fallback_provider is not None:
-            fallback = _LockedOCRProvider(fallback_provider, ocr_call_lock)
-        return primary, fallback
+                model_status("ocr", "primary provider loaded")
+        return _LockedOCRProvider(primary_provider, ocr_call_gate), _LazyFallbackOCRProvider(ensure_fallback_provider)
 
     def ensure_formula_extractor() -> FormulaExtractor | None:
         nonlocal formula_extractor, formula_loaded, formula_disabled
-        if not settings.formula.enabled or formula_disabled:
+        if not settings.formula.enabled or getattr(settings.formula, "defer", False) or formula_disabled:
             return None
         with formula_setup_lock:
             if formula_disabled:
@@ -1173,6 +1255,8 @@ def _run_layout_enabled_pdf_graph(
         page_num = int(unit.metadata["page"])
         page_mode = str(unit.metadata["page_mode"])
         if task.task_type == "layout":
+            page_started_at = start_timer()
+            page_stage_start(page_num, "layout", f"mode={page_mode}")
             progress_bar("layout", page_num, profile.page_count, f"page {page_num} layout")
             zoom = settings.rendering.zoom if page_mode == PDFContentType.DIGITAL.value else settings.rendering.scanned_pdf_zoom
             image_bytes = render_pdf_page_to_bytes(source_path, page_num, zoom=zoom)
@@ -1195,11 +1279,12 @@ def _run_layout_enabled_pdf_graph(
                 page=page_num,
                 summary={
                     "output": str(layout_path),
+                    "provider": getattr(provider, "name", provider.__class__.__name__),
                     "region_count": len(layout_result.regions),
                     "region_types": _layout_region_counts(layout_result),
                     "layout_confidence": layout_result.layout_confidence,
                 },
-                artifacts={layout_path.name: layout_path},
+                artifacts=_layout_checkpoint_artifacts(layout_path, image_bytes, layout_result, getattr(provider, "name", provider.__class__.__name__)),
             )
             set_status("layout", document, page_num, "done", str(layout_path))
             native_blocks = get_pdf_native_blocks(source_path, page_num)
@@ -1210,8 +1295,11 @@ def _run_layout_enabled_pdf_graph(
                     "native_blocks": native_blocks,
                     "page_mode": page_mode,
                 }
+            page_stage_complete(page_num, "layout", page_started_at, f"regions={len(layout_result.regions)}")
             return TaskRunResult(path=str(layout_path), metadata={"page_mode": page_mode})
 
+        page_started_at = start_timer()
+        page_stage_start(page_num, "structured", f"mode={page_mode}")
         with state_lock:
             state = dict(page_state[page_num])
         image_bytes = state["image_bytes"]
@@ -1230,26 +1318,42 @@ def _run_layout_enabled_pdf_graph(
             )
             matched_region_ids = _matched_layout_region_ids(native_blocks, layout_result)
             regions = [region for region in layout_result.regions if region.region_id not in matched_region_ids]
+            if page_mode == PDFContentType.DIGITAL.value:
+                skipped_count = len(regions)
+                regions = _filter_native_pdf_residual_regions(settings, regions)
+                skipped_count -= len(regions)
+                if skipped_count:
+                    phase_validation("ocr", f"page {page_num}: skipped {skipped_count} residual native-text region(s)")
         else:
             page_blocks = []
             regions = list(layout_result.regions)
 
         if regions:
             primary, fallback = ensure_ocr_providers()
-            progress_bar("ocr", page_num, profile.page_count, f"page {page_num} region OCR")
-            formula = ensure_formula_extractor() if any(region.region_type == "formula" for region in regions) else None
-            ocr_blocks = _ocr_page_blocks(
-                document,
-                page_num,
-                image_bytes,
-                layout_result,
-                primary,
-                fallback,
-                formula,
-                regions=regions,
-                artifact_root=settings.paths.artifact_path,
-                project_root=settings.paths.project_root,
-            )
+            ocr_started_at = start_timer()
+            use_page_ocr = not native_blocks and _should_use_page_level_ocr(settings, regions)
+            if use_page_ocr:
+                page_stage_start(page_num, "OCR", f"page fallback regions={len(regions)}")
+                progress_bar("ocr", page_num, profile.page_count, f"page {page_num} page-level OCR fallback")
+                page_result = _extract_with_fallback(primary, fallback, image_bytes, "page")
+                ocr_blocks = _ocr_result_to_page_blocks(document, page_num, page_result)
+            else:
+                page_stage_start(page_num, "OCR", f"regions={len(regions)}")
+                progress_bar("ocr", page_num, profile.page_count, f"page {page_num} region OCR")
+                formula = ensure_formula_extractor() if any(region.region_type == "formula" for region in regions) else None
+                ocr_blocks = _ocr_page_blocks(
+                    document,
+                    page_num,
+                    image_bytes,
+                    layout_result,
+                    primary,
+                    fallback,
+                    formula,
+                    regions=regions,
+                    artifact_root=settings.paths.artifact_path,
+                    project_root=settings.paths.project_root,
+                )
+            page_stage_complete(page_num, "OCR", ocr_started_at, f"blocks={len(ocr_blocks)}")
             write_development_checkpoint(
                 document,
                 "ocr",
@@ -1295,6 +1399,7 @@ def _run_layout_enabled_pdf_graph(
                 },
                 artifacts={structured_path.name: structured_path},
             )
+        page_stage_complete(page_num, "structured", page_started_at, f"blocks={len(page_blocks)}")
         return TaskRunResult(path=str(structured_path), metadata={"page_mode": output_page_mode})
 
     executor = DAGExecutor()
@@ -1308,7 +1413,7 @@ def _run_layout_enabled_pdf_graph(
         model_status("ocr", "offloading primary provider")
         with gpu_scheduler.claim("ocr"):
             primary_provider.offload()
-        if fallback_provider is not None and fallback_provider is not primary_provider:
+        if fallback_loaded and fallback_provider is not None and fallback_provider is not primary_provider:
             model_status("ocr", "offloading fallback provider")
             with gpu_scheduler.claim("ocr"):
                 fallback_provider.offload()
@@ -1380,11 +1485,12 @@ def _run_layout_detection_graph(*, source_path: Path, profile, document: str, se
             page=page_num,
             summary={
                 "output": str(out_path),
+                "provider": getattr(layout_provider, "name", layout_provider.__class__.__name__),
                 "region_count": len(layout_result.regions),
                 "region_types": _layout_region_counts(layout_result),
                 "layout_confidence": layout_result.layout_confidence,
             },
-            artifacts={out_path.name: out_path},
+            artifacts=_layout_checkpoint_artifacts(out_path, image_bytes, layout_result, getattr(layout_provider, "name", layout_provider.__class__.__name__)),
         )
         set_status("layout", document, page_num, "done", str(out_path))
         with results_lock:
@@ -1483,15 +1589,38 @@ def extract_structured_document(
 
     if profile.source_kind == SourceKind.IMAGE:
         primary_provider = build_primary_ocr_provider()
-        fallback_provider = build_fallback_ocr_provider()
+        fallback_provider: OCRProvider | None = None
+        fallback_loaded = False
+        ocr_call_gate = threading.BoundedSemaphore(max(1, settings.ocr.max_parallel_requests))
+
+        def ensure_image_fallback_provider() -> OCRProvider | None:
+            nonlocal fallback_provider, fallback_loaded
+            if fallback_provider is None:
+                fallback_provider = build_fallback_ocr_provider()
+            if fallback_provider is None:
+                return None
+            if getattr(fallback_provider, "name", None) == getattr(primary_provider, "name", None):
+                return _LockedOCRProvider(primary_provider, ocr_call_gate)
+            if not fallback_loaded:
+                model_status("ocr", f"loading fallback provider {getattr(fallback_provider, 'name', fallback_provider.__class__.__name__)}")
+                with gpu_scheduler.claim("ocr"):
+                    fallback_provider.load()
+                fallback_loaded = True
+                model_status("ocr", "fallback provider loaded")
+            return _LockedOCRProvider(fallback_provider, ocr_call_gate)
+
+        model_status("ocr", f"loading primary provider {getattr(primary_provider, 'name', primary_provider.__class__.__name__)}")
         with gpu_scheduler.claim("ocr"):
             primary_provider.load()
-        if fallback_provider is not None and getattr(fallback_provider, "name", None) != getattr(primary_provider, "name", None):
-            with gpu_scheduler.claim("ocr"):
-                fallback_provider.load()
+        model_status("ocr", "primary provider loaded")
         try:
             image_bytes = source_path.read_bytes()
-            result = _extract_with_fallback(primary_provider, fallback_provider, image_bytes, "page")
+            result = _extract_with_fallback(
+                _LockedOCRProvider(primary_provider, ocr_call_gate),
+                _LazyFallbackOCRProvider(ensure_image_fallback_provider),
+                image_bytes,
+                "page",
+            )
             write_development_checkpoint(
                 document,
                 "ocr",
@@ -1528,7 +1657,7 @@ def extract_structured_document(
         finally:
             with gpu_scheduler.claim("ocr"):
                 primary_provider.offload()
-            if fallback_provider is not None and fallback_provider is not primary_provider:
+            if fallback_loaded and fallback_provider is not None and fallback_provider is not primary_provider:
                 with gpu_scheduler.claim("ocr"):
                     fallback_provider.offload()
 

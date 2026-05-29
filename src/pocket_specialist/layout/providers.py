@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import base64
 import gc
 import io
-from types import ModuleType
 from dataclasses import dataclass, field
+from types import ModuleType
 from typing import Protocol
 
 from PIL import Image
+import requests
 import torch
 
 from pocket_specialist.core.config import get_settings
@@ -62,9 +64,8 @@ _LAYOUT_LABEL_MAP = {
 }
 
 _PP_DOCLAYOUT_V3_MODEL_ID = "PaddlePaddle/PP-DocLayoutV3_safetensors"
-
-
 _PP_DOCLAYOUT_V3_MIN_TRANSFORMERS = "5.5.4"
+_LAYOUT_SERVICE_TIMEOUT_SECONDS = 60
 
 
 def _parse_version(version_text: str) -> tuple[int, ...]:
@@ -89,7 +90,7 @@ def _build_pp_doclayout_v3_pipeline(transformers_module: ModuleType, model_id: s
     return transformers_module.pipeline("object-detection", model=model_id, device=device)
 
 
-def _normalize_layout_label(provider_label: str) -> str:
+def normalize_layout_label(provider_label: str) -> str:
     normalized = provider_label.strip().lower().replace("-", "_").replace(" ", "_")
     compact = normalized.replace("_", "")
     return _LAYOUT_LABEL_MAP.get(normalized, _LAYOUT_LABEL_MAP.get(compact, normalized))
@@ -157,7 +158,7 @@ class PPDocLayoutV3LayoutProvider:
             regions.append(
                 LayoutRegion(
                     region_id=f"region-{idx:04d}",
-                    region_type=_normalize_layout_label(provider_label),
+                    region_type=normalize_layout_label(provider_label),
                     bbox=(x0, y0, x1, y1),
                     confidence=confidence,
                     reading_order=idx - 1,
@@ -177,73 +178,112 @@ class PPDocLayoutV3LayoutProvider:
         gpu_scheduler.release_memory()
 
 
-class SuryaLayoutProvider:
-    """Compatibility layout adapter used behind configurable layout provider names."""
+class SuryaLayoutServiceProvider:
+    """HTTP-backed Surya layout adapter isolated from the main runtime dependency stack."""
 
-    def __init__(self, provider_name: str | None = None) -> None:
-        self.name = provider_name or get_settings().layout.provider
-        self._predictor = None
-        self._foundation = None
+    def __init__(self, provider_name: str | None = None, base_url: str | None = None) -> None:
+        settings = get_settings().layout
+        self.name = provider_name or "surya-layout-service"
+        self._base_url = (base_url or settings.base_url).rstrip("/")
+        self._session: requests.Session | None = None
 
     def load(self) -> None:
-        if self._predictor is not None:
+        if self._session is not None:
             return
+        self._session = requests.Session()
         try:
-            from surya.foundation import FoundationPredictor
-            from surya.layout import LayoutPredictor
-            from surya.settings import settings
-        except ImportError as exc:
-            raise RuntimeError("surya-ocr is not installed. Run: pip install surya-ocr") from exc
-
-        self._foundation = FoundationPredictor(checkpoint=settings.LAYOUT_MODEL_CHECKPOINT)
-        self._predictor = LayoutPredictor(self._foundation)
+            response = self._session.post(
+                f"{self._base_url}/load",
+                json={"provider": self.name},
+                timeout=_LAYOUT_SERVICE_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            self.offload()
+            raise RuntimeError(f"Surya layout service load failed: {exc}") from exc
 
     def detect(self, image_bytes: bytes) -> LayoutResult:
-        if self._predictor is None:
-            raise RuntimeError("SuryaLayoutProvider.load() must be called before detect()")
+        if self._session is None:
+            raise RuntimeError("SuryaLayoutServiceProvider.load() must be called before detect()")
 
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        with gpu_scheduler.claim("layout"):
-            result = self._predictor([image])[0]
-        raw_regions = getattr(result, "bboxes", [])
-        ordered = sorted(raw_regions, key=lambda item: getattr(item, "position", 0))
-        regions: list[LayoutRegion] = []
-        confidences: list[float] = []
-        for idx, raw_region in enumerate(ordered, 1):
-            x0, y0, x1, y1 = raw_region.bbox
-            confidence = float(getattr(raw_region, "confidence", 1.0) or 1.0)
-            confidences.append(confidence)
-            provider_label = getattr(raw_region, "label", "Text")
-            regions.append(
-                LayoutRegion(
-                    region_id=f"region-{idx:04d}",
-                    region_type=_normalize_layout_label(provider_label),
-                    bbox=(int(x0), int(y0), int(x1), int(y1)),
-                    confidence=confidence,
-                    reading_order=int(getattr(raw_region, "position", idx - 1)),
-                    metadata={"provider": self.name, "provider_label": provider_label},
-                )
+        payload = {"image": base64.b64encode(image_bytes).decode("ascii")}
+        try:
+            response = self._session.post(
+                f"{self._base_url}/detect",
+                json=payload,
+                timeout=_LAYOUT_SERVICE_TIMEOUT_SECONDS,
             )
-
-        return LayoutResult(
-            page_id="page",
-            regions=regions,
-            layout_confidence=(sum(confidences) / len(confidences)) if confidences else None,
-        )
+            response.raise_for_status()
+            body = response.json()
+        except (requests.RequestException, ValueError) as exc:
+            raise RuntimeError(f"Surya layout service detect failed: {exc}") from exc
+        return _layout_result_from_service_payload(body, provider_name=self.name)
 
     def offload(self) -> None:
-        self._predictor = None
-        self._foundation = None
-        gc.collect()
+        session = self._session
+        self._session = None
+        if session is None:
+            return
+        try:
+            session.post(f"{self._base_url}/offload", timeout=min(_LAYOUT_SERVICE_TIMEOUT_SECONDS, 5))
+        except requests.RequestException:
+            pass
+        session.close()
         gpu_scheduler.release_memory()
+
+    def health_check(self) -> bool:
+        try:
+            response = requests.get(f"{self._base_url}/health", timeout=min(_LAYOUT_SERVICE_TIMEOUT_SECONDS, 5))
+            return response.ok
+        except requests.RequestException:
+            return False
+
+
+def _layout_result_from_service_payload(payload: object, *, provider_name: str) -> LayoutResult:
+    if not isinstance(payload, dict):
+        raise RuntimeError("Surya layout service returned a non-object response")
+    raw_regions = payload.get("regions")
+    if not isinstance(raw_regions, list):
+        raise RuntimeError("Surya layout service response must include a regions list")
+    page_id = str(payload.get("page_id") or "page")
+    layout_confidence = payload.get("layout_confidence")
+    regions: list[LayoutRegion] = []
+    for idx, raw_region in enumerate(raw_regions, 1):
+        if not isinstance(raw_region, dict):
+            raise RuntimeError(f"Surya layout service region {idx} is not an object")
+        bbox = raw_region.get("bbox")
+        if not isinstance(bbox, list | tuple) or len(bbox) != 4:
+            raise RuntimeError(f"Surya layout service region {idx} has invalid bbox")
+        provider_label = str(raw_region.get("provider_label") or raw_region.get("region_type") or "text")
+        region_type = str(raw_region.get("region_type") or normalize_layout_label(provider_label))
+        confidence = float(raw_region.get("confidence") or 0.0)
+        reading_order = int(raw_region.get("reading_order") if raw_region.get("reading_order") is not None else idx - 1)
+        regions.append(
+            LayoutRegion(
+                region_id=f"region-{idx:04d}",
+                region_type=region_type,
+                bbox=tuple(int(float(value)) for value in bbox),
+                confidence=confidence,
+                reading_order=reading_order,
+                metadata={
+                    "provider": provider_name,
+                    "provider_label": provider_label,
+                },
+            )
+        )
+    return LayoutResult(
+        page_id=page_id,
+        regions=regions,
+        layout_confidence=float(layout_confidence) if layout_confidence is not None else None,
+    )
 
 
 def build_layout_provider(provider_name: str | None = None) -> LayoutProvider:
     configured = (provider_name or get_settings().layout.provider).lower()
     if configured in {"pp-doclayout-v3", "ppdoclayoutv3"}:
         return PPDocLayoutV3LayoutProvider(provider_name="pp-doclayout-v3")
-    if configured in {"surya-layout", "surya"}:
-        return SuryaLayoutProvider(provider_name=configured)
+    if configured in {"surya-layout-service", "surya-layout", "surya"}:
+        return SuryaLayoutServiceProvider(provider_name="surya-layout-service")
     raise ValueError(f"Unsupported layout provider: {provider_name or get_settings().layout.provider}")
 
 
@@ -261,7 +301,8 @@ __all__ = [
     "LayoutRegion",
     "LayoutResult",
     "PPDocLayoutV3LayoutProvider",
-    "SuryaLayoutProvider",
+    "SuryaLayoutServiceProvider",
     "build_layout_provider",
     "crop_region_image",
+    "normalize_layout_label",
 ]

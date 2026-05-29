@@ -1,0 +1,6 @@
+Pillow==10.4.0
+requests==2.34.2
+surya-ocr==0.17.1
+transformers==4.56.1
+torch==2.12.0
+torchvision==0.27.0

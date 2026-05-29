@@ -12,7 +12,8 @@ from pathlib import Path
 from typing import Any
 
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
-_DEFAULT_SCANNED_ZOOM = 300.0 / 72.0
+_BASE_RENDER_DPI = 72.0
+_DEFAULT_SCANNED_ZOOM = 300.0 / _BASE_RENDER_DPI
 
 
 def slugify_document_name(name: str) -> str:
@@ -95,6 +96,7 @@ class PipelinePaths:
 class RenderingSettings:
     zoom: float = 2.0
     scanned_pdf_zoom: float = _DEFAULT_SCANNED_ZOOM
+    max_dpi: int = 300
 
 
 @dataclass(frozen=True)
@@ -105,12 +107,16 @@ class OCRProviderSettings:
     batch_size: int = 4
     ollama_base_url: str = "http://localhost:11434"
     timeout_seconds: int = 60
+    page_fallback_region_threshold: int = 12
+    max_parallel_requests: int = 1
+    skip_residual_text_regions_for_native_pdf: bool = True
 
 
 @dataclass(frozen=True)
 class LayoutSettings:
     provider: str = "pp-doclayout-v3"
     enabled: bool = True
+    base_url: str = "http://localhost:8002"
 
 
 @dataclass(frozen=True)
@@ -119,6 +125,7 @@ class FormulaSettings:
     base_url: str = "http://localhost:8001"
     model_size: str = "base"
     fallback_to_ocr: bool = True
+    defer: bool = False
     timeout_seconds: int = 60
 
 
@@ -224,6 +231,7 @@ class PipelineSettings:
             rendering=RenderingSettings(
                 zoom=float(os.getenv("PIPELINE_RENDER_ZOOM", str(_nested_get(config_data, "rendering", "zoom", default=2.0)))),
                 scanned_pdf_zoom=float(os.getenv("PIPELINE_SCANNED_RENDER_ZOOM", str(_nested_get(config_data, "rendering", "scanned_pdf_zoom", default=_DEFAULT_SCANNED_ZOOM)))),
+                max_dpi=int(os.getenv("PIPELINE_RENDER_MAX_DPI", str(_nested_get(config_data, "rendering", "max_dpi", default=300)))),
             ),
             ocr=OCRProviderSettings(
                 provider=os.getenv("PIPELINE_OCR_PROVIDER", str(_nested_get(config_data, "ocr", "provider", default="glm-ocr"))),
@@ -232,16 +240,21 @@ class PipelineSettings:
                 batch_size=int(os.getenv("PIPELINE_OCR_BATCH_SIZE", str(_nested_get(config_data, "ocr", "batch_size", default=4)))),
                 ollama_base_url=os.getenv("PIPELINE_OCR_OLLAMA_BASE", str(_nested_get(config_data, "ocr", "ollama_base_url", default="http://localhost:11434"))),
                 timeout_seconds=int(os.getenv("PIPELINE_OCR_TIMEOUT_SECONDS", str(_nested_get(config_data, "ocr", "timeout_seconds", default=60)))),
+                page_fallback_region_threshold=int(os.getenv("PIPELINE_OCR_PAGE_FALLBACK_REGION_THRESHOLD", str(_nested_get(config_data, "ocr", "page_fallback_region_threshold", default=12)))),
+                max_parallel_requests=int(os.getenv("PIPELINE_OCR_MAX_PARALLEL_REQUESTS", str(_nested_get(config_data, "ocr", "max_parallel_requests", default=1)))),
+                skip_residual_text_regions_for_native_pdf=os.getenv("PIPELINE_OCR_SKIP_RESIDUAL_TEXT_REGIONS_FOR_NATIVE_PDF", str(_nested_get(config_data, "ocr", "skip_residual_text_regions_for_native_pdf", default=True))).lower() not in {"0", "false", "no"},
             ),
             layout=LayoutSettings(
                 provider=os.getenv("PIPELINE_LAYOUT_PROVIDER", str(_nested_get(config_data, "layout", "provider", default="pp-doclayout-v3"))),
                 enabled=os.getenv("PIPELINE_LAYOUT_ENABLED", str(_nested_get(config_data, "layout", "enabled", default=True))).lower() not in {"0", "false", "no"},
+                base_url=os.getenv("PIPELINE_LAYOUT_BASE_URL", str(_nested_get(config_data, "layout", "base_url", default="http://localhost:8002"))),
             ),
             formula=FormulaSettings(
                 enabled=os.getenv("PIPELINE_FORMULA_ENABLED", str(_nested_get(config_data, "formula", "enabled", default=True))).lower() not in {"0", "false", "no"},
                 base_url=os.getenv("PIPELINE_FORMULA_BASE_URL", str(_nested_get(config_data, "formula", "base_url", default="http://localhost:8001"))),
                 model_size=os.getenv("PIPELINE_FORMULA_MODEL_SIZE", str(_nested_get(config_data, "formula", "model_size", default="base"))),
                 fallback_to_ocr=os.getenv("PIPELINE_FORMULA_FALLBACK_TO_OCR", str(_nested_get(config_data, "formula", "fallback_to_ocr", default=True))).lower() not in {"0", "false", "no"},
+                defer=os.getenv("PIPELINE_FORMULA_DEFER", str(_nested_get(config_data, "formula", "defer", default=False))).lower() in {"1", "true", "yes"},
                 timeout_seconds=int(os.getenv("PIPELINE_FORMULA_TIMEOUT_SECONDS", str(_nested_get(config_data, "formula", "timeout_seconds", default=60)))),
             ),
             embedding=EmbeddingSettings(
@@ -304,6 +317,28 @@ OLLAMA_MODEL = SETTINGS.ollama.model
 OLLAMA_BASE = SETTINGS.ollama.base_url
 MAX_RETRIES = SETTINGS.runtime.max_retries
 DB_PATH = SETTINGS.paths.database_path
+
+
+def dpi_to_zoom(dpi: float) -> float:
+    return float(dpi) / _BASE_RENDER_DPI
+
+
+def zoom_to_dpi(zoom: float) -> float:
+    return float(zoom) * _BASE_RENDER_DPI
+
+
+def clamp_render_dpi(dpi: float, max_dpi: float | int | None = None) -> float:
+    resolved_max = float(max_dpi if max_dpi is not None else SETTINGS.rendering.max_dpi)
+    requested = max(float(dpi), _BASE_RENDER_DPI)
+    if resolved_max <= 0:
+        return requested
+    return min(requested, resolved_max)
+
+
+def resolve_render_zoom(zoom: float | None = None, *, dpi: float | None = None, max_dpi: float | int | None = None) -> tuple[float, float]:
+    requested_dpi = zoom_to_dpi(zoom) if dpi is None else float(dpi)
+    effective_dpi = clamp_render_dpi(requested_dpi, max_dpi=max_dpi)
+    return dpi_to_zoom(effective_dpi), effective_dpi
 
 
 def document_slug(pdf_path: Path) -> str:

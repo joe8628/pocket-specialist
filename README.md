@@ -124,7 +124,7 @@ data/pipeline.db
 
 `layout/page_*.json` contains layout regions, bounding boxes, confidence, and reading order. `structured/page_*.json` contains per-page structured blocks. `structured/document.json` contains the full CIF aggregate returned by `extract-structured`.
 
-Development-only status output is printed during ingestion phases. It includes `[START]`, `[VALIDATION]`, `[MODEL]`, `[PROGRESS]`, `[COMPLETED]`, and `[ERROR]` messages for script and model processing. Final command output now also includes `elapsed=<duration>` and `finished_at=<local ISO timestamp>` so ingestion runs can be benchmarked from the terminal log. This is implemented as temporary development instrumentation and should be removed before release with the development checkpoints.
+Development-only status output is printed during ingestion phases. It includes `[START]`, `[VALIDATION]`, `[MODEL]`, `[PROGRESS]`, `[PAGE START]`, `[PAGE COMPLETE]`, `[REGION START]`, `[REGION COMPLETE]`, `[COMPLETED]`, and `[ERROR]` messages for script and model processing. Page-stage and region-stage messages include elapsed timing so slow pages and individual OCR/formula regions are visible from the terminal log. Final command output also includes `elapsed=<duration>` and `finished_at=<local ISO timestamp>` so ingestion runs can be benchmarked end to end. This is implemented as temporary development instrumentation and should be removed before release with the development checkpoints.
 
 Development-only checkpoints are also written after ingestion stages. These are temporary debugging breadcrumbs intended to be removed before release, not disabled as a runtime feature:
 
@@ -166,6 +166,9 @@ export PIPELINE_DB_PATH=/data/pipeline.db
 export PIPELINE_LAYOUT_PROVIDER=pp-doclayout-v3
 export PIPELINE_OCR_PROVIDER=glm-ocr
 export PIPELINE_OCR_FALLBACK_PROVIDER=deepseek-ocr
+export PIPELINE_OCR_PAGE_FALLBACK_REGION_THRESHOLD=12
+export PIPELINE_OCR_MAX_PARALLEL_REQUESTS=1
+export PIPELINE_FORMULA_DEFER=0
 export PIPELINE_STRUCTURED_CORPUS_ENABLED=1
 ```
 
@@ -179,10 +182,14 @@ enabled = true
 [ocr]
 provider = "glm-ocr"
 fallback_provider = "deepseek-ocr"
+page_fallback_region_threshold = 12
+max_parallel_requests = 1
+skip_residual_text_regions_for_native_pdf = true
 
 [formula]
 enabled = true
 fallback_to_ocr = true
+defer = false
 
 [batch]
 structured_corpus_enabled = false

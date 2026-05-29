@@ -40,9 +40,22 @@ class GPUScheduler:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
         lock_file.close()
 
+    def _should_serialize(self, resource_type: str) -> bool:
+        settings = get_settings()
+        if not settings.gpu.serialized_execution:
+            return False
+        if resource_type == "ocr" and settings.ocr.max_parallel_requests > 1:
+            return False
+        return True
+
     @asynccontextmanager
     async def acquire(self, resource_type: str):
-        del resource_type
+        if not self._should_serialize(resource_type):
+            try:
+                yield
+            finally:
+                self.release_memory()
+            return
         timeout = get_settings().runtime.gpu_serialization_timeout_s
         lock_file = await asyncio.to_thread(self._acquire_file_lock, timeout)
         try:
@@ -53,7 +66,12 @@ class GPUScheduler:
 
     @contextmanager
     def claim(self, resource_type: str):
-        del resource_type
+        if not self._should_serialize(resource_type):
+            try:
+                yield
+            finally:
+                self.release_memory()
+            return
         timeout = get_settings().runtime.gpu_serialization_timeout_s
         lock_file = self._acquire_file_lock(timeout)
         try:

@@ -15,7 +15,7 @@ import xml.etree.ElementTree as ET
 import fitz
 
 from pocket_specialist.core.cif import CanonicalIntermediateFormat, ProvenanceRecord, SourceCoords, StructuredBlock
-from pocket_specialist.core.config import get_settings
+from pocket_specialist.core.config import get_settings, resolve_render_zoom
 
 
 class SourceKind(str, Enum):
@@ -350,8 +350,9 @@ def classify_document(source_path: Path) -> DocumentProfile:
     )
 
 
-def render_pdf_page_to_bytes(pdf_path: Path, page_num: int, zoom: float | None = None) -> bytes:
-    zoom_factor = zoom or get_settings().rendering.zoom
+def render_pdf_page_to_bytes(pdf_path: Path, page_num: int, zoom: float | None = None, dpi: float | None = None) -> bytes:
+    requested_zoom = zoom if zoom is not None else get_settings().rendering.zoom
+    zoom_factor, _ = resolve_render_zoom(requested_zoom, dpi=dpi)
     with fitz.open(str(pdf_path)) as doc:
         page = doc[page_num - 1]
         pix = page.get_pixmap(matrix=fitz.Matrix(zoom_factor, zoom_factor))

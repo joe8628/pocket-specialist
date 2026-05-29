@@ -7,7 +7,7 @@ from typing import cast
 
 import fitz  # PyMuPDF
 
-from pocket_specialist.core.config import RENDER_ZOOM, document_slug, render_dir_for
+from pocket_specialist.core.config import RENDER_ZOOM, clamp_render_dpi, document_slug, dpi_to_zoom, render_dir_for, resolve_render_zoom, zoom_to_dpi
 from pocket_specialist.core.dev_checkpoints import write_development_checkpoint
 from pocket_specialist.core.progress import phase_complete, phase_error, phase_start, phase_validation, progress_bar
 from pocket_specialist.storage.checkpoint import get_status, init_db, set_status, should_process
@@ -27,6 +27,7 @@ def render_pdf(
     pdf_path: Path,
     output_dir: Path | None = None,
     zoom: float = RENDER_ZOOM,
+    dpi: float | None = None,
     start_page: int = 1,
     end_page: int | None = None,
 ) -> tuple[int, int]:
@@ -61,7 +62,8 @@ def render_pdf(
 
     total = len(doc)
     end = min(end_page, total) if end_page else total
-    phase_validation("render", f"document={document} pages={start_page}-{end} output={output_dir}")
+    effective_zoom, effective_dpi = resolve_render_zoom(zoom, dpi=dpi)
+    phase_validation("render", f"document={document} pages={start_page}-{end} output={output_dir} dpi={effective_dpi:.0f}")
 
     if start_page < 1 or start_page > total:
         print(f"Error: start_page {start_page} out of range (1–{total}).", file=sys.stderr)
@@ -83,13 +85,13 @@ def render_pdf(
             continue
 
         try:
-            out_path = render_page(doc, page_num, output_dir, zoom)
+            out_path = render_page(doc, page_num, output_dir, effective_zoom)
             set_status("render", document, page_num, "done", str(out_path))
             write_development_checkpoint(
                 document,
                 "render",
                 page=page_num,
-                summary={"output": str(out_path), "zoom": zoom},
+                summary={"output": str(out_path), "zoom": effective_zoom, "dpi": int(round(effective_dpi))},
                 artifacts={out_path.name: out_path},
             )
             done += 1

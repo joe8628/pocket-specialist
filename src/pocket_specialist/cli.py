@@ -106,7 +106,8 @@ def rename_corpus_cmd(
 @app.command()
 def render(
     pdf: Path = typer.Argument(..., help="Source PDF file."),
-    zoom: float = typer.Option(2.0, help="Render scale factor (2.0 ≈ 150 DPI)."),
+    zoom: float = typer.Option(2.0, help="Render scale factor (2.0 ≈ 144 DPI). Ignored when --dpi is provided."),
+    dpi: int | None = typer.Option(None, "--dpi", min=72, help="Requested render DPI before max_dpi clamping."),
     start_page: int = typer.Option(1, "--start-page", help="First page (1-indexed)."),
     end_page: int = typer.Option(None, "--end-page", help="Last page inclusive. Default: last page."),
     output_dir: Path = typer.Option(None, "--output-dir", help="Override document-scoped PNG output directory."),
@@ -117,7 +118,7 @@ def render(
 
     pdf_path = pdf.resolve()
     out = output_dir or render_dir_for(_doc_slug(pdf_path))
-    render_pdf(pdf_path, output_dir=out, zoom=zoom, start_page=start_page, end_page=end_page)
+    render_pdf(pdf_path, output_dir=out, zoom=zoom, dpi=dpi, start_page=start_page, end_page=end_page)
 
 
 # ── OCR Extraction ─────────────────────────────────────────────────────────────
@@ -145,6 +146,17 @@ def ocr(
     )
     if failed:
         raise typer.Exit(1)
+
+
+@app.command(name="serve-surya-layout")
+def serve_surya_layout(
+    host: str = typer.Option("127.0.0.1", "--host", help="Host interface for the Surya layout microservice."),
+    port: int = typer.Option(8002, "--port", help="TCP port for the Surya layout microservice."),
+) -> None:
+    """Run the isolated Surya layout microservice."""
+    from pocket_specialist.layout.service import serve
+
+    serve(host=host, port=port)
 
 
 @app.command(name="layout")
