@@ -1,0 +1,4 @@
+# Install a matching Paddle runtime for your CPU/CUDA environment before using this service.
+paddleocr==3.3.2
+Pillow==10.4.0
+numpy==2.3.3

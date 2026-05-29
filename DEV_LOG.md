@@ -625,3 +625,60 @@ OCR throughput tuning follow-up:
 - OCR calls are now gated by `ocr.max_parallel_requests`; setting it above 1 also bypasses the cross-process GPU file lock for OCR only, while layout/formula remain serialized.
 - Formula extraction can now be deferred with `formula.defer=true`, and disabled/deferred formula regions no longer trigger symbolic OCR fallback.
 - Fallback OCR provider loading is now lazy in the active extraction paths: the fallback provider is built and loaded only when primary OCR extraction fails.
+
+## fix/pp-doclayout - layout fidelity, crop-only formula routing, and PaddleOCR layout service
+
+This branch continued from `fix/review1` to tighten the PP-DocLayout integration around what the pipeline actually needs: reliable layout regions, preserved reading order, preserved polygons, and formula regions that act as crop proposals for UniMERNet rather than as early semantic formula interpretations.
+
+Key decisions:
+
+- Removed the geometric re-sort from the Transformers-backed `PPDocLayoutV3LayoutProvider` and now preserve the model's native reading-order output directly.
+- Expanded PP-DocLayout label normalization to cover the model's actual label set such as `abstract`, `algorithm`, `aside_text`, `content`, `doc_title`, `reference`, `reference_content`, `vision_footnote`, `chart`, `seal`, `figure_title`, `paragraph_title`, and `formula_number`.
+- Switched the in-process PP-DocLayout adapter away from the generic `transformers.pipeline("object-detection")` path and onto the lower-level `AutoImageProcessor` plus `AutoModelForObjectDetection` path so `polygon_points` and model `order_seq` are preserved.
+- Added `polygon` to `LayoutRegion` and threaded polygons through service payload parsing and checkpoint reloads.
+- Replaced native block matching from centroid-in-box to overlap scoring. Matching now prefers polygon-vs-bbox overlap when polygons exist and falls back to bbox intersection otherwise.
+- Fixed a coordinate-space bug in the structured path by scaling native PDF text block coordinates to the same rendered-page zoom used for layout inference.
+- Corrected the formula contract in the structured pipeline. PP-DocLayout `formula` regions are now treated as crop-only routing hints for the formula stage instead of being consumed by native-text matching or converted into formula semantics from native/OCR fallback text.
+- Split OCR-region processing from formula-region processing so page-level OCR fallback applies only to text-like OCR regions and does not bypass crop-based formula extraction.
+- Added an isolated PaddleOCR layout service and provider path so official PaddleOCR layout inference with tuning knobs can be compared against the current Transformers-backed PP-DocLayout path without changing the main runtime dependency stack.
+
+Implementation details:
+
+- `src/pocket_specialist/layout/providers.py`
+  - `PPDocLayoutV3LayoutProvider` now uses `AutoImageProcessor.post_process_object_detection(...)` and keeps `polygon_points` plus `order_seq`.
+  - Added `PaddleOCRLayoutServiceProvider` with the same `/load`, `/detect`, `/offload`, `/health` contract used by the existing isolated layout services.
+- `src/pocket_specialist/phases/extract.py`
+  - Added polygon-aware overlap scoring helpers.
+  - Stopped native block routing from consuming formula regions.
+  - Removed native formula fallback conversion from `_native_contract()`.
+  - Split formula-region handling into a dedicated crop-based formula path separate from OCR-region handling.
+- `src/pocket_specialist/handlers/intake.py`
+  - `get_pdf_native_blocks()` now accepts render zoom/DPI context and scales native PDF coordinates into rendered-image space.
+- `src/pocket_specialist/layout/paddle_service.py`
+  - Added a standalone PaddleOCR layout microservice with configurable `model_name`, `img_size`, `threshold`, `formula_threshold`, `layout_nms`, `layout_unclip_ratio`, and `layout_merge_bboxes_mode`.
+- `src/pocket_specialist/core/config.py`, `pipeline.toml`, and `src/pocket_specialist/cli.py`
+  - Added layout tuning/config fields and a new `serve-paddleocr-layout` CLI entrypoint.
+- `services/paddleocr_layout_service/requirements.txt`
+  - Added the isolated service requirements for the PaddleOCR layout runtime.
+
+Validation performed:
+
+- `.venv` syntax checks passed for the touched modules:
+  - `PYTHONPATH=src .venv/bin/python -m py_compile src/pocket_specialist/layout/providers.py src/pocket_specialist/phases/extract.py src/pocket_specialist/handlers/intake.py`
+  - `PYTHONPATH=src .venv/bin/python -m py_compile src/pocket_specialist/core/config.py src/pocket_specialist/cli.py src/pocket_specialist/layout/paddle_service.py`
+- Real PP-DocLayout page-6 validation at `192` DPI confirmed polygon preservation and overlap matching:
+  - `59` layout regions total
+  - `59` regions with polygons
+  - `44` native blocks matched under the new overlap scorer
+- Focused formula-routing validation on page 6 confirmed the crop-only handoff behavior:
+  - `33` formula regions total
+  - `0` formula regions consumed by native matching
+  - `0` native formula blocks emitted
+- Additional PP-DocLayout diagnostics confirmed that the raw model itself still emits many `formula` labels on dense scientific prose. A DPI sweep at `96`, `144`, `192`, and `300` DPI showed formula-region counts remained in the `32-34` range, which indicates the remaining false positives are mainly a model-behavior issue rather than a missing documented Transformers integration step.
+- Minimal provider wiring sanity checks passed in `.venv` for the new PaddleOCR service path: the new layout tuning fields load from config and `build_layout_provider("paddleocr-layout-service")` resolves to `PaddleOCRLayoutServiceProvider`.
+
+Follow-up implications:
+
+- The active pipeline now better matches the intended architecture: layout detection proposes formula regions, UniMERNet translates those crops to LaTeX, and any future semantic enrichment can be layered afterward rather than being inferred prematurely from layout/native/OCR heuristics.
+- The new PaddleOCR layout service is wired but not executed inside the main `.venv`; it still requires its own isolated environment from `services/paddleocr_layout_service/requirements.txt` plus an appropriate Paddle runtime for the target machine.
+- PP-DocLayout region quality on page 6 is still noisy even with the corrected integration. The next meaningful comparison is to run the isolated PaddleOCR layout service with tuned thresholds and compare its formula-region artifacts against the current Transformers-backed PP-DocLayout output.

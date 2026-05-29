@@ -359,7 +359,8 @@ def render_pdf_page_to_bytes(pdf_path: Path, page_num: int, zoom: float | None =
         return pix.tobytes("png")
 
 
-def get_pdf_native_blocks(pdf_path: Path, page_num: int) -> list[NativeTextBlock]:
+def get_pdf_native_blocks(pdf_path: Path, page_num: int, *, zoom: float | None = None, dpi: float | None = None) -> list[NativeTextBlock]:
+    zoom_factor, _ = resolve_render_zoom(zoom if zoom is not None else get_settings().rendering.zoom, dpi=dpi)
     with fitz.open(str(pdf_path)) as doc:
         page = doc[page_num - 1]
         native_blocks: list[NativeTextBlock] = []
@@ -368,7 +369,18 @@ def get_pdf_native_blocks(pdf_path: Path, page_num: int) -> list[NativeTextBlock
             clean = text.strip()
             if not clean:
                 continue
-            native_blocks.append(NativeTextBlock(text=clean, bbox=(int(x0), int(y0), int(x1), int(y1)), block_no=idx))
+            native_blocks.append(
+                NativeTextBlock(
+                    text=clean,
+                    bbox=(
+                        int(round(x0 * zoom_factor)),
+                        int(round(y0 * zoom_factor)),
+                        int(round(x1 * zoom_factor)),
+                        int(round(y1 * zoom_factor)),
+                    ),
+                    block_no=idx,
+                )
+            )
         return native_blocks
 
 

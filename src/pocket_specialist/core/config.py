@@ -41,6 +41,59 @@ def _nested_get(mapping: dict[str, Any], *keys: str, default: Any = None) -> Any
     return current
 
 
+def _parse_optional_int_or_pair(value: str | None) -> int | tuple[int, int] | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    if not stripped or stripped.lower() == "none":
+        return None
+    for delimiter in (",", "x"):
+        if delimiter in stripped:
+            left, right = [part.strip() for part in stripped.split(delimiter, 1)]
+            return (int(left), int(right))
+    return int(stripped)
+
+
+def _parse_optional_float_or_pair(value: str | None) -> float | tuple[float, float] | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    if not stripped or stripped.lower() == "none":
+        return None
+    for delimiter in (",", "x"):
+        if delimiter in stripped:
+            left, right = [part.strip() for part in stripped.split(delimiter, 1)]
+            return (float(left), float(right))
+    return float(stripped)
+
+
+def _parse_optional_float(value: str | None) -> float | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    if not stripped or stripped.lower() == "none":
+        return None
+    return float(stripped)
+
+
+def _parse_optional_bool(value: str | None) -> bool | None:
+    if value is None:
+        return None
+    stripped = value.strip().lower()
+    if not stripped or stripped == "none":
+        return None
+    return stripped not in {"0", "false", "no"}
+
+
+def _parse_optional_str(value: str | None) -> str | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    if not stripped or stripped.lower() == "none":
+        return None
+    return stripped
+
+
 def _default_project_root() -> Path:
     start = Path(__file__).resolve()
     for candidate in start.parents:
@@ -117,6 +170,13 @@ class LayoutSettings:
     provider: str = "pp-doclayout-v3"
     enabled: bool = True
     base_url: str = "http://localhost:8002"
+    model_name: str = "PP-DocLayoutV3_safetensors"
+    img_size: int | tuple[int, int] | None = None
+    threshold: float | None = None
+    formula_threshold: float | None = None
+    layout_nms: bool | None = None
+    layout_unclip_ratio: float | tuple[float, float] | None = None
+    layout_merge_bboxes_mode: str | None = None
 
 
 @dataclass(frozen=True)
@@ -248,6 +308,13 @@ class PipelineSettings:
                 provider=os.getenv("PIPELINE_LAYOUT_PROVIDER", str(_nested_get(config_data, "layout", "provider", default="pp-doclayout-v3"))),
                 enabled=os.getenv("PIPELINE_LAYOUT_ENABLED", str(_nested_get(config_data, "layout", "enabled", default=True))).lower() not in {"0", "false", "no"},
                 base_url=os.getenv("PIPELINE_LAYOUT_BASE_URL", str(_nested_get(config_data, "layout", "base_url", default="http://localhost:8002"))),
+                model_name=os.getenv("PIPELINE_LAYOUT_MODEL_NAME", str(_nested_get(config_data, "layout", "model_name", default="PP-DocLayoutV3_safetensors"))),
+                img_size=_parse_optional_int_or_pair(os.getenv("PIPELINE_LAYOUT_IMG_SIZE", str(_nested_get(config_data, "layout", "img_size", default="")))),
+                threshold=_parse_optional_float(os.getenv("PIPELINE_LAYOUT_THRESHOLD", str(_nested_get(config_data, "layout", "threshold", default="")))),
+                formula_threshold=_parse_optional_float(os.getenv("PIPELINE_LAYOUT_FORMULA_THRESHOLD", str(_nested_get(config_data, "layout", "formula_threshold", default="")))),
+                layout_nms=_parse_optional_bool(os.getenv("PIPELINE_LAYOUT_NMS", str(_nested_get(config_data, "layout", "layout_nms", default="")))),
+                layout_unclip_ratio=_parse_optional_float_or_pair(os.getenv("PIPELINE_LAYOUT_UNCLIP_RATIO", str(_nested_get(config_data, "layout", "layout_unclip_ratio", default="")))),
+                layout_merge_bboxes_mode=_parse_optional_str(os.getenv("PIPELINE_LAYOUT_MERGE_BBOXES_MODE", str(_nested_get(config_data, "layout", "layout_merge_bboxes_mode", default="")))),
             ),
             formula=FormulaSettings(
                 enabled=os.getenv("PIPELINE_FORMULA_ENABLED", str(_nested_get(config_data, "formula", "enabled", default=True))).lower() not in {"0", "false", "no"},

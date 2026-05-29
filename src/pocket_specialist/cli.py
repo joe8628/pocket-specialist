@@ -159,6 +159,17 @@ def serve_surya_layout(
     serve(host=host, port=port)
 
 
+@app.command(name="serve-paddleocr-layout")
+def serve_paddleocr_layout(
+    host: str = typer.Option("127.0.0.1", "--host", help="Host interface for the PaddleOCR layout microservice."),
+    port: int = typer.Option(8003, "--port", help="TCP port for the PaddleOCR layout microservice."),
+) -> None:
+    """Run the isolated PaddleOCR layout microservice."""
+    from pocket_specialist.layout.paddle_service import serve
+
+    serve(host=host, port=port)
+
+
 @app.command(name="layout")
 def layout_detect(
     pdf: Path = typer.Argument(..., help="Source PDF file."),

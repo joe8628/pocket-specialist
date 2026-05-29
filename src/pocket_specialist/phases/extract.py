@@ -8,6 +8,8 @@ import threading
 from dataclasses import asdict
 from pathlib import Path
 
+from PIL import Image, ImageDraw
+
 from pocket_specialist.storage.checkpoint import DAGNodeState, init_db, set_status, should_process
 
 from pocket_specialist.core.cif import CanonicalIntermediateFormat, ProcessingArtifact, ProvenanceRecord, SourceCoords, StructuredBlock
@@ -50,6 +52,7 @@ _REGION_TO_BLOCK_TYPE = {
     "header": "TextBlock",
 }
 
+_LAYOUT_REGION_TYPES = set(_REGION_TO_BLOCK_TYPE)
 _OCR_REGION_TYPES = {"text", "heading", "table", "code", "key_value", "list", "footer", "header", "figure"}
 _DIGITAL_NATIVE_RESIDUAL_OCR_TYPES = {"table", "figure", "formula", "code", "key_value"}
 
@@ -58,7 +61,7 @@ def _should_use_page_level_ocr(settings, regions: list[LayoutRegion]) -> bool:
     threshold = int(getattr(settings.ocr, "page_fallback_region_threshold", 0) or 0)
     if threshold <= 0:
         return False
-    ocr_region_count = len([region for region in regions if region.region_type in _OCR_REGION_TYPES or region.region_type == "formula"])
+    ocr_region_count = len([region for region in regions if region.region_type in _OCR_REGION_TYPES])
     return ocr_region_count >= threshold
 
 
@@ -235,18 +238,70 @@ def _layout_region_to_block_type(region_type: str) -> str:
     return _REGION_TO_BLOCK_TYPE.get(region_type, "TextBlock")
 
 
+def _bbox_area(bbox: tuple[int, int, int, int]) -> int:
+    return max(0, bbox[2] - bbox[0]) * max(0, bbox[3] - bbox[1])
+
+
+def _bbox_intersection_area(left: tuple[int, int, int, int], right: tuple[int, int, int, int]) -> int:
+    x0 = max(left[0], right[0])
+    y0 = max(left[1], right[1])
+    x1 = min(left[2], right[2])
+    y1 = min(left[3], right[3])
+    if x1 <= x0 or y1 <= y0:
+        return 0
+    return (x1 - x0) * (y1 - y0)
+
+
+def _polygon_bbox_overlap_area(polygon: list[tuple[int, int]], bbox: tuple[int, int, int, int]) -> int:
+    if len(polygon) < 3:
+        return 0
+    polygon_x = [point[0] for point in polygon]
+    polygon_y = [point[1] for point in polygon]
+    left = min(min(polygon_x), bbox[0])
+    top = min(min(polygon_y), bbox[1])
+    right = max(max(polygon_x), bbox[2])
+    bottom = max(max(polygon_y), bbox[3])
+    width = max(1, right - left)
+    height = max(1, bottom - top)
+    mask = Image.new("L", (width, height), 0)
+    draw = ImageDraw.Draw(mask)
+    draw.polygon([(x - left, y - top) for x, y in polygon], fill=1)
+    crop_box = (
+        max(0, bbox[0] - left),
+        max(0, bbox[1] - top),
+        min(width, bbox[2] - left),
+        min(height, bbox[3] - top),
+    )
+    if crop_box[2] <= crop_box[0] or crop_box[3] <= crop_box[1]:
+        return 0
+    return mask.crop(crop_box).histogram()[1]
+
+
+def _region_overlap_score(bbox: tuple[int, int, int, int], region: LayoutRegion) -> tuple[float, float, int]:
+    bbox_area = _bbox_area(bbox)
+    if bbox_area <= 0:
+        return 0.0, 0.0, 0
+    overlap_area = _polygon_bbox_overlap_area(region.polygon, bbox) if region.polygon else _bbox_intersection_area(bbox, region.bbox)
+    if overlap_area <= 0:
+        return 0.0, 0.0, 0
+    region_area = _bbox_area(region.bbox)
+    union_area = max(1, bbox_area + region_area - overlap_area)
+    coverage = overlap_area / bbox_area
+    iou = overlap_area / union_area
+    return coverage, iou, overlap_area
+
+
 def _match_region(bbox: tuple[int, int, int, int], layout: LayoutResult) -> LayoutRegion | None:
-    cx = (bbox[0] + bbox[2]) / 2
-    cy = (bbox[1] + bbox[3]) / 2
     best: LayoutRegion | None = None
-    best_area = None
+    best_score = (0.0, 0.0, 0.0, 0, 0)
     for region in layout.regions:
-        x0, y0, x1, y1 = region.bbox
-        if x0 <= cx <= x1 and y0 <= cy <= y1:
-            area = (x1 - x0) * (y1 - y0)
-            if best_area is None or area < best_area:
-                best = region
-                best_area = area
+        coverage, iou, overlap_area = _region_overlap_score(bbox, region)
+        if overlap_area <= 0:
+            continue
+        score = (coverage, iou, region.confidence, -_bbox_area(region.bbox), overlap_area)
+        if score > best_score:
+            best = region
+            best_score = score
     return best
 
 
@@ -254,8 +309,9 @@ def _matched_layout_region_ids(native_blocks, layout: LayoutResult) -> set[str]:
     matched: set[str] = set()
     for native in native_blocks:
         region = _match_region(native.bbox, layout)
-        if region is not None:
-            matched.add(region.region_id)
+        if region is None or region.region_type == "formula":
+            continue
+        matched.add(region.region_id)
     return matched
 
 
@@ -354,8 +410,6 @@ def _native_contract(region_type: str, text: str, *, artifact_uri: str | None = 
         return {"type": "KeyValueBlock", "pairs": _parse_key_value_pairs(text)}
     if region_type == "figure":
         return _figure_contract(caption=None, alt_text="", embedded_text=[text] if text else None, artifact_uri=artifact_uri)
-    if region_type == "formula":
-        return _formula_fallback_contract(text, inline=False)
     return {"type": "TextBlock", "text": text, "heading_level": None, "language": None}
 
 
@@ -443,6 +497,17 @@ def _inline_formula_blocks(
     return blocks
 
 
+def _guard_native_region_type(region: LayoutRegion | None, text: str) -> tuple[str, str | None]:
+    if region is None:
+        return "text", None
+    provider_label = str(region.metadata.get("provider_label") or "").strip().lower()
+    if provider_label in {"figure_title", "caption"}:
+        return "text", "caption_text"
+    if region.region_type == "formula":
+        return "text", "formula_crop_only"
+    return region.region_type, None
+
+
 def _native_page_blocks(
     document: str,
     page_num: int,
@@ -456,7 +521,9 @@ def _native_page_blocks(
     blocks: list[StructuredBlock] = []
     for idx, native in enumerate(native_blocks, 1):
         region = _match_region(native.bbox, layout)
-        region_type = region.region_type if region else "text"
+        if region is not None and region.region_type == "formula":
+            continue
+        region_type, route_guard = _guard_native_region_type(region, native.text)
         block_type = _layout_region_to_block_type(region_type)
         block_id = f"{document}-page-{page_num:04d}-native-{idx:04d}"
         artifact_uri = None
@@ -470,7 +537,14 @@ def _native_page_blocks(
                 artifact_root=artifact_root,
                 project_root=project_root,
             )
-        metadata = {"region_type": region_type, "layout_region_id": region.region_id if region else None}
+        metadata = {
+            "region_type": region_type,
+            "layout_region_id": region.region_id if region else None,
+            "matched_layout_region_type": region.region_type if region else None,
+            "layout_provider_label": region.metadata.get("provider_label") if region else None,
+        }
+        if route_guard is not None:
+            metadata["route_guard"] = route_guard
         if artifact_uri is not None:
             metadata["artifact_uri"] = artifact_uri
         block = StructuredBlock(
@@ -513,12 +587,62 @@ def _extract_with_fallback(primary: OCRProvider, fallback: OCRProvider | None, c
         return fallback.extract(crop_bytes, region_type)
 
 
-def _extract_formula_symbolic_fallback(primary: OCRProvider, fallback: OCRProvider | None, crop_bytes: bytes) -> str:
-    try:
-        result = _extract_with_fallback(primary, fallback, crop_bytes, "formula")
-    except Exception:
-        return ""
-    return "\n".join(str(block["raw_text"]).strip() for block in result.typed_content["blocks"] if str(block["raw_text"]).strip())
+def _formula_page_blocks(
+    document: str,
+    page_num: int,
+    image_bytes: bytes,
+    formula_regions: list[LayoutRegion],
+    formula_extractor: FormulaExtractor | None = None,
+) -> list[StructuredBlock]:
+    blocks: list[StructuredBlock] = []
+    settings = get_settings()
+    ordered_regions = sorted(formula_regions, key=lambda item: item.reading_order)
+    formula_total = len(ordered_regions)
+    for block_index, region in enumerate(ordered_regions, 1):
+        region_started_at = start_timer()
+        region_stage_start(page_num, "formula", block_index, formula_total, region.region_id, region.region_type)
+        crop_bytes = crop_region_image(image_bytes, region.bbox)
+        write_development_artifact(document, "formula", f"page_{page_num:04d}_{region.region_id}.png", crop_bytes)
+        formula_result: FormulaResult | None = None
+        formula_error: str | None = None
+        formula_deferred = getattr(settings.formula, "defer", False)
+        if not settings.formula.enabled:
+            formula_error = "formula extraction disabled"
+        elif formula_deferred:
+            formula_error = "formula extraction deferred"
+        elif formula_extractor is not None:
+            try:
+                formula_result = formula_extractor.extract(crop_bytes)
+            except Exception as exc:
+                formula_error = str(exc)
+                raise
+
+        content = _formula_contract(formula_result) if formula_result is not None else _formula_fallback_contract("", inline=False)
+        blocks.append(
+            StructuredBlock(
+                block_id=f"{document}-page-{page_num:04d}-formula-{block_index:04d}",
+                doc_id=document,
+                block_type="FormulaBlock",
+                content=content,
+                section_path=[],
+                reading_order=region.reading_order,
+                page=page_num,
+                source_coords=SourceCoords(page=page_num, bbox=region.bbox),
+                provenance=ProvenanceRecord(
+                    source_stage="formula_extract" if formula_result is not None else "structured_extract",
+                    provider=formula_result.provider if formula_result is not None else "layout-routing",
+                    confidence=formula_result.confidence if formula_result is not None else region.confidence,
+                    metadata={
+                        "layout_region_id": region.region_id,
+                        "region_type": region.region_type,
+                        "formula_latency_ms": formula_result.latency_ms if formula_result is not None else None,
+                        "fallback_reason": formula_error,
+                    },
+                ),
+            )
+        )
+        region_stage_complete(page_num, "formula", block_index, formula_total, region.region_id, region.region_type, region_started_at)
+    return blocks
 
 
 def _ocr_page_blocks(
@@ -528,7 +652,6 @@ def _ocr_page_blocks(
     layout: LayoutResult,
     primary_provider: OCRProvider,
     fallback_provider: OCRProvider | None,
-    formula_extractor: FormulaExtractor | None = None,
     regions: list[LayoutRegion] | None = None,
     *,
     artifact_root: Path | None = None,
@@ -536,71 +659,14 @@ def _ocr_page_blocks(
 ) -> list[StructuredBlock]:
     blocks: list[StructuredBlock] = []
     block_index = 0
-    settings = get_settings()
     ordered_regions = sorted(regions or layout.regions, key=lambda item: item.reading_order)
     ocr_total = len([region for region in ordered_regions if region.region_type in _OCR_REGION_TYPES])
-    formula_total = len([region for region in ordered_regions if region.region_type == "formula"])
     ocr_current = 0
-    formula_current = 0
     for region in ordered_regions:
-        block_type = _layout_region_to_block_type(region.region_type)
-        if region.region_type == "formula":
-            formula_current += 1
-            region_started_at = start_timer()
-            region_stage_start(page_num, "formula", formula_current, formula_total, region.region_id, region.region_type)
-            block_index += 1
-            crop_bytes = crop_region_image(image_bytes, region.bbox)
-            write_development_artifact(document, "formula", f"page_{page_num:04d}_{region.region_id}.png", crop_bytes)
-            formula_result: FormulaResult | None = None
-            formula_error: str | None = None
-            formula_deferred = getattr(settings.formula, "defer", False)
-            if not settings.formula.enabled:
-                formula_error = "formula extraction disabled"
-            elif formula_deferred:
-                formula_error = "formula extraction deferred"
-            elif formula_extractor is not None:
-                try:
-                    formula_result = formula_extractor.extract(crop_bytes)
-                except Exception as exc:
-                    formula_error = str(exc)
-                    if not settings.formula.fallback_to_ocr:
-                        raise
-
-            if formula_result is not None:
-                raw_formula_text = ""
-            elif settings.formula.enabled and not formula_deferred and settings.formula.fallback_to_ocr:
-                raw_formula_text = _extract_formula_symbolic_fallback(primary_provider, fallback_provider, crop_bytes)
-            else:
-                raw_formula_text = ""
-            content = _formula_contract(formula_result) if formula_result is not None else _formula_fallback_contract(raw_formula_text, inline=False)
-            blocks.append(
-                StructuredBlock(
-                    block_id=f"{document}-page-{page_num:04d}-formula-{block_index:04d}",
-                    doc_id=document,
-                    block_type=block_type,
-                    content=content,
-                    section_path=[],
-                    reading_order=region.reading_order,
-                    page=page_num,
-                    source_coords=SourceCoords(page=page_num, bbox=region.bbox),
-                    provenance=ProvenanceRecord(
-                        source_stage="formula_extract" if formula_result is not None else "structured_extract",
-                        provider=formula_result.provider if formula_result is not None else "layout-routing",
-                        confidence=formula_result.confidence if formula_result is not None else region.confidence,
-                        metadata={
-                            "layout_region_id": region.region_id,
-                            "region_type": region.region_type,
-                            "formula_latency_ms": formula_result.latency_ms if formula_result is not None else None,
-                            "fallback_reason": formula_error,
-                        },
-                    ),
-                )
-            )
-            region_stage_complete(page_num, "formula", formula_current, formula_total, region.region_id, region.region_type, region_started_at)
-            continue
         if region.region_type not in _OCR_REGION_TYPES:
             continue
 
+        block_type = _layout_region_to_block_type(region.region_type)
         ocr_current += 1
         region_started_at = start_timer()
         region_stage_start(page_num, "ocr", ocr_current, ocr_total, region.region_id, region.region_type)
@@ -662,7 +728,6 @@ def _ocr_page_blocks(
         region_stage_complete(page_num, "ocr", ocr_current, ocr_total, region.region_id, region.region_type, region_started_at)
     return blocks
 
-
 def _write_json(path: Path, payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -708,6 +773,14 @@ def _layout_result_from_payload(payload: dict[str, object]) -> LayoutResult:
             bbox_obj = item.get("bbox")
             if not isinstance(bbox_obj, list | tuple) or len(bbox_obj) != 4:
                 continue
+            polygon_obj = item.get("polygon")
+            polygon = None
+            if isinstance(polygon_obj, list):
+                normalized_points: list[tuple[int, int]] = []
+                for point in polygon_obj:
+                    if isinstance(point, (list, tuple)) and len(point) == 2:
+                        normalized_points.append((int(float(point[0])), int(float(point[1]))))
+                polygon = normalized_points if len(normalized_points) >= 3 else None
             regions.append(
                 LayoutRegion(
                     region_id=str(item.get("region_id") or f"region-{idx:04d}"),
@@ -715,6 +788,7 @@ def _layout_result_from_payload(payload: dict[str, object]) -> LayoutResult:
                     bbox=tuple(int(float(value)) for value in bbox_obj),
                     confidence=float(item.get("confidence") or 0.0),
                     reading_order=int(item.get("reading_order") or idx - 1),
+                    polygon=polygon,
                     metadata=item.get("metadata") if isinstance(item.get("metadata"), dict) else {},
                 )
             )
@@ -852,7 +926,7 @@ def _raw_block_bbox(raw_block: dict[str, object]) -> tuple[int, int, int, int] |
 
 def _page_region_type(raw_block: dict[str, object]) -> str:
     candidate = str(raw_block.get("block_type", "text")).strip().lower()
-    if candidate in _REGION_TO_BLOCK_TYPE or candidate == "formula":
+    if candidate in _LAYOUT_REGION_TYPES:
         return candidate
     return "text"
 
@@ -1031,7 +1105,7 @@ def _run_layout_disabled_pdf_graph(
             summary={"page_mode": page_mode, "zoom": zoom, "bytes": len(image_bytes)},
             artifacts={f"page_{page_num:04d}.png": image_bytes},
         )
-        native_blocks = get_pdf_native_blocks(source_path, page_num)
+        native_blocks = get_pdf_native_blocks(source_path, page_num, zoom=zoom)
         progress_bar("structured", page_num, profile.page_count, f"page {page_num} structured")
         structured_path = structured_dir / f"page_{page_num:04d}.json"
         if native_blocks:
@@ -1235,7 +1309,7 @@ def _run_layout_enabled_pdf_graph(
             layout_result = _layout_result_from_payload(payload)
             zoom = settings.rendering.zoom if page_mode == PDFContentType.DIGITAL.value else settings.rendering.scanned_pdf_zoom
             image_bytes = render_pdf_page_to_bytes(source_path, page_num, zoom=zoom)
-            native_blocks = get_pdf_native_blocks(source_path, page_num)
+            native_blocks = get_pdf_native_blocks(source_path, page_num, zoom=zoom)
             with state_lock:
                 page_state[page_num] = {
                     "image_bytes": image_bytes,
@@ -1287,7 +1361,7 @@ def _run_layout_enabled_pdf_graph(
                 artifacts=_layout_checkpoint_artifacts(layout_path, image_bytes, layout_result, getattr(provider, "name", provider.__class__.__name__)),
             )
             set_status("layout", document, page_num, "done", str(layout_path))
-            native_blocks = get_pdf_native_blocks(source_path, page_num)
+            native_blocks = get_pdf_native_blocks(source_path, page_num, zoom=zoom)
             with state_lock:
                 page_state[page_num] = {
                     "image_bytes": image_bytes,
@@ -1329,54 +1403,67 @@ def _run_layout_enabled_pdf_graph(
             regions = list(layout_result.regions)
 
         if regions:
-            primary, fallback = ensure_ocr_providers()
-            ocr_started_at = start_timer()
-            use_page_ocr = not native_blocks and _should_use_page_level_ocr(settings, regions)
-            if use_page_ocr:
-                page_stage_start(page_num, "OCR", f"page fallback regions={len(regions)}")
-                progress_bar("ocr", page_num, profile.page_count, f"page {page_num} page-level OCR fallback")
-                page_result = _extract_with_fallback(primary, fallback, image_bytes, "page")
-                ocr_blocks = _ocr_result_to_page_blocks(document, page_num, page_result)
-            else:
-                page_stage_start(page_num, "OCR", f"regions={len(regions)}")
-                progress_bar("ocr", page_num, profile.page_count, f"page {page_num} region OCR")
-                formula = ensure_formula_extractor() if any(region.region_type == "formula" for region in regions) else None
-                ocr_blocks = _ocr_page_blocks(
+            formula_regions = [region for region in regions if region.region_type == "formula"]
+            ocr_regions = [region for region in regions if region.region_type != "formula"]
+            ocr_blocks: list[StructuredBlock] = []
+            formula_blocks: list[StructuredBlock] = []
+            if ocr_regions:
+                primary, fallback = ensure_ocr_providers()
+                ocr_started_at = start_timer()
+                use_page_ocr = not native_blocks and _should_use_page_level_ocr(settings, ocr_regions)
+                if use_page_ocr:
+                    page_stage_start(page_num, "OCR", f"page fallback regions={len(ocr_regions)}")
+                    progress_bar("ocr", page_num, profile.page_count, f"page {page_num} page-level OCR fallback")
+                    page_result = _extract_with_fallback(primary, fallback, image_bytes, "page")
+                    ocr_blocks = _ocr_result_to_page_blocks(document, page_num, page_result)
+                else:
+                    page_stage_start(page_num, "OCR", f"regions={len(ocr_regions)}")
+                    progress_bar("ocr", page_num, profile.page_count, f"page {page_num} region OCR")
+                    ocr_blocks = _ocr_page_blocks(
+                        document,
+                        page_num,
+                        image_bytes,
+                        layout_result,
+                        primary,
+                        fallback,
+                        regions=ocr_regions,
+                        artifact_root=settings.paths.artifact_path,
+                        project_root=settings.paths.project_root,
+                    )
+                page_stage_complete(page_num, "OCR", ocr_started_at, f"blocks={len(ocr_blocks)}")
+                write_development_checkpoint(
+                    document,
+                    "ocr",
+                    page=page_num,
+                    summary={
+                        "region_count": len(ocr_regions),
+                        "block_count": len([block for block in ocr_blocks if block.provenance.source_stage == "structured_extract"]),
+                        "block_types": _block_type_counts(ocr_blocks),
+                    },
+                )
+            if formula_regions:
+                formula_extractor = ensure_formula_extractor()
+                progress_bar("formula", page_num, profile.page_count, f"page {page_num} formula regions")
+                formula_started_at = start_timer()
+                page_stage_start(page_num, "Formula", f"regions={len(formula_regions)}")
+                formula_blocks = _formula_page_blocks(
                     document,
                     page_num,
                     image_bytes,
-                    layout_result,
-                    primary,
-                    fallback,
-                    formula,
-                    regions=regions,
-                    artifact_root=settings.paths.artifact_path,
-                    project_root=settings.paths.project_root,
+                    formula_regions,
+                    formula_extractor,
                 )
-            page_stage_complete(page_num, "OCR", ocr_started_at, f"blocks={len(ocr_blocks)}")
-            write_development_checkpoint(
-                document,
-                "ocr",
-                page=page_num,
-                summary={
-                    "region_count": len([region for region in regions if region.region_type != "formula"]),
-                    "block_count": len([block for block in ocr_blocks if block.provenance.source_stage == "structured_extract"]),
-                    "block_types": _block_type_counts(ocr_blocks),
-                },
-            )
-            formula_region_count = len([region for region in regions if region.region_type == "formula"])
-            if formula_region_count:
-                progress_bar("formula", page_num, profile.page_count, f"page {page_num} formula regions")
+                page_stage_complete(page_num, "Formula", formula_started_at, f"blocks={len(formula_blocks)}")
                 write_development_checkpoint(
                     document,
                     "formula",
                     page=page_num,
                     summary={
-                        "region_count": formula_region_count,
-                        "formula_blocks": len([block for block in ocr_blocks if block.block_type == "FormulaBlock"]),
+                        "region_count": len(formula_regions),
+                        "formula_blocks": len([block for block in formula_blocks if block.block_type == "FormulaBlock"]),
                     },
                 )
-            page_blocks = sorted(page_blocks + ocr_blocks, key=lambda block: (block.reading_order, block.block_id))
+            page_blocks = sorted(page_blocks + ocr_blocks + formula_blocks, key=lambda block: (block.reading_order, block.block_id))
 
         structured_path = structured_dir / f"page_{page_num:04d}.json"
         output_page_mode = PDFContentType.DIGITAL.value if native_blocks else PDFContentType.SCANNED.value

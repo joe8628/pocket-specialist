@@ -20,6 +20,13 @@ skip_residual_text_regions_for_native_pdf = true
 provider = "surya-layout-service"
 enabled = true
 base_url = "http://localhost:8002"
+model_name = "PP-DocLayoutV3_safetensors"
+img_size = 800
+threshold = 0.5
+formula_threshold = 0.6
+layout_nms = true
+layout_unclip_ratio = 1.0
+layout_merge_bboxes_mode = "small"
 
 [formula]
 enabled = true
