@@ -17,10 +17,10 @@ max_parallel_requests = 1
 skip_residual_text_regions_for_native_pdf = true
 
 [layout]
-provider = "surya-layout-service"
+provider = "pp-doclayout-v3"
 enabled = true
 base_url = "http://localhost:8002"
-model_name = "PP-DocLayoutV3_safetensors"
+model_name = "PaddlePaddle/PP-DocLayoutV3_safetensors"
 img_size = 800
 threshold = 0.5
 formula_threshold = 0.6

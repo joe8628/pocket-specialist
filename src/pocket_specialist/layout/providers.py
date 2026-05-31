@@ -117,6 +117,15 @@ def normalize_layout_label(provider_label: str) -> str:
     return _LAYOUT_LABEL_MAP.get(normalized, _LAYOUT_LABEL_MAP.get(compact, normalized))
 
 
+def _normalize_pp_doclayout_model_id(model_id: str) -> str:
+    stripped = model_id.strip()
+    if not stripped:
+        return _PP_DOCLAYOUT_V3_MODEL_ID
+    if "/" in stripped:
+        return stripped
+    return f"PaddlePaddle/{stripped}"
+
+
 def _layout_box(raw_region: object) -> tuple[int, int, int, int]:
     if isinstance(raw_region, dict):
         box = raw_region.get("box")
@@ -153,9 +162,20 @@ def _polygon_points(raw_polygon: object) -> list[tuple[int, int]] | None:
 class PPDocLayoutV3LayoutProvider:
     """Transformers-backed PP-DocLayoutV3 adapter."""
 
-    def __init__(self, provider_name: str | None = None, model_id: str = _PP_DOCLAYOUT_V3_MODEL_ID) -> None:
+    def __init__(
+        self,
+        provider_name: str | None = None,
+        *,
+        model_id: str = _PP_DOCLAYOUT_V3_MODEL_ID,
+        threshold: float | None = None,
+        formula_threshold: float | None = None,
+        img_size: int | tuple[int, int] | None = None,
+    ) -> None:
         self.name = provider_name or "pp-doclayout-v3"
-        self.model_id = model_id
+        self.model_id = _normalize_pp_doclayout_model_id(model_id)
+        self.threshold = threshold
+        self.formula_threshold = formula_threshold
+        self.img_size = img_size
         self._image_processor = None
         self._model = None
         self._device = torch.device("cpu")
@@ -191,13 +211,24 @@ class PPDocLayoutV3LayoutProvider:
 
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         with gpu_scheduler.claim("layout"):
-            inputs = self._image_processor(images=image, return_tensors="pt")
+            processor_kwargs: dict[str, object] = {"images": image, "return_tensors": "pt"}
+            if self.img_size is not None:
+                if isinstance(self.img_size, tuple):
+                    processor_kwargs["size"] = {"height": int(self.img_size[1]), "width": int(self.img_size[0])}
+                else:
+                    processor_kwargs["size"] = {"height": int(self.img_size), "width": int(self.img_size)}
+            try:
+                inputs = self._image_processor(**processor_kwargs)
+            except TypeError:
+                processor_kwargs.pop("size", None)
+                inputs = self._image_processor(**processor_kwargs)
             inputs = inputs.to(self._device)
             with torch.inference_mode():
                 outputs = self._model(**inputs)
+            threshold = float(self.threshold) if self.threshold is not None else 0.5
             processed = self._image_processor.post_process_object_detection(
                 outputs,
-                threshold=0.5,
+                threshold=threshold,
                 target_sizes=[(image.height, image.width)],
             )
 
@@ -227,6 +258,9 @@ class PPDocLayoutV3LayoutProvider:
             provider_label = str(self._model.config.id2label.get(label_id, "text"))
             score_value = raw_scores[idx - 1]
             confidence = float(score_value.item()) if hasattr(score_value, "item") else float(score_value)
+            normalized_label = normalize_layout_label(provider_label)
+            if normalized_label == "formula" and self.formula_threshold is not None and confidence < float(self.formula_threshold):
+                continue
             polygon = _polygon_points(raw_polygons[idx - 1] if idx - 1 < len(raw_polygons) else None)
             order_value = raw_order[idx - 1] if idx - 1 < len(raw_order) else idx - 1
             reading_order = int(order_value.item()) if hasattr(order_value, "item") else int(order_value)
@@ -234,7 +268,7 @@ class PPDocLayoutV3LayoutProvider:
             regions.append(
                 LayoutRegion(
                     region_id=f"region-{idx:04d}",
-                    region_type=normalize_layout_label(provider_label),
+                    region_type=normalized_label,
                     bbox=(x0, y0, x1, y1),
                     confidence=confidence,
                     reading_order=reading_order,
@@ -245,6 +279,8 @@ class PPDocLayoutV3LayoutProvider:
                         "model_id": self.model_id,
                         "has_polygon": polygon is not None,
                         "order_seq": reading_order,
+                        "threshold": threshold,
+                        "formula_threshold": self.formula_threshold,
                     },
                 )
             )
@@ -444,14 +480,21 @@ def _layout_result_from_service_payload(payload: object, *, provider_name: str) 
 
 
 def build_layout_provider(provider_name: str | None = None) -> LayoutProvider:
-    configured = (provider_name or get_settings().layout.provider).lower()
+    settings = get_settings().layout
+    configured = (provider_name or settings.provider).lower()
     if configured in {"pp-doclayout-v3", "ppdoclayoutv3"}:
-        return PPDocLayoutV3LayoutProvider(provider_name="pp-doclayout-v3")
+        return PPDocLayoutV3LayoutProvider(
+            provider_name="pp-doclayout-v3",
+            model_id=settings.model_name,
+            threshold=settings.threshold,
+            formula_threshold=settings.formula_threshold,
+            img_size=settings.img_size,
+        )
     if configured in {"surya-layout-service", "surya-layout", "surya"}:
         return SuryaLayoutServiceProvider(provider_name="surya-layout-service")
     if configured in {"paddleocr-layout-service", "paddleocr-layout", "paddle-layout", "paddleocr"}:
         return PaddleOCRLayoutServiceProvider(provider_name="paddleocr-layout-service")
-    raise ValueError(f"Unsupported layout provider: {provider_name or get_settings().layout.provider}")
+    raise ValueError(f"Unsupported layout provider: {provider_name or settings.provider}")
 
 
 def crop_region_image(image_bytes: bytes, bbox: tuple[int, int, int, int]) -> bytes:

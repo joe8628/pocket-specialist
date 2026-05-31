@@ -1232,7 +1232,7 @@ def _run_layout_enabled_pdf_graph(
         nonlocal layout_provider, layout_loaded
         with layout_setup_lock:
             if layout_provider is None:
-                layout_provider = build_layout_provider()
+                layout_provider = build_layout_provider(layout_provider_name)
             if not layout_loaded:
                 model_status("layout", f"loading provider {getattr(layout_provider, 'name', layout_provider.__class__.__name__)}")
                 with gpu_scheduler.claim("layout"):
@@ -1514,7 +1514,7 @@ def _run_layout_enabled_pdf_graph(
 
 
 
-def _run_layout_detection_graph(*, source_path: Path, profile, document: str, settings, layout_dir: Path) -> tuple[int, int, dict[int, LayoutResult]]:
+def _run_layout_detection_graph(*, source_path: Path, profile, document: str, settings, layout_dir: Path, layout_provider_name: str | None = None) -> tuple[int, int, dict[int, LayoutResult]]:
     page_modes = profile.metadata.get("page_modes", [])
     tasks: list[ExtractionTask] = []
     units: dict[str, PageUnit] = {}
@@ -1540,7 +1540,7 @@ def _run_layout_detection_graph(*, source_path: Path, profile, document: str, se
         nonlocal provider, provider_loaded
         with setup_lock:
             if provider is None:
-                provider = build_layout_provider()
+                provider = build_layout_provider(layout_provider_name)
             if not provider_loaded:
                 with gpu_scheduler.claim("layout"):
                     provider.load()
@@ -1598,6 +1598,7 @@ def extract_structured_document(
     source_path: Path,
     structured_output_dir: Path | None = None,
     layout_output_dir: Path | None = None,
+    layout_provider_name: str | None = None,
 ) -> tuple[int, int, CanonicalIntermediateFormat]:
     profile = classify_document(source_path)
     document = profile.doc_id
@@ -1798,6 +1799,7 @@ def extract_structured_document(
 def detect_layout_document(
     source_path: Path,
     layout_output_dir: Path | None = None,
+    layout_provider_name: str | None = None,
 ) -> tuple[int, int, dict[int, LayoutResult]]:
     profile = classify_document(source_path)
     phase_start("layout", f"{source_path}")
@@ -1817,6 +1819,7 @@ def detect_layout_document(
         document=document,
         settings=settings,
         layout_dir=layout_dir,
+        layout_provider_name=layout_provider_name,
     )
     if failed:
         phase_error("layout", f"{done} done, {failed} failed")

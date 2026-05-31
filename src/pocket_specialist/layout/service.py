@@ -1,7 +1,7 @@
 """Isolated Surya layout microservice.
 
-This service keeps Surya and its compatible Transformers stack outside the main
-pipeline runtime. It exposes small JSON endpoints consumed by
+This service keeps Surya and its compatible runtime outside the main
+pipeline environment. It exposes small JSON endpoints consumed by
 ``SuryaLayoutServiceProvider``.
 """
 
@@ -23,26 +23,34 @@ from pocket_specialist.core.gpu import gpu_scheduler
 
 
 _LAYOUT_LABEL_MAP = {
-    "text": "text",
-    "sectionheader": "heading",
-    "section_header": "heading",
-    "title": "heading",
-    "table": "table",
-    "equation": "formula",
-    "formula": "formula",
-    "code": "code",
-    "figure": "figure",
+    "abstract": "text",
+    "bibliography": "text",
+    "blankpage": "text",
     "caption": "text",
-    "listitem": "list",
-    "list_item": "list",
+    "chemicalblock": "formula",
+    "code": "code",
+    "diagram": "figure",
+    "equation": "formula",
+    "figure": "figure",
     "footnote": "footer",
-    "pageheader": "header",
-    "header": "header",
-    "pagefooter": "footer",
-    "footer": "footer",
     "form": "key_value",
+    "formula": "formula",
+    "header": "header",
     "keyvalue": "key_value",
     "key_value": "key_value",
+    "listgroup": "list",
+    "listitem": "list",
+    "list_item": "list",
+    "pagefooter": "footer",
+    "pageheader": "header",
+    "picture": "figure",
+    "sectionheader": "heading",
+    "section_header": "heading",
+    "table": "table",
+    "tableofcontents": "text",
+    "text": "text",
+    "text_inline_math": "formula",
+    "title": "heading",
 }
 
 
@@ -59,6 +67,9 @@ class ServiceLayoutRegion:
     confidence: float
     reading_order: int
     provider_label: str
+    raw_label: str | None = None
+    polygon: list[list[int]] | None = None
+    count: int | None = None
 
 
 @dataclass(slots=True)
@@ -69,6 +80,8 @@ class ServiceLayoutResult:
 
 
 class LayoutRuntime(Protocol):
+    @property
+    def loaded(self) -> bool: ...
     def load(self) -> None: ...
     def detect(self, image_bytes: bytes) -> ServiceLayoutResult: ...
     def offload(self) -> None: ...
@@ -79,49 +92,59 @@ class SuryaLayoutRuntime:
 
     def __init__(self) -> None:
         self._predictor = None
-        self._foundation = None
+        self._manager = None
 
     @property
     def loaded(self) -> bool:
-        return self._predictor is not None
+        return self._predictor is not None and self._manager is not None
 
     def load(self) -> None:
-        if self._predictor is not None:
+        if self.loaded:
             return
         try:
-            from surya.foundation import FoundationPredictor
+            from surya.inference import SuryaInferenceManager
             from surya.layout import LayoutPredictor
-            from surya.settings import settings
         except ImportError as exc:
             raise RuntimeError("Surya is not installed in the layout service environment") from exc
 
         with gpu_scheduler.claim("layout"):
-            self._foundation = FoundationPredictor(checkpoint=settings.LAYOUT_MODEL_CHECKPOINT)
-            self._predictor = LayoutPredictor(self._foundation)
+            self._manager = SuryaInferenceManager()
+            self._predictor = LayoutPredictor(self._manager)
 
     def detect(self, image_bytes: bytes) -> ServiceLayoutResult:
-        if self._predictor is None:
+        if not self.loaded:
             self.load()
 
         image = Image.open(BytesIO(image_bytes)).convert("RGB")
         with gpu_scheduler.claim("layout"):
             result = self._predictor([image])[0]
+        if bool(_get_value(result, "error", default=False)):
+            raise RuntimeError("Surya layout inference returned an error result")
 
-        raw_regions = sorted(getattr(result, "bboxes", []), key=lambda item: getattr(item, "position", 0))
+        raw_regions = list(_get_value(result, "bboxes", default=[]))
+        raw_regions.sort(key=lambda item: int(_get_value(item, "position", default=0)))
         regions: list[ServiceLayoutRegion] = []
         confidences: list[float] = []
         for idx, raw_region in enumerate(raw_regions):
-            x0, y0, x1, y1 = getattr(raw_region, "bbox")
-            provider_label = str(getattr(raw_region, "label", "Text"))
-            confidence = float(getattr(raw_region, "confidence", 1.0) or 1.0)
+            bbox = _get_value(raw_region, "bbox", default=[0, 0, 0, 0])
+            if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                continue
+            provider_label = str(_get_value(raw_region, "label", default="Text"))
+            raw_label = _get_value(raw_region, "raw_label", default=None)
+            confidence = float(_get_value(raw_region, "confidence", default=1.0) or 1.0)
+            count_value = _get_value(raw_region, "count", default=None)
+            polygon = _normalize_polygon(_get_value(raw_region, "polygon", default=None))
             confidences.append(confidence)
             regions.append(
                 ServiceLayoutRegion(
                     region_type=_normalize_layout_label(provider_label),
-                    bbox=[int(x0), int(y0), int(x1), int(y1)],
+                    bbox=[int(float(value)) for value in bbox],
                     confidence=confidence,
-                    reading_order=int(getattr(raw_region, "position", idx)),
+                    reading_order=int(_get_value(raw_region, "position", default=idx)),
                     provider_label=provider_label,
+                    raw_label=str(raw_label) if raw_label is not None else None,
+                    polygon=polygon,
+                    count=int(count_value) if count_value is not None else None,
                 )
             )
 
@@ -133,7 +156,14 @@ class SuryaLayoutRuntime:
 
     def offload(self) -> None:
         self._predictor = None
-        self._foundation = None
+        manager = self._manager
+        self._manager = None
+        if manager is not None:
+            for method_name in ("shutdown", "close", "terminate"):
+                method = getattr(manager, method_name, None)
+                if callable(method):
+                    method()
+                    break
         gc.collect()
         try:
             import torch
@@ -203,6 +233,23 @@ def _decode_image_payload(payload: dict[str, Any], *, key: str) -> bytes:
     if not isinstance(value, str) or not value:
         raise ValueError("image payload must be non-empty base64 text")
     return base64.b64decode(value, validate=True)
+
+
+def _get_value(obj: Any, key: str, *, default: Any = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _normalize_polygon(raw_polygon: Any) -> list[list[int]] | None:
+    if not isinstance(raw_polygon, (list, tuple)):
+        return None
+    points: list[list[int]] = []
+    for point in raw_polygon:
+        if not isinstance(point, (list, tuple)) or len(point) != 2:
+            continue
+        points.append([int(float(point[0])), int(float(point[1]))])
+    return points if len(points) >= 3 else None
 
 
 def serve(host: str = "127.0.0.1", port: int = 8002) -> None:

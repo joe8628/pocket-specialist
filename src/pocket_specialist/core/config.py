@@ -170,7 +170,7 @@ class LayoutSettings:
     provider: str = "pp-doclayout-v3"
     enabled: bool = True
     base_url: str = "http://localhost:8002"
-    model_name: str = "PP-DocLayoutV3_safetensors"
+    model_name: str = "PaddlePaddle/PP-DocLayoutV3_safetensors"
     img_size: int | tuple[int, int] | None = None
     threshold: float | None = None
     formula_threshold: float | None = None
@@ -308,7 +308,7 @@ class PipelineSettings:
                 provider=os.getenv("PIPELINE_LAYOUT_PROVIDER", str(_nested_get(config_data, "layout", "provider", default="pp-doclayout-v3"))),
                 enabled=os.getenv("PIPELINE_LAYOUT_ENABLED", str(_nested_get(config_data, "layout", "enabled", default=True))).lower() not in {"0", "false", "no"},
                 base_url=os.getenv("PIPELINE_LAYOUT_BASE_URL", str(_nested_get(config_data, "layout", "base_url", default="http://localhost:8002"))),
-                model_name=os.getenv("PIPELINE_LAYOUT_MODEL_NAME", str(_nested_get(config_data, "layout", "model_name", default="PP-DocLayoutV3_safetensors"))),
+                model_name=os.getenv("PIPELINE_LAYOUT_MODEL_NAME", str(_nested_get(config_data, "layout", "model_name", default="PaddlePaddle/PP-DocLayoutV3_safetensors"))),
                 img_size=_parse_optional_int_or_pair(os.getenv("PIPELINE_LAYOUT_IMG_SIZE", str(_nested_get(config_data, "layout", "img_size", default="")))),
                 threshold=_parse_optional_float(os.getenv("PIPELINE_LAYOUT_THRESHOLD", str(_nested_get(config_data, "layout", "threshold", default="")))),
                 formula_threshold=_parse_optional_float(os.getenv("PIPELINE_LAYOUT_FORMULA_THRESHOLD", str(_nested_get(config_data, "layout", "formula_threshold", default="")))),

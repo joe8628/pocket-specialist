@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import json
 import time
 from datetime import datetime
 from pathlib import Path
@@ -71,6 +72,64 @@ def _benchmark_stamp(started_at: float) -> str:
     finished_at = datetime.now().isoformat(timespec="seconds")
     return f"elapsed={_format_duration(time.monotonic() - started_at)} finished_at={finished_at}"
 
+
+
+def _provider_slug(provider_name: str) -> str:
+    return provider_name.strip().lower().replace(" ", "-").replace("_", "-")
+
+
+def _provider_scoped_dir(base_dir: Path, provider_name: str | None) -> Path:
+    if provider_name is None:
+        return base_dir
+    return base_dir / _provider_slug(provider_name)
+
+
+def _run_layout_detection_command(pdf: Path, output_dir: Path | None, *, provider_name: str | None = None) -> None:
+    from pocket_specialist.core.config import layout_dir_for
+    from pocket_specialist.phases.extract import detect_layout_document
+
+    started_at = time.monotonic()
+    pdf_path = pdf.resolve()
+    document = _doc_slug(pdf_path)
+    base_output_dir = output_dir or layout_dir_for(document)
+    target_dir = _provider_scoped_dir(base_output_dir, provider_name)
+    done, failed, _ = detect_layout_document(pdf_path, layout_output_dir=target_dir, layout_provider_name=provider_name)
+    typer.echo(f"Layout detection complete: {done} done, {failed} failed. Output: {target_dir} {_benchmark_stamp(started_at)}")
+    if failed:
+        raise typer.Exit(1)
+
+
+def _run_extract_structured_command(
+    source: Path,
+    output_dir: Path | None,
+    layout_output_dir: Path | None,
+    *,
+    provider_name: str | None = None,
+) -> None:
+    from pocket_specialist.core.config import layout_dir_for, structured_dir_for
+    from pocket_specialist.handlers.intake import classify_document
+    from pocket_specialist.phases.extract import extract_structured_document
+
+    started_at = time.monotonic()
+    source_path = source.resolve()
+    profile = classify_document(source_path)
+    base_structured_target = output_dir or structured_dir_for(profile.doc_id)
+    base_layout_target = layout_output_dir or layout_dir_for(profile.doc_id)
+    structured_target = _provider_scoped_dir(base_structured_target, provider_name)
+    layout_target = _provider_scoped_dir(base_layout_target, provider_name)
+    done, failed, cif = extract_structured_document(
+        source_path,
+        structured_output_dir=structured_target,
+        layout_output_dir=layout_target,
+        layout_provider_name=provider_name,
+    )
+    typer.echo(
+        f"Structured extraction complete: {done} done, {failed} failed. "
+        f"Blocks: {len(cif.blocks)}. Output: {structured_target / 'document.json'} "
+        f"Layout: {layout_target} {_benchmark_stamp(started_at)}"
+    )
+    if failed:
+        raise typer.Exit(1)
 
 
 # ── Corpus Intake ──────────────────────────────────────────────────────────────
@@ -176,16 +235,41 @@ def layout_detect(
     output_dir: Path = typer.Option(None, "--output-dir", help="Override document-scoped layout JSON output directory."),
 ) -> None:
     """Detect page layout regions and write per-page layout JSON."""
-    from pocket_specialist.core.config import layout_dir_for
-    from pocket_specialist.phases.extract import detect_layout_document
+    _run_layout_detection_command(pdf, output_dir)
+
+
+@app.command(name="layout-surya")
+def layout_detect_surya(
+    pdf: Path = typer.Argument(..., help="Source PDF file."),
+    output_dir: Path = typer.Option(None, "--output-dir", help="Override the base layout output directory. Results are written under a surya-layout-service subfolder by default."),
+) -> None:
+    """Detect layout with the Surya layout service without changing global config."""
+    _run_layout_detection_command(pdf, output_dir, provider_name="surya-layout-service")
+
+
+@app.command(name="layout-pp-doclayout-v3")
+def layout_detect_pp_doclayout_v3(
+    pdf: Path = typer.Argument(..., help="Source PDF file."),
+    output_dir: Path = typer.Option(None, "--output-dir", help="Override the base layout output directory. Results are written under a pp-doclayout-v3 subfolder by default."),
+) -> None:
+    """Detect layout with PP-DocLayoutV3 without changing global config."""
+    _run_layout_detection_command(pdf, output_dir, provider_name="pp-doclayout-v3")
+
+
+@app.command(name="compare-layout-page")
+def compare_layout_page_cmd(
+    pdf: Path = typer.Argument(..., help="Source PDF file."),
+    page: int = typer.Option(..., "--page", min=1, help="1-indexed PDF page to compare."),
+    dpi: int = typer.Option(192, "--dpi", min=72, help="Render DPI used for both providers."),
+    output_dir: Path = typer.Option(Path("/tmp/layout_compare"), "--output-dir", help="Directory for side-by-side provider artifacts."),
+) -> None:
+    """Compare page-level layout artifacts side by side for the available providers."""
+    from pocket_specialist.layout.compare import compare_layout_page
 
     started_at = time.monotonic()
-    pdf_path = pdf.resolve()
-    document = _doc_slug(pdf_path)
-    done, failed, _ = detect_layout_document(pdf_path, layout_output_dir=output_dir or layout_dir_for(document))
-    typer.echo(f"Layout detection complete: {done} done, {failed} failed. {_benchmark_stamp(started_at)}")
-    if failed:
-        raise typer.Exit(1)
+    summary = compare_layout_page(pdf.resolve(), page_num=page, dpi=dpi, output_dir=output_dir.resolve())
+    typer.echo(json.dumps(summary, indent=2))
+    typer.echo(_benchmark_stamp(started_at))
 
 
 @app.command(name="extract-structured")
@@ -195,27 +279,27 @@ def extract_structured(
     layout_output_dir: Path = typer.Option(None, "--layout-output-dir", help="Override document-scoped layout JSON output directory."),
 ) -> None:
     """Run the Phase B structured extraction path for PDF or HTML input."""
-    from pocket_specialist.core.config import layout_dir_for, structured_dir_for
-    from pocket_specialist.handlers.intake import classify_document
-    from pocket_specialist.phases.extract import extract_structured_document
+    _run_extract_structured_command(source, output_dir, layout_output_dir)
 
-    started_at = time.monotonic()
-    source_path = source.resolve()
-    profile = classify_document(source_path)
-    structured_target = output_dir or structured_dir_for(profile.doc_id)
-    layout_target = layout_output_dir or layout_dir_for(profile.doc_id)
-    done, failed, cif = extract_structured_document(
-        source_path,
-        structured_output_dir=structured_target,
-        layout_output_dir=layout_target,
-    )
-    typer.echo(
-        f"Structured extraction complete: {done} done, {failed} failed. "
-        f"Blocks: {len(cif.blocks)}. Output: {structured_target / 'document.json'} "
-        f"{_benchmark_stamp(started_at)}"
-    )
-    if failed:
-        raise typer.Exit(1)
+
+@app.command(name="extract-structured-surya")
+def extract_structured_surya(
+    source: Path = typer.Argument(..., help="Source document. Supports PDF and HTML."),
+    output_dir: Path = typer.Option(None, "--output-dir", help="Override the base structured output directory. Results are written under a surya-layout-service subfolder by default."),
+    layout_output_dir: Path = typer.Option(None, "--layout-output-dir", help="Override the base layout output directory. Results are written under a surya-layout-service subfolder by default."),
+) -> None:
+    """Run structured extraction with the Surya layout service without changing global config."""
+    _run_extract_structured_command(source, output_dir, layout_output_dir, provider_name="surya-layout-service")
+
+
+@app.command(name="extract-structured-pp-doclayout-v3")
+def extract_structured_pp_doclayout_v3(
+    source: Path = typer.Argument(..., help="Source document. Supports PDF and HTML."),
+    output_dir: Path = typer.Option(None, "--output-dir", help="Override the base structured output directory. Results are written under a pp-doclayout-v3 subfolder by default."),
+    layout_output_dir: Path = typer.Option(None, "--layout-output-dir", help="Override the base layout output directory. Results are written under a pp-doclayout-v3 subfolder by default."),
+) -> None:
+    """Run structured extraction with PP-DocLayoutV3 without changing global config."""
+    _run_extract_structured_command(source, output_dir, layout_output_dir, provider_name="pp-doclayout-v3")
 
 
 @app.command(name="extract-structured-corpus")

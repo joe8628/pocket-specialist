@@ -13,10 +13,11 @@ from PIL import Image
 
 from pocket_specialist.core.config import PipelineSettings
 from pocket_specialist.formula.providers import FormulaResult, UniMERNetFormulaExtractor
-from pocket_specialist.layout.providers import LayoutRegion, LayoutResult, SuryaLayoutProvider, build_layout_provider
+from pocket_specialist.layout.providers import LayoutRegion, LayoutResult, SuryaLayoutServiceProvider, build_layout_provider
+from pocket_specialist.layout.service import SuryaLayoutRuntime
 from pocket_specialist.handlers.intake import DocumentProfile, NativeTextBlock, PDFContentType, SourceKind
 from pocket_specialist.formula.symbolic import inline_formula_candidates, looks_symbolic
-from pocket_specialist.ocr.providers import OllamaOCRProvider, SuryaOCRProvider
+from pocket_specialist.ocr.providers import OllamaOCRProvider
 from pocket_specialist.phases.extract import _matched_layout_region_ids, _native_page_blocks, _ocr_page_blocks, extract_structured_document
 
 
@@ -634,25 +635,100 @@ class PhaseCFormulaTests(unittest.TestCase):
         assert recorder.claims.count("layout") == 2
         assert recorder.claims.count("ocr") == 2
 
-    def test_layout_provider_detect_claims_gpu_scheduler(self) -> None:
-        class FakePredictor:
-            def __call__(self, images):
-                return [SimpleNamespace(bboxes=[])]
+    def test_surya_layout_service_provider_normalizes_v2_payload(self) -> None:
+        class LayoutSession(FakeSession):
+            def post(self, url: str, json: object | None = None, timeout: int | float | None = None) -> FakeResponse:
+                self.posts.append((url, json))
+                if url.endswith("/load") or url.endswith("/offload"):
+                    return FakeResponse({"ok": True})
+                if url.endswith("/detect"):
+                    return FakeResponse(
+                        {
+                            "page_id": "page",
+                            "layout_confidence": 0.89,
+                            "regions": [
+                                {
+                                    "region_type": "heading",
+                                    "bbox": [0, 0, 10, 10],
+                                    "confidence": 0.94,
+                                    "reading_order": 0,
+                                    "provider_label": "SectionHeader",
+                                    "raw_label": "SectionHeader",
+                                    "polygon": [[0, 0], [10, 0], [10, 10], [0, 10]],
+                                    "count": 50,
+                                }
+                            ],
+                        }
+                    )
+                raise AssertionError(url)
 
+        session = LayoutSession()
+        with patch("pocket_specialist.layout.providers.requests.Session", return_value=session):
+            provider = SuryaLayoutServiceProvider(base_url="http://layout.local")
+            provider.load()
+            result = provider.detect(b"image-bytes")
+            provider.offload()
+
+        assert result.page_id == "page"
+        assert result.layout_confidence == 0.89
+        assert [region.region_type for region in result.regions] == ["heading"]
+        assert result.regions[0].metadata["provider"] == "surya-layout-service"
+        assert result.regions[0].metadata["provider_label"] == "SectionHeader"
+
+    def test_surya_layout_runtime_uses_v2_manager_and_claims_gpu_scheduler(self) -> None:
         recorder = ClaimRecorder()
-        from pocket_specialist.layout.providers import SuryaLayoutProvider
-
-        provider = SuryaLayoutProvider()
-        provider._predictor = FakePredictor()
-
         image = Image.new("RGB", (24, 24), "white")
         buffer = io.BytesIO()
         image.save(buffer, format="PNG")
 
-        with patch("pocket_specialist.layout.providers.gpu_scheduler", recorder):
-            provider.detect(buffer.getvalue())
+        class FakeManager:
+            def __init__(self) -> None:
+                self.closed = False
 
-        assert recorder.claims == ["layout"]
+            def shutdown(self) -> None:
+                self.closed = True
+
+        class FakePredictor:
+            def __init__(self, manager) -> None:
+                self.manager = manager
+
+            def __call__(self, images):
+                assert len(images) == 1
+                return [
+                    SimpleNamespace(
+                        error=False,
+                        bboxes=[
+                            SimpleNamespace(
+                                bbox=[1, 2, 10, 12],
+                                label="SectionHeader",
+                                raw_label="SectionHeader",
+                                position=0,
+                                confidence=0.91,
+                                count=50,
+                                polygon=[[1, 2], [10, 2], [10, 12], [1, 12]],
+                            )
+                        ],
+                    )
+                ]
+
+        with patch.dict(
+            "sys.modules",
+            {
+                "surya.inference": SimpleNamespace(SuryaInferenceManager=FakeManager),
+                "surya.layout": SimpleNamespace(LayoutPredictor=FakePredictor),
+            },
+        ), patch("pocket_specialist.layout.service.gpu_scheduler", recorder):
+            runtime = SuryaLayoutRuntime()
+            runtime.load()
+            result = runtime.detect(buffer.getvalue())
+            manager = runtime._manager
+            runtime.offload()
+
+        assert recorder.claims == ["layout", "layout"]
+        assert isinstance(manager, FakeManager)
+        assert manager.closed is True
+        assert result.regions[0].region_type == "heading"
+        assert result.regions[0].provider_label == "SectionHeader"
 
     def test_pp_doclayout_v3_provider_detects_regions_via_transformers_pipeline(self) -> None:
         class FakePipeline:
@@ -692,12 +768,10 @@ class PhaseCFormulaTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "requires transformers >= 5.5.4; found 4.57.6"):
                 provider.load()
 
-    def test_provider_import_failures_raise_runtime_errors(self) -> None:
-        with patch.dict("sys.modules", {"surya.foundation": None}):
-            with self.assertRaisesRegex(RuntimeError, "surya-ocr is not installed"):
-                SuryaLayoutProvider().load()
-            with self.assertRaisesRegex(RuntimeError, "surya-ocr is not installed"):
-                SuryaOCRProvider().load()
+    def test_surya_layout_runtime_import_failures_raise_runtime_errors(self) -> None:
+        with patch.dict("sys.modules", {"surya.inference": None, "surya.layout": None}):
+            with self.assertRaisesRegex(RuntimeError, "Surya is not installed in the layout service environment"):
+                SuryaLayoutRuntime().load()
 
     def test_ollama_ocr_retries_repairable_malformed_json_with_constrained_prompt(self) -> None:
         class OCRSession:

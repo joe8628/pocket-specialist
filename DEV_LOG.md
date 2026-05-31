@@ -682,3 +682,52 @@ Follow-up implications:
 - The active pipeline now better matches the intended architecture: layout detection proposes formula regions, UniMERNet translates those crops to LaTeX, and any future semantic enrichment can be layered afterward rather than being inferred prematurely from layout/native/OCR heuristics.
 - The new PaddleOCR layout service is wired but not executed inside the main `.venv`; it still requires its own isolated environment from `services/paddleocr_layout_service/requirements.txt` plus an appropriate Paddle runtime for the target machine.
 - PP-DocLayout region quality on page 6 is still noisy even with the corrected integration. The next meaningful comparison is to run the isolated PaddleOCR layout service with tuned thresholds and compare its formula-region artifacts against the current Transformers-backed PP-DocLayout output.
+
+## fix/pp-doclayout - provider split and page-6 comparison workflow
+
+Follow-up work in this session aligned the layout tooling with the updated CLI split and pushed the isolated PaddleOCR service further toward a real side-by-side comparison against PP-DocLayout.
+
+Key changes:
+
+- Confirmed and preserved the new CLI split between the layout entry points:
+  - `layout-surya`
+  - `layout-pp-doclayout-v3`
+  - plus the matching structured extraction variants.
+- Fixed the in-process PP-DocLayout provider so it now honors layout config instead of silently hardcoding old defaults:
+  - `layout.model_name`
+  - `layout.threshold`
+  - `layout.formula_threshold`
+  - `layout.img_size`
+- Normalized the default PP-DocLayout model id to the documented Hugging Face identifier `PaddlePaddle/PP-DocLayoutV3_safetensors` while keeping the service-side PaddleOCR model-name mapping explicit.
+- Switched the default layout provider in `pipeline.toml` back to `pp-doclayout-v3` so the default runtime matches the intended layout path.
+- Added a reusable comparison helper in `src/pocket_specialist/layout/compare.py` and a CLI command:
+  - `compare-layout-page`
+  This renders a single page once and writes the same artifact bundle for each provider:
+  - base page render
+  - full overlay
+  - formula-only overlay
+  - region crops
+  - per-provider JSON summary
+- Patched the isolated PaddleOCR layout service to reduce accidental coupling to the main runtime:
+  - added a no-op local GPU scheduler fallback when `torch` is absent
+  - normalized incoming HF-style PP-DocLayout model ids into PaddleOCR layout model names
+  - added retry logic that drops unsupported `predict()` kwargs for version-specific PaddleOCR API differences
+  - removed detect-time kwargs that triggered a Paddle runtime `ConvertPirAttribute2RuntimeAttribute` failure on this machine
+- Created and populated an isolated service virtual environment under `services/paddleocr_layout_service/.venv` with `paddleocr` and `paddlepaddle`, then brought the service up successfully on localhost.
+
+Validation performed:
+
+- `.venv` syntax checks passed for the touched modules during this follow-up work.
+- Real page-6 PP-DocLayout layout-only run at `192` DPI succeeded and wrote artifacts under `/tmp/ppdoclayout_page6_check`.
+- Real side-by-side comparison command runs succeeded far enough to generate the PP-DocLayout side cleanly under `/tmp/layout_compare_page6/pp-doclayout-v3`.
+- PaddleOCR service validation progressed in stages:
+  - service health check returned `True`
+  - `/load` now succeeds after model-source and model-name fixes
+  - official Paddle model weights were downloaded and cached under `~/.paddlex/official_models/PP-DocLayout_plus-L`
+  - `/detect` still fails on this machine, which means the remaining blocker is a PaddleOCR/Paddle runtime inference compatibility issue rather than service reachability or missing artifacts.
+
+Current status:
+
+- PP-DocLayout comparison artifacts are available and usable.
+- The new comparison workflow is wired to the updated command structure and is ready for repeated provider checks.
+- The remaining open issue is the isolated PaddleOCR service `detect` runtime path; once that inference incompatibility is resolved, the same command should produce both provider bundles side by side without further CLI changes.

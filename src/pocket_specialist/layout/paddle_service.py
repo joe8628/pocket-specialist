@@ -20,7 +20,17 @@ from typing import Any, Protocol
 import numpy as np
 from PIL import Image
 
-from pocket_specialist.core.gpu import gpu_scheduler
+try:
+    from pocket_specialist.core.gpu import gpu_scheduler
+except Exception:  # pragma: no cover - isolated service fallback when torch is absent
+    from contextlib import contextmanager
+
+    class _FallbackGPUScheduler:
+        @contextmanager
+        def claim(self, _resource: str):
+            yield
+
+    gpu_scheduler = _FallbackGPUScheduler()
 
 
 _LAYOUT_LABEL_MAP = {
@@ -68,6 +78,18 @@ def normalize_layout_label(provider_label: str) -> str:
     return _LAYOUT_LABEL_MAP.get(normalized, _LAYOUT_LABEL_MAP.get(compact, normalized))
 
 
+def _normalize_model_name(model_name: str) -> str:
+    stripped = model_name.strip()
+    if not stripped:
+        return "PP-DocLayout_plus-L"
+    short_name = stripped.split("/", 1)[-1]
+    if short_name.endswith("_safetensors"):
+        short_name = short_name[: -len("_safetensors")]
+    if short_name in {"PP-DocLayoutV3", "PP-DocLayoutV3_safetensors"}:
+        return "PP-DocLayout_plus-L"
+    return short_name
+
+
 @dataclass(slots=True)
 class ServiceLayoutRegion:
     region_type: str
@@ -87,7 +109,7 @@ class ServiceLayoutResult:
 
 @dataclass(slots=True)
 class PaddleLayoutConfig:
-    model_name: str = "PP-DocLayoutV3_safetensors"
+    model_name: str = "PP-DocLayoutV3"
     img_size: int | list[int] | None = None
     threshold: float | None = None
     formula_threshold: float | None = None
@@ -126,7 +148,7 @@ class PaddleOCRLayoutRuntime:
             raise RuntimeError("PaddleOCR is not installed in the layout service environment") from exc
 
         kwargs: dict[str, object] = {
-            "model_name": self._config.model_name,
+            "model_name": _normalize_model_name(self._config.model_name),
             "device": "gpu" if _gpu_available() else "cpu",
             "enable_hpi": _gpu_available(),
         }
@@ -148,13 +170,9 @@ class PaddleOCRLayoutRuntime:
             predict_kwargs["img_size"] = self._config.img_size
         if self._config.layout_nms is not None:
             predict_kwargs["layout_nms"] = self._config.layout_nms
-        if self._config.layout_unclip_ratio is not None:
-            predict_kwargs["layout_unclip_ratio"] = self._config.layout_unclip_ratio
-        if self._config.layout_merge_bboxes_mode is not None:
-            predict_kwargs["layout_merge_bboxes_mode"] = self._config.layout_merge_bboxes_mode
 
         with gpu_scheduler.claim("layout"):
-            prediction = self._predictor.predict(**predict_kwargs)
+            prediction = _predict_with_supported_kwargs(self._predictor, predict_kwargs)
 
         raw_result = next(iter(prediction), None)
         raw_boxes = _extract_layout_boxes(raw_result)
@@ -228,6 +246,22 @@ def _normalize_polygon(raw_polygon: object) -> list[tuple[int, int]] | None:
         except (TypeError, ValueError):
             continue
     return points if len(points) >= 3 else None
+
+
+def _predict_with_supported_kwargs(predictor, kwargs: dict[str, object]):
+    current_kwargs = dict(kwargs)
+    while True:
+        try:
+            return predictor.predict(**current_kwargs)
+        except TypeError as exc:
+            message = str(exc)
+            marker = "unexpected keyword argument "
+            if marker not in message:
+                raise
+            keyword = message.split(marker, 1)[1].strip().replace("'", "").replace('"', "")
+            if keyword not in current_kwargs:
+                raise
+            current_kwargs.pop(keyword, None)
 
 
 def _bbox_from_payload(raw_box: dict[str, Any], polygon: list[tuple[int, int]] | None) -> tuple[int, int, int, int] | None:
@@ -330,7 +364,7 @@ class PaddleOCRLayoutRequestHandler(BaseHTTPRequestHandler):
 
 def _config_from_payload(payload: dict[str, Any]) -> PaddleLayoutConfig:
     return PaddleLayoutConfig(
-        model_name=str(payload.get("model_name") or "PP-DocLayoutV3_safetensors"),
+        model_name=str(payload.get("model_name") or "PP-DocLayoutV3"),
         img_size=payload.get("img_size") if isinstance(payload.get("img_size"), (int, list)) else None,
         threshold=float(payload["threshold"]) if payload.get("threshold") is not None else None,
         formula_threshold=float(payload["formula_threshold"]) if payload.get("formula_threshold") is not None else None,
