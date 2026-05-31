@@ -731,3 +731,66 @@ Current status:
 - PP-DocLayout comparison artifacts are available and usable.
 - The new comparison workflow is wired to the updated command structure and is ready for repeated provider checks.
 - The remaining open issue is the isolated PaddleOCR service `detect` runtime path; once that inference incompatibility is resolved, the same command should produce both provider bundles side by side without further CLI changes.
+
+## fix/surya-v2 - isolated Surya v2 service, provider-specific entry points, and blocked live verification
+
+This follow-up migrated the isolated Surya layout path to the Surya v2 runtime model, added provider-specific pipeline entry points so Surya and PP-DocLayout can be run without editing config, and attempted a real layout-only verification run against the repository PDF in `RAG-corpus`.
+
+Key changes:
+
+- `src/pocket_specialist/layout/service.py`
+  - Reworked the isolated Surya service from the old `FoundationPredictor` pattern to the Surya v2 `SuryaInferenceManager` + `LayoutPredictor` path.
+  - Expanded label normalization for the newer Surya output vocabulary and preserved extra v2 fields such as `raw_label`, `polygon`, and `count` in the service payload.
+  - Added a more defensive runtime wrapper around manager lifecycle and result field access so the repo-side `LayoutResult` contract stays stable even though the upstream Surya objects changed shape.
+- `services/surya_layout_service/requirements.txt`
+  - Re-pinned the isolated Surya service environment to `surya-ocr==0.20.0` and let Surya own the matching Transformers dependency rather than forcing the old v1 pin set.
+- `src/pocket_specialist/phases/extract.py`
+  - Threaded an explicit `layout_provider_name` override through the layout-only and structured extraction paths.
+  - This keeps the pipeline implementation shared while allowing the caller to select a provider at runtime instead of mutating `pipeline.toml` or environment defaults.
+- `src/pocket_specialist/cli.py`
+  - Added provider-scoped layout entry points:
+    - `layout-surya`
+    - `layout-pp-doclayout-v3`
+  - Added provider-scoped structured extraction entry points:
+    - `extract-structured-surya`
+    - `extract-structured-pp-doclayout-v3`
+  - Routed those commands through shared helpers that write to provider-scoped output directories so repeated runs do not overwrite each other.
+- `src/pocket_specialist/layout/compare.py`
+  - Updated the default comparison pair to `surya-layout-service` vs `pp-doclayout-v3`.
+- `tests/test_phase_c_formula.py`
+  - Removed stale expectations tied to the deleted in-process `SuryaLayoutProvider` path.
+  - Replaced them with coverage for the HTTP-backed Surya service payload normalization and the new Surya v2 runtime wrapper.
+
+Validation performed:
+
+- Syntax validation passed for the touched modules with:
+  - `python3 -m py_compile src/pocket_specialist/cli.py src/pocket_specialist/phases/extract.py src/pocket_specialist/layout/compare.py src/pocket_specialist/layout/service.py`
+- CLI registration validation in `.venv` confirmed the new commands are live:
+  - `layout`
+  - `layout-surya`
+  - `layout-pp-doclayout-v3`
+  - `extract-structured`
+  - `extract-structured-surya`
+  - `extract-structured-pp-doclayout-v3`
+  - `compare-layout-page`
+- Created an isolated Surya v2 service environment at `services/surya_layout_service/.venv` and confirmed it imports:
+  - `surya.inference`
+  - `surya.layout`
+  - `surya-ocr 0.20.0`
+- Real verification attempt against `RAG-corpus/unknown_2018_mpphys-many-particle-simulation-package.pdf`:
+  - started the isolated Surya service on `http://127.0.0.1:8004`
+  - ran `PIPELINE_LAYOUT_BASE_URL=http://127.0.0.1:8004 PYTHONPATH=src .venv/bin/python -m pocket_specialist.cli layout-surya RAG-corpus/unknown_2018_mpphys-many-particle-simulation-package.pdf`
+  - the layout phase processed rendering checkpoints but failed all `10` pages before any layout JSON was written
+  - direct `POST /detect` probing on rendered page 1 returned the concrete blocker:
+    - `{"error": "docker binary not found. Install Docker (https://docs.docker.com/get-docker/) and ensure the daemon is running."}`
+
+Current status:
+
+- The repository-side Surya v2 integration and the provider-specific entry points are in place.
+- The isolated Surya v2 environment itself imports correctly.
+- Live layout verification is currently blocked on this machine because the installed Surya v2 inference manager expects a Docker-backed backend and Docker is not available in the execution environment.
+- The PP-DocLayout-specific entry points remain usable independently of this blocker.
+
+Follow-up implication:
+
+- To complete real Surya v2 page verification on this machine, the next required environment change is to provide Docker or configure a supported non-Docker Surya inference backend that the installed `SuryaInferenceManager` can start locally.
