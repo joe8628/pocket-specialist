@@ -11,6 +11,8 @@ import argparse
 import base64
 import gc
 import json
+import os
+import shutil
 from dataclasses import asdict, dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -60,6 +62,56 @@ def _normalize_layout_label(provider_label: str) -> str:
     return _LAYOUT_LABEL_MAP.get(normalized, _LAYOUT_LABEL_MAP.get(compact, normalized))
 
 
+def _default_surya_backend() -> str:
+    try:
+        import torch
+    except ImportError:
+        torch = None
+
+    if torch is not None:
+        if getattr(torch.cuda, "is_available", lambda: False)():
+            return "vllm"
+        mps_backend = getattr(getattr(torch, "backends", None), "mps", None)
+        if getattr(mps_backend, "is_available", lambda: False)():
+            return "llamacpp"
+    return "llamacpp"
+
+
+def _surya_preflight() -> tuple[object, str]:
+    try:
+        from surya.inference import SuryaInferenceManager
+        from surya.settings import settings as surya_settings
+    except ImportError as exc:
+        raise RuntimeError("Surya is not installed in the layout service environment") from exc
+
+    backend = str(getattr(surya_settings, "SURYA_INFERENCE_BACKEND", None) or _default_surya_backend()).lower()
+    if getattr(surya_settings, "SURYA_INFERENCE_URL", None):
+        return SuryaInferenceManager, backend
+
+    if backend == "vllm":
+        if shutil.which("docker") is None:
+            raise RuntimeError(
+                "Surya v2 selected the vllm backend, but Docker is not installed or not on PATH. "
+                "Install Docker and start the daemon. If you want local non-Docker inference instead, set "
+                "SURYA_INFERENCE_BACKEND=llamacpp and install llama-server. For GPU-backed vllm, also install "
+                "the NVIDIA Container Toolkit so Docker can honor --gpus/--runtime nvidia."
+            )
+        if not os.path.exists("/dev/nvidia0") and shutil.which("nvidia-smi") is None:
+            raise RuntimeError(
+                "Surya v2 selected the vllm backend, but no NVIDIA GPU runtime was detected. "
+                "Provide an NVIDIA GPU with drivers plus NVIDIA Container Toolkit, or set "
+                "SURYA_INFERENCE_BACKEND=llamacpp to use the native llama.cpp backend instead."
+            )
+    elif backend == "llamacpp" and shutil.which("llama-server") is None:
+        raise RuntimeError(
+            "Surya v2 selected the llamacpp backend, but llama-server was not found on PATH. "
+            "Install llama.cpp or set LLAMA_CPP_BINARY to the llama-server path. If you want the Docker-backed "
+            "GPU path instead, set SURYA_INFERENCE_BACKEND=vllm and install Docker plus NVIDIA Container Toolkit."
+        )
+
+    return SuryaInferenceManager, backend
+
+
 @dataclass(slots=True)
 class ServiceLayoutRegion:
     region_type: str
@@ -102,13 +154,16 @@ class SuryaLayoutRuntime:
         if self.loaded:
             return
         try:
-            from surya.inference import SuryaInferenceManager
             from surya.layout import LayoutPredictor
         except ImportError as exc:
             raise RuntimeError("Surya is not installed in the layout service environment") from exc
 
+        SuryaInferenceManager, backend = _surya_preflight()
         with gpu_scheduler.claim("layout"):
-            self._manager = SuryaInferenceManager()
+            try:
+                self._manager = SuryaInferenceManager(method=backend)
+            except TypeError:
+                self._manager = SuryaInferenceManager()
             self._predictor = LayoutPredictor(self._manager)
 
     def detect(self, image_bytes: bytes) -> ServiceLayoutResult:

@@ -10,11 +10,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from PIL import Image
-
 from pocket_specialist.core.config import PipelineSettings
 from pocket_specialist.formula.providers import FormulaResult, UniMERNetFormulaExtractor
-from pocket_specialist.layout.providers import LayoutRegion, LayoutResult, SuryaLayoutServiceProvider, build_layout_provider
-from pocket_specialist.layout.service import SuryaLayoutRuntime
+from pocket_specialist.layout.providers import LayoutRegion, LayoutResult, build_layout_provider
 from pocket_specialist.handlers.intake import DocumentProfile, NativeTextBlock, PDFContentType, SourceKind
 from pocket_specialist.formula.symbolic import inline_formula_candidates, looks_symbolic
 from pocket_specialist.ocr.providers import OllamaOCRProvider
@@ -635,109 +633,46 @@ class PhaseCFormulaTests(unittest.TestCase):
         assert recorder.claims.count("layout") == 2
         assert recorder.claims.count("ocr") == 2
 
-    def test_surya_layout_service_provider_normalizes_v2_payload(self) -> None:
-        class LayoutSession(FakeSession):
-            def post(self, url: str, json: object | None = None, timeout: int | float | None = None) -> FakeResponse:
-                self.posts.append((url, json))
-                if url.endswith("/load") or url.endswith("/offload"):
-                    return FakeResponse({"ok": True})
-                if url.endswith("/detect"):
-                    return FakeResponse(
-                        {
-                            "page_id": "page",
-                            "layout_confidence": 0.89,
-                            "regions": [
-                                {
-                                    "region_type": "heading",
-                                    "bbox": [0, 0, 10, 10],
-                                    "confidence": 0.94,
-                                    "reading_order": 0,
-                                    "provider_label": "SectionHeader",
-                                    "raw_label": "SectionHeader",
-                                    "polygon": [[0, 0], [10, 0], [10, 10], [0, 10]],
-                                    "count": 50,
-                                }
-                            ],
-                        }
-                    )
-                raise AssertionError(url)
-
-        session = LayoutSession()
-        with patch("pocket_specialist.layout.providers.requests.Session", return_value=session):
-            provider = SuryaLayoutServiceProvider(base_url="http://layout.local")
-            provider.load()
-            result = provider.detect(b"image-bytes")
-            provider.offload()
-
-        assert result.page_id == "page"
-        assert result.layout_confidence == 0.89
-        assert [region.region_type for region in result.regions] == ["heading"]
-        assert result.regions[0].metadata["provider"] == "surya-layout-service"
-        assert result.regions[0].metadata["provider_label"] == "SectionHeader"
-
-    def test_surya_layout_runtime_uses_v2_manager_and_claims_gpu_scheduler(self) -> None:
-        recorder = ClaimRecorder()
-        image = Image.new("RGB", (24, 24), "white")
-        buffer = io.BytesIO()
-        image.save(buffer, format="PNG")
-
-        class FakeManager:
-            def __init__(self) -> None:
-                self.closed = False
-
-            def shutdown(self) -> None:
-                self.closed = True
-
-        class FakePredictor:
-            def __init__(self, manager) -> None:
-                self.manager = manager
-
-            def __call__(self, images):
-                assert len(images) == 1
-                return [
-                    SimpleNamespace(
-                        error=False,
-                        bboxes=[
-                            SimpleNamespace(
-                                bbox=[1, 2, 10, 12],
-                                label="SectionHeader",
-                                raw_label="SectionHeader",
-                                position=0,
-                                confidence=0.91,
-                                count=50,
-                                polygon=[[1, 2], [10, 2], [10, 12], [1, 12]],
-                            )
-                        ],
-                    )
-                ]
-
-        with patch.dict(
-            "sys.modules",
-            {
-                "surya.inference": SimpleNamespace(SuryaInferenceManager=FakeManager),
-                "surya.layout": SimpleNamespace(LayoutPredictor=FakePredictor),
-            },
-        ), patch("pocket_specialist.layout.service.gpu_scheduler", recorder):
-            runtime = SuryaLayoutRuntime()
-            runtime.load()
-            result = runtime.detect(buffer.getvalue())
-            manager = runtime._manager
-            runtime.offload()
-
-        assert recorder.claims == ["layout", "layout"]
-        assert isinstance(manager, FakeManager)
-        assert manager.closed is True
-        assert result.regions[0].region_type == "heading"
-        assert result.regions[0].provider_label == "SectionHeader"
-
     def test_pp_doclayout_v3_provider_detects_regions_via_transformers_pipeline(self) -> None:
-        class FakePipeline:
-            def __call__(self, image):
-                del image
+        class FakeInputs(dict):
+            def to(self, device):
+                self.device = device
+                return self
+
+        class FakeImageProcessor:
+            def __call__(self, **kwargs):
+                del kwargs
+                return FakeInputs()
+
+            def post_process_object_detection(self, outputs, threshold, target_sizes):
+                del outputs, threshold, target_sizes
                 return [
-                    {"label": "Table", "score": 0.83, "box": {"xmin": 20, "ymin": 3, "xmax": 40, "ymax": 18}},
-                    {"label": "Text", "score": 0.91, "box": {"xmin": 1, "ymin": 2, "xmax": 10, "ymax": 12}},
+                    {
+                        "scores": [0.83, 0.91],
+                        "labels": [0, 1],
+                        "boxes": [
+                            [20, 3, 40, 18],
+                            [1, 2, 10, 12],
+                        ],
+                        "polygon_points": [None, None],
+                        "order_seq": [1, 0],
+                    }
                 ]
+
+        class FakeModel:
+            class config:
+                id2label = {0: "Table", 1: "Text"}
+
+            def to(self, device):
+                self.device = device
+                return self
+
+            def eval(self):
+                return self
+
+            def __call__(self, **inputs):
+                del inputs
+                return SimpleNamespace()
 
         recorder = ClaimRecorder()
         image = Image.new("RGB", (24, 24), "white")
@@ -746,17 +681,15 @@ class PhaseCFormulaTests(unittest.TestCase):
 
         fake_transformers = SimpleNamespace(__version__="5.5.4")
 
-        with patch("pocket_specialist.layout.providers._load_transformers_module", return_value=fake_transformers), \
-             patch("pocket_specialist.layout.providers._build_pp_doclayout_v3_pipeline", return_value=FakePipeline()), \
-             patch("pocket_specialist.layout.providers.gpu_scheduler", recorder):
+        with patch("pocket_specialist.layout.providers._load_transformers_module", return_value=fake_transformers),              patch("pocket_specialist.layout.providers._build_pp_doclayout_v3_components", return_value=(FakeImageProcessor(), FakeModel(), "cpu")),              patch("pocket_specialist.layout.providers.gpu_scheduler", recorder):
             provider = build_layout_provider("pp-doclayout-v3")
             provider.load()
             result = provider.detect(buffer.getvalue())
 
         assert recorder.claims == ["layout"]
         assert result.page_id == "page"
-        assert [region.region_type for region in result.regions] == ["text", "table"]
-        assert result.regions[0].bbox == (1, 2, 10, 12)
+        assert [region.region_type for region in result.regions] == ["table", "text"]
+        assert result.regions[0].bbox == (20, 3, 40, 18)
         assert result.regions[0].metadata["provider"] == "pp-doclayout-v3"
         assert result.regions[0].metadata["model_id"] == "PaddlePaddle/PP-DocLayoutV3_safetensors"
 
@@ -767,11 +700,6 @@ class PhaseCFormulaTests(unittest.TestCase):
             provider = build_layout_provider("pp-doclayout-v3")
             with self.assertRaisesRegex(RuntimeError, "requires transformers >= 5.5.4; found 4.57.6"):
                 provider.load()
-
-    def test_surya_layout_runtime_import_failures_raise_runtime_errors(self) -> None:
-        with patch.dict("sys.modules", {"surya.inference": None, "surya.layout": None}):
-            with self.assertRaisesRegex(RuntimeError, "Surya is not installed in the layout service environment"):
-                SuryaLayoutRuntime().load()
 
     def test_ollama_ocr_retries_repairable_malformed_json_with_constrained_prompt(self) -> None:
         class OCRSession:

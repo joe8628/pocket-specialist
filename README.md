@@ -68,6 +68,131 @@ If the package is not installed editable in the active environment, run commands
 PYTHONPATH=src .venv/bin/python -m pocket_specialist.cli --help
 ```
 
+## Surya V2 Setup
+
+Surya v2 in this repo runs through the isolated layout service in `src/pocket_specialist/layout/service.py`. The repository-side pipeline can call that service directly, but the Surya runtime itself has additional backend requirements that are not covered by the main `.venv`.
+
+### Option 1: Docker + NVIDIA GPU (`vllm`)
+
+This is the default Surya v2 path on Linux when an NVIDIA GPU is detected. It requires host-level dependencies in addition to the isolated service virtualenv:
+
+- Docker installed and available on `PATH`
+- Docker daemon running
+- NVIDIA drivers installed
+- NVIDIA Container Toolkit installed so Docker can use GPU flags such as `--gpus` / `--runtime nvidia`
+
+#### Host setup checklist
+
+1. Install Docker and make sure the CLI is on your shell `PATH`.
+2. Install the NVIDIA driver for your GPU and verify the host can see it:
+
+```bash
+nvidia-smi -L
+```
+
+3. Install NVIDIA Container Toolkit and restart Docker so GPU containers are enabled.
+4. Verify Docker itself is reachable:
+
+```bash
+docker --version
+docker info
+```
+
+5. Verify Docker can access the GPU:
+
+```bash
+docker run --rm --gpus all nvidia/cuda:12.3.2-base-ubuntu22.04 nvidia-smi
+```
+
+If `docker --version` fails with `docker: command not found`, Docker is either not installed or not on the current shell `PATH`. Check with:
+
+```bash
+which docker
+command -v docker
+echo $PATH
+```
+
+If `docker info` fails, the daemon is not reachable from the current user/session.
+
+#### Ubuntu-style install outline
+
+The exact package names may vary by distro, but on Ubuntu-like systems the host setup usually looks like this:
+
+```bash
+# Docker
+sudo apt-get update
+sudo apt-get install -y docker.io
+sudo systemctl enable --now docker
+
+# Optional: allow running docker without sudo after re-login
+sudo usermod -aG docker $USER
+
+# NVIDIA driver verification
+nvidia-smi -L
+```
+
+Then install NVIDIA Container Toolkit using the official NVIDIA instructions for your distro and restart Docker. After that, rerun the Docker verification commands above before starting the Surya service.
+
+Create the isolated Surya service environment:
+
+```bash
+python3 -m venv services/surya_layout_service/.venv
+services/surya_layout_service/.venv/bin/pip install -r services/surya_layout_service/requirements.txt
+```
+
+Recommended environment for a single-GPU host using an RTX 2080 Ti:
+
+```bash
+export SURYA_INFERENCE_BACKEND=vllm
+export VLLM_GPUS=0
+export VLLM_GPU_TYPE=4090
+export VLLM_DTYPE=float16
+export DOCKER_HF_CACHE_PATH=$HOME/.cache/huggingface
+```
+
+The installed Surya package does not currently list `2080ti` as a supported `VLLM_GPU_TYPE` value. On this hardware, use `VLLM_GPU_TYPE=4090` as a sizing override and force `VLLM_DTYPE=float16` because RTX 2080 Ti is a Turing-generation card and should not use the default `bfloat16` path. You may still need to tune `VLLM_GPU_MEMORY_UTILIZATION` or switch to `SURYA_INFERENCE_BACKEND=llamacpp` if the `vllm` container proves too heavy for the card.
+
+Start the isolated Surya service:
+
+```bash
+PYTHONPATH=src services/surya_layout_service/.venv/bin/python \
+  -m pocket_specialist.layout.service --host 127.0.0.1 --port 8004
+```
+
+Then point the pipeline at that service for the current run:
+
+```bash
+PIPELINE_LAYOUT_BASE_URL=http://127.0.0.1:8004 \
+PYTHONPATH=src .venv/bin/python -m pocket_specialist.cli layout-surya /path/to/file.pdf
+```
+
+Or run the full structured path:
+
+```bash
+PIPELINE_LAYOUT_BASE_URL=http://127.0.0.1:8004 \
+PYTHONPATH=src .venv/bin/python -m pocket_specialist.cli extract-structured-surya /path/to/file.pdf
+```
+
+### Option 2: Native `llama.cpp` (`llamacpp`)
+
+If you do not want Docker, Surya v2 can use its `llamacpp` backend instead. That path requires:
+
+- `llama-server` installed and available on `PATH`, or `LLAMA_CPP_BINARY` set explicitly
+- enough local disk/cache space for the Surya GGUF assets
+
+Example:
+
+```bash
+export SURYA_INFERENCE_BACKEND=llamacpp
+export LLAMA_CPP_BINARY=$(command -v llama-server)
+```
+
+Then start the same isolated service command shown above.
+
+### Preflight behavior
+
+The Surya layout service now performs a startup preflight before model initialization. If Surya v2 selects `vllm` and Docker or NVIDIA runtime support is missing, the service returns a clear error immediately instead of timing out later during page detection. The same applies to the `llamacpp` path when `llama-server` is not installed.
+
 ## CLI
 
 The current CLI exposes both the active structured extraction path and legacy compatibility commands:

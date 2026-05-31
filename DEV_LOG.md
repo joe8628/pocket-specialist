@@ -794,3 +794,28 @@ Current status:
 Follow-up implication:
 
 - To complete real Surya v2 page verification on this machine, the next required environment change is to provide Docker or configure a supported non-Docker Surya inference backend that the installed `SuryaInferenceManager` can start locally.
+
+
+## Surya v2 vLLM diagnostics and test isolation
+
+This update was driven by an operational failure mode in the isolated Surya layout service. The service itself was healthy, but first-request layout work was timing out because the client-side layout timeout was far shorter than the backend cold-start path.
+
+Key findings:
+
+- The isolated Surya service venv is on `surya-ocr 0.20.0`, while the main repo venv still carries `surya-ocr 0.17.1`. The v2 behavior lives only in the service environment.
+- `surya/inference/__init__.py` in the service venv uses a lazy `SuryaInferenceManager` that auto-selects `vllm` on NVIDIA GPUs and spawns `vllm/vllm-openai:v0.20.1` via Docker.
+- The cached vLLM sentinel at `~/.cache/datalab/surya/vllm_server.json` pointed at `surya-vllm-57275` with `pid: null`, which is consistent with Docker-backed startup/cleanup rather than a native process.
+- The vLLM container on the RTX 2080 Ti took roughly 294 seconds to fully initialize on first cold start, including weight download, model load, torch compile, and warmup.
+- The repo-side layout HTTP client still enforces a 60 second detect timeout, so the first page request can fail even though the backend later becomes healthy.
+- Once the backend is warm, page-6 layout detection completes quickly: the page-6-only comparison ran in 4.37 seconds and produced 26 regions.
+
+Verification:
+
+- Installed `PyMuPDF` into `services/surya_layout_service/.venv` so the service env could render PDF pages directly.
+- Added a dedicated `tests/test_surya_layout_service.py` so Surya runtime and HTTP-client checks no longer depend on `pp-doclayout` coverage.
+- Confirmed the Surya page-6 formula boxes align with the rendered page and correspond to equations (15), (16), (17), and (18) on the PDF page.
+- The formula boxes were verified in PDF geometry space, not just by label; each detected formula box overlapped the expected equation text on the rendered page.
+
+Follow-up implication:
+
+- The actionable failure is a timeout mismatch, not a broken model path. If the cold-start path needs to remain supported, the layout client timeout should be raised or the service should be pre-warmed before page work begins.
