@@ -192,3 +192,43 @@ def test_surya_layout_runtime_import_failures_raise_runtime_errors() -> None:
                 assert "Surya is not installed in the layout service environment" in str(exc)
             else:  # pragma: no cover - defensive
                 raise AssertionError("expected runtime error")
+
+
+def test_surya_layout_runtime_offload_stops_spawned_vllm_container() -> None:
+    stopped = {"manager": False, "docker": None}
+
+    class FakeHandle:
+        base_url = "http://127.0.0.1:57275/v1"
+        spawned_by_us = True
+
+    class FakeBackend:
+        name = "vllm"
+
+        def __init__(self) -> None:
+            self.handle = FakeHandle()
+
+    class FakeManager:
+        def __init__(self) -> None:
+            self.backend = FakeBackend()
+
+        def stop(self) -> None:
+            stopped["manager"] = True
+
+    runtime = SuryaLayoutRuntime()
+    runtime._predictor = object()
+    runtime._manager = FakeManager()
+
+    def fake_run(cmd, check=False, capture_output=False, timeout=None):
+        stopped["docker"] = cmd
+        class Result:
+            returncode = 0
+        return Result()
+
+    with patch("pocket_specialist.layout.service.shutil.which", return_value="/usr/bin/docker"), \
+         patch("pocket_specialist.layout.service.subprocess.run", side_effect=fake_run):
+        runtime.offload()
+
+    assert runtime._manager is None
+    assert runtime._predictor is None
+    assert stopped["manager"] is True
+    assert stopped["docker"] == ["/usr/bin/docker", "stop", "surya-vllm-57275"]

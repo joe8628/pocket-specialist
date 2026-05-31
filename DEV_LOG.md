@@ -819,3 +819,24 @@ Verification:
 Follow-up implication:
 
 - The actionable failure is a timeout mismatch, not a broken model path. If the cold-start path needs to remain supported, the layout client timeout should be raised or the service should be pre-warmed before page work begins.
+
+
+## Surya v2 offload correctness
+
+This update tightened the Surya runtime teardown path so the isolated layout service now actually offloads the backend rather than only dropping Python references.
+
+Key decisions:
+
+- `SuryaLayoutRuntime.offload()` now prefers the v2 manager's explicit `stop()` method and falls back to the older shutdown/close/terminate methods for compatibility.
+- When the loaded backend is Docker-backed vLLM and the backend was spawned by the service, the runtime now stops the matching `surya-vllm-<port>` container during offload.
+- The same teardown path preserves the older llama.cpp process cleanup behavior for completeness.
+
+Validation performed:
+
+- Added a regression test in `tests/test_surya_layout_service.py` proving that offload calls the manager stop hook and issues `docker stop surya-vllm-57275` for a spawned vLLM backend.
+- Verified the live container `surya-vllm-57275` was stopped before commit time.
+- Ran `PYTHONPATH=src .venv/bin/python -m pytest tests/test_surya_layout_service.py -q` and confirmed `5 passed`.
+
+Follow-up implication:
+
+- Surya's `load()`/`detect()` lifecycle remains lazy, but `offload()` now matches the operational intent: the model backend is actually torn down when the service is released.

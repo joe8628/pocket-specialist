@@ -13,6 +13,9 @@ import gc
 import json
 import os
 import shutil
+import subprocess
+from pathlib import Path
+from urllib.parse import urlparse
 from dataclasses import asdict, dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -214,11 +217,7 @@ class SuryaLayoutRuntime:
         manager = self._manager
         self._manager = None
         if manager is not None:
-            for method_name in ("shutdown", "close", "terminate"):
-                method = getattr(manager, method_name, None)
-                if callable(method):
-                    method()
-                    break
+            self._stop_loaded_backend(manager)
         gc.collect()
         try:
             import torch
@@ -227,6 +226,58 @@ class SuryaLayoutRuntime:
                 torch.cuda.empty_cache()
         except ImportError:
             pass
+
+    def _stop_loaded_backend(self, manager: object) -> None:
+        stop = getattr(manager, "stop", None)
+        if callable(stop):
+            stop()
+        else:
+            for method_name in ("shutdown", "close", "terminate"):
+                method = getattr(manager, method_name, None)
+                if callable(method):
+                    method()
+                    break
+
+        backend = getattr(manager, "backend", None)
+        handle = getattr(backend, "handle", None)
+        if handle is None or not getattr(handle, "spawned_by_us", False):
+            return
+
+        backend_name = str(getattr(backend, "name", "")).strip().lower()
+        if backend_name == "vllm":
+            self._stop_vllm_container(handle)
+            return
+        if backend_name == "llamacpp":
+            self._stop_llamacpp_process()
+
+    def _stop_vllm_container(self, handle: object) -> None:
+        port = urlparse(str(getattr(handle, "base_url", ""))).port
+        if port is None:
+            return
+        docker = shutil.which("docker")
+        if docker is None:
+            return
+        container_name = f"surya-vllm-{port}"
+        subprocess.run([docker, "stop", container_name], check=False, capture_output=True, timeout=30)
+
+    def _stop_llamacpp_process(self) -> None:
+        sentinel_path = Path(os.path.expanduser("~/.cache/datalab/surya/llamacpp_server.json"))
+        if not sentinel_path.exists():
+            return
+        try:
+            payload = json.loads(sentinel_path.read_text())
+        except Exception:
+            return
+        pid = payload.get("pid")
+        if not isinstance(pid, int) or pid <= 0:
+            return
+        for signum in (15, 9):
+            try:
+                os.kill(pid, signum)
+            except ProcessLookupError:
+                break
+            except Exception:
+                break
 
 
 @dataclass(slots=True)
