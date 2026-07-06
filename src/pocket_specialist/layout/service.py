@@ -228,6 +228,12 @@ class SuryaLayoutRuntime:
             pass
 
     def _stop_loaded_backend(self, manager: object) -> None:
+        # Snapshot the backend handle first: Surya's manager.stop() cascades to
+        # backend.stop(), which nulls backend.handle without stopping the
+        # spawned vLLM container.
+        backend = getattr(manager, "backend", None)
+        handle = getattr(backend, "handle", None)
+
         stop = getattr(manager, "stop", None)
         if callable(stop):
             stop()
@@ -238,8 +244,6 @@ class SuryaLayoutRuntime:
                     method()
                     break
 
-        backend = getattr(manager, "backend", None)
-        handle = getattr(backend, "handle", None)
         if handle is None or not getattr(handle, "spawned_by_us", False):
             return
 

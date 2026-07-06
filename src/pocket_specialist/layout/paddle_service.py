@@ -152,6 +152,11 @@ class PaddleOCRLayoutRuntime:
             "device": "gpu" if _gpu_available() else "cpu",
             "enable_hpi": _gpu_available(),
         }
+        if not _gpu_available():
+            # Paddle 3.3 PIR + oneDNN cannot execute this model on CPU
+            # (ConvertPirAttribute2RuntimeAttribute, onednn_instruction.cc);
+            # plain CPU inference works.
+            kwargs["enable_mkldnn"] = False
         if self._config.layout_merge_bboxes_mode is not None:
             kwargs["layout_merge_bboxes_mode"] = self._config.layout_merge_bboxes_mode
         with gpu_scheduler.claim("layout"):
@@ -266,6 +271,12 @@ def _predict_with_supported_kwargs(predictor, kwargs: dict[str, object]):
 
 def _bbox_from_payload(raw_box: dict[str, Any], polygon: list[tuple[int, int]] | None) -> tuple[int, int, int, int] | None:
     bbox = raw_box.get("bbox") or raw_box.get("box")
+    if bbox is None:
+        # PaddleX DetResult stores the box as a flat [xmin, ymin, xmax, ymax]
+        # under "coordinate".
+        coordinate = raw_box.get("coordinate")
+        if isinstance(coordinate, (list, tuple)) and len(coordinate) == 4:
+            bbox = list(coordinate)
     if isinstance(bbox, dict):
         try:
             return (

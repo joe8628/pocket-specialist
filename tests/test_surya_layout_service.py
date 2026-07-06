@@ -213,6 +213,9 @@ def test_surya_layout_runtime_offload_stops_spawned_vllm_container() -> None:
 
         def stop(self) -> None:
             stopped["manager"] = True
+            # Mirror surya's real behavior: backend.stop() nulls the handle
+            # without stopping the spawned container.
+            self.backend.handle = None
 
     runtime = SuryaLayoutRuntime()
     runtime._predictor = object()

@@ -1187,6 +1187,7 @@ def _run_layout_enabled_pdf_graph(
     structured_dir: Path,
     layout_dir: Path,
     cif: CanonicalIntermediateFormat,
+    layout_provider_name: str | None = None,
 ) -> tuple[int, int]:
     page_modes = profile.metadata.get("page_modes", [])
     tasks: list[ExtractionTask] = []
@@ -1785,6 +1786,7 @@ def extract_structured_document(
         structured_dir=structured_dir,
         layout_dir=layout_dir,
         cif=cif,
+        layout_provider_name=layout_provider_name,
     )
     document_path = structured_dir / "document.json"
     _write_json(document_path, asdict(cif))
