@@ -282,16 +282,15 @@ def _check_ollama(model: str) -> None:
     try:
         resp = requests.get(f"{_OLLAMA_BASE}/api/tags", timeout=5)
         resp.raise_for_status()
-    except Exception:
-        print(f"Error: Ollama is not running. Start it with: ollama serve", file=sys.stderr)
-        sys.exit(1)
+    except Exception as exc:
+        raise RuntimeError("Ollama is not running. Start it with: ollama serve") from exc
 
     names = [m["name"] for m in resp.json().get("models", [])]
     if not any(m.startswith(model.split(":")[0]) for m in names):
-        print(f"Error: model '{model}' not found in Ollama.", file=sys.stderr)
-        print(f"Pull it with: ollama pull {model}", file=sys.stderr)
-        print(f"Available: {names}", file=sys.stderr)
-        sys.exit(1)
+        raise RuntimeError(
+            f"model '{model}' not found in Ollama. Pull it with: ollama pull {model}. "
+            f"Available: {names}"
+        )
 
 
 def _coverage_ok(blocks: list[TextBlock], markdown: str, min_ratio: float = 0.50) -> bool:

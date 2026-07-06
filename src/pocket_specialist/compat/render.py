@@ -1,7 +1,6 @@
 """Document rasterization utilities for page-level image generation via PyMuPDF."""
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 from typing import cast
 
@@ -40,8 +39,7 @@ def render_pdf(
     Returns (n_done, n_failed).
     """
     if not pdf_path.exists():
-        print(f"Error: PDF not found: {pdf_path}", file=sys.stderr)
-        sys.exit(1)
+        raise FileNotFoundError(f"PDF not found: {pdf_path}")
 
     document = document_slug(pdf_path)
     phase_start("render", str(pdf_path))
@@ -52,13 +50,11 @@ def render_pdf(
     try:
         doc = fitz.open(str(pdf_path))
     except Exception as exc:
-        print(f"Error: cannot open PDF — {exc}", file=sys.stderr)
-        sys.exit(1)
+        raise RuntimeError(f"cannot open PDF — {exc}") from exc
 
     if doc.is_encrypted:
-        print("Error: PDF is encrypted. Decrypt the file and retry.", file=sys.stderr)
         doc.close()
-        sys.exit(1)
+        raise RuntimeError("PDF is encrypted. Decrypt the file and retry.")
 
     total = len(doc)
     end = min(end_page, total) if end_page else total
@@ -66,9 +62,8 @@ def render_pdf(
     phase_validation("render", f"document={document} pages={start_page}-{end} output={output_dir} dpi={effective_dpi:.0f}")
 
     if start_page < 1 or start_page > total:
-        print(f"Error: start_page {start_page} out of range (1–{total}).", file=sys.stderr)
         doc.close()
-        sys.exit(1)
+        raise ValueError(f"start_page {start_page} out of range (1–{total}).")
 
     done = failed = skipped = 0
 

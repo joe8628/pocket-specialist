@@ -50,9 +50,8 @@ def _load_layout():
         from surya.foundation import FoundationPredictor
         from surya.layout import LayoutPredictor
         from surya.settings import settings
-    except ImportError:
-        print("Error: surya-ocr is not installed. Run: pip install surya-ocr", file=sys.stderr)
-        sys.exit(1)
+    except ImportError as exc:
+        raise RuntimeError("surya-ocr is not installed. Run: pip install surya-ocr") from exc
     foundation = FoundationPredictor(checkpoint=settings.LAYOUT_MODEL_CHECKPOINT)
     return LayoutPredictor(foundation), foundation
 
@@ -62,9 +61,8 @@ def _load_latex_ocr():
         from surya.foundation import FoundationPredictor
         from surya.recognition import RecognitionPredictor
         from surya.settings import settings
-    except ImportError:
-        print("Error: surya-ocr is not installed. Run: pip install surya-ocr", file=sys.stderr)
-        sys.exit(1)
+    except ImportError as exc:
+        raise RuntimeError("surya-ocr is not installed. Run: pip install surya-ocr") from exc
     foundation = FoundationPredictor(checkpoint=settings.RECOGNITION_MODEL_CHECKPOINT)
     return RecognitionPredictor(foundation), foundation
 
