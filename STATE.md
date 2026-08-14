@@ -4,7 +4,7 @@
 > This is your fast recovery point after `/clear` or compaction. Keep it current
 > over comprehensive — stale state is worse than none.
 
-**Last updated:** 2026-07-06
+**Last updated:** 2026-08-14
 **Active branch / worktree:** fix/pp-doclayout
 
 ---
@@ -14,97 +14,116 @@
 > The ONE thing in flight right now. One or two sentences. This is the line the
 > compaction directives are told to preserve verbatim.
 
-Decide which layout model to standardize on. All three providers are now
-verified working end-to-end on this machine (PP-DocLayoutV3 in-process,
-PaddleOCR service after the oneDNN fix, Surya v2 service after the float16 fix)
-— run the page comparisons and record the decision as a `wiki/DEC-XXXX.md`.
+Build the **controlled-mode** layout comparison (DEC-0017): a single render
+process with per-provider `RenderSpec` (DEC-0016), one shared label map, and one
+threshold applied in one place — then make the layout standardization decision
+from that. The previously recorded page-6 numbers are invalid evidence (RUL-0007).
 
 ## Done (recent, relevant)
 
-- [x] Deep-dive review of `src/` against `docs/document_intelligence_pipeline_spec_v_0_5_1_beta_complete.md`:
-  §5/§6/§8/§9/§10/§11/§14.3/§17 contracts conform (often richer than spec).
-  Gaps: Phase D absent (known), §15 telemetry absent (Phase E), §16 MIME
-  sniffing only for PDF/HTML magic, `scripts/ingest.py` absent, no
-  cross-provider OCR fallback escalation in the Ollama providers.
-- [x] **Fixed P0**: `extract.py` `_run_layout_enabled_pdf_graph` referenced an
-  undeclared `layout_provider_name` (introduced in 424463f) → NameError on every
-  layout-enabled PDF page; structured extraction produced 0 blocks. Parameter now
-  threaded from `extract_structured_document`. Suite: 5 failed → 3 failed.
-- [x] **Fixed the PaddleOCR blocker** (DEC-0015): `enable_mkldnn=False` on CPU
-  restores `/detect` (Paddle 3.3 PIR/oneDNN bug), plus bbox parsing of PaddleX
-  `DetResult.coordinate` (boxes were silently dropped → 0 regions). Verified:
-  51 regions on mpphys page 6 @192 DPI, distribution ≈ PP-DocLayout.
-- [x] **Diagnosed + fixed Surya cold start** (RUL-0006): vLLM backend defaults to
-  bfloat16, rejected by RTX 2080 Ti (CC 7.5); `--rm` container died instantly and
-  the spawner polled a ghost for 600 s. With `VLLM_DTYPE=float16`: cold 417 s,
-  warm 3.3 s, 26 regions on page 6.
-- [x] **Fixed DEC-0004 violation in Surya offload**: `manager.stop()` nulls
-  `backend.handle` before the service read it, so the vLLM container (10.8 GB
-  VRAM) survived `/offload`. Handle is now snapshotted first; the unit-test fake
-  now mirrors Surya's real `stop()` so this regression is actually covered.
-- [x] 3-provider runtime verification on mpphys page 6 @192 DPI:
-  PP-DocLayoutV3 55 regions (29 formula, conf 0.81, ~7 s incl. load);
-  PaddleOCR 51 regions (25 formula, conf 0.86); Surya 26 regions (4 formula).
-- [x] Wiki records RUL-0006 + DEC-0015 created; index regenerated (24 records).
-- [x] Previous session: RUL-0002/DEC-0014 fixes in `compat/` (sys.exit → raise).
+**This session (analysis + decisions only — no code changed):**
+
+- [x] **Full code review of the path up to layout detection** → `docs/layout-path-review.md`
+  (implementation-vs-expected mermaid diagrams + a 15-row divergence table C1–C15).
+- [x] **Established the page-6 comparison is invalid.** `pipeline.toml` sets
+  `threshold=0.5 / formula_threshold=0.6 / img_size=800`, which reach
+  PP-DocLayoutV3 and PaddleOCR. Surya sends `{"provider": name}` on `/load` and
+  applies **no threshold at all** — its 26 regions are unfiltered against two
+  filtered counts. Plus three divergent label maps and a `confidence or 1.0`
+  default. → RUL-0007, DEC-0017.
+- [x] **Verified PP-DocLayoutV3 resizes every input to 800×800**, bicubic,
+  non-aspect-preserving. Ran the processor at 144/192/300/400 DPI → all produce
+  `(1,3,800,800)`. Render DPI above ~2× the target long edge is waste for
+  PP/Paddle; only Surya (dynamic-resolution VLM) can use more pixels. → CON-0004.
+- [x] **Measured the image plumbing** (page 6, 192 DPI): PNG encode 42.1 ms vs
+  4.9 ms to rasterize (8.6×); bitmap→PIL 59.8 ms via PNG round-trip vs 1.1 ms via
+  `pix.samples` (57×); 55 region crops 991 ms vs 18 ms (56×). A 55-region page
+  spends ~1.05 s on plumbing for ~20 ms of real work. → DEC-0016.
+- [x] **Two real bugs found** (not yet fixed): provider offload sits outside any
+  `try/finally` at both graph sites (`extract.py:1496-1510`, `1591-1593`) —
+  DEC-0004 violation, leaks the model on exception. And the client label map is
+  **dead code** for service providers (`providers.py:450`, `or` short-circuits).
+- [x] **Web scan of the 2026 model landscape.** PP-DocLayoutV3 == RT-DocLayout
+  (arXiv 2606.23344, ECCV 2026, 33M params, 92.46%, 132.1 FPS) — i.e. the current
+  default *is* current SOTA, and is the layout stage inside both PaddleOCR-VL-1.6
+  and GLM-OCR. **DEC-0006 is re-validated, not weakened.** New candidate worth a
+  comparison row: Surya's 20M rf-detr/ONNX **CPU** fast-layout model (v0.21.0,
+  Jul 2026) — sidesteps RUL-0006's float16 issue, the 417 s cold start, and the
+  10.8 GB VRAM. OCR note: OmniDocBench v1.6 leader PaddleOCR-VL-1.6 requires
+  CC ≥ 8.0 and is **not deployable on this 2080 Ti**; GLM-OCR (MIT, 0.9B, 95.22)
+  is the best fit and already a configured provider name.
+- [x] Wiki records created: **CON-0004, DEC-0016, DEC-0017, RUL-0007**; index
+  regenerated (28 records: 4 concepts, 7 rules, 12 decisions, 5 rejected).
+
+**Previous sessions (committed in `443f993`, `83273d3`):**
+
+- [x] Fixed P0 `NameError` on `layout_provider_name` in `_run_layout_enabled_pdf_graph`.
+- [x] Fixed the PaddleOCR blocker (DEC-0015): `enable_mkldnn=False` + `coordinate` bbox parsing.
+- [x] Diagnosed + fixed Surya cold start (RUL-0006): `VLLM_DTYPE=float16`.
+- [x] Fixed DEC-0004 violation in Surya offload (handle snapshotted before `manager.stop()`).
+- [x] RUL-0002/DEC-0014 fixes in `compat/` (sys.exit → raise).
 
 ## In Progress
 
-- [ ] Layout provider comparison across real pages — all 3 providers now usable;
-  only page 6 compared so far.
+- [ ] Nothing mid-edit. Next action is the DEC-0016 implementation (below).
 
 ## Next
 
-- [ ] **Commit the pending work** (everything below is verified but uncommitted):
-  suggest two commits — (1) `compat/` RUL-0002 sys.exit fixes, (2) this session's
-  layout/extract fixes + hardened test + wiki records + STATE.md.
-- [ ] **Decide the default layout model** (currently `pp-doclayout-v3`, DEC-0006)
-  from multi-page comparisons; record as `wiki/DEC-XXXX.md`. Key signal so far:
-  Paddle-family sees 25–29 formula regions/page, Surya sees 4.
-- [ ] **Decide formula-fallback semantics (spec §8.5 / RUL-0003)**: the
-  ocr/formula split left `_formula_page_blocks` re-raising on extractor failure
-  (`extract.py` ~line 617 — makes the fallback contract dead code), takes no OCR
-  provider, and emits `FormulaFallback` with empty `raw_formula_text`;
-  `formula.fallback_to_ocr` config is not honored there. Decide intended
-  behavior, then repair the 3 remaining stale Phase C tests
-  (they still call `_ocr_page_blocks` with a formula extractor positionally).
-- [ ] Isolate tests from the real `data/pipeline.db`: `storage/checkpoint.py`
-  binds `DB_PATH` at import; Phase C tests patch `extract.get_settings` only, so
-  the suite writes `document='doc'` rows into the production state store
-  (cleaned manually this session). Add a conftest fixture or settings injection.
-- [ ] Add `--providers` to `compare-layout-page` (default set omits Surya, so the
-  decision bundle can't include it) or include Surya when its service is up.
-- [ ] Fix the Surya cold-start timeout mismatch: client `_LAYOUT_SERVICE_TIMEOUT_SECONDS`
-  is 60 s vs ~417 s observed cold start — raise it, or pre-warm on service start.
-- [ ] PP-DocLayout formula false positives (29/page on page 6 even at
-  `formula_threshold=0.6`) — threshold tuning vs model behavior → may become a DEC.
+1. [ ] **Controlled-mode prerequisites** (blocking the layout decision, in order):
+   - [ ] **Per-provider `base_url`.** `LayoutSettings.base_url` is one scalar
+     (`config.py:172`) read by *both* the Surya (`providers.py:307`) and PaddleOCR
+     (`:368`) providers. Surya is on :8004, Paddle on :8003 → **a single process
+     cannot reach both**, so `compare_layout_page` structurally cannot compare them.
+   - [ ] **One shared label map.** Delete the two service-side maps
+     (`service.py:30`, `paddle_service.py:36`); services emit raw `provider_label`;
+     normalize once client-side. Fixes the dead-code path at `providers.py:450`.
+   - [ ] **One threshold, one place.** Prefer capturing regions *unfiltered* and
+     sweeping the threshold at analysis time → precision/recall curves instead of
+     one arbitrary operating point.
+   - [ ] **`render/raster.py`** — `RenderSpec` / `PageRaster` / `PageRenderer`
+     (DEC-0016). Controlled mode pins one spec across all providers.
+2. [ ] **Then** run the multi-page comparison and record the layout DEC.
+3. [ ] Fix the DEC-0004 offload leak (`try/finally` at both graph sites).
+4. [ ] Add Surya CPU fast-layout (v0.21.0) as a fourth comparison row.
+5. [ ] Raise `_LAYOUT_SERVICE_TIMEOUT_SECONDS` (60 s vs 417 s cold start) or split
+   `/load` (long) from `/detect` (short) — `providers.py:84`.
+6. [ ] **Decide formula-fallback semantics (spec §8.5 / RUL-0003)**: `_formula_page_blocks`
+   re-raises on extractor failure (`extract.py` ~617), takes no OCR provider, and
+   emits `FormulaFallback` with empty `raw_formula_text`; `formula.fallback_to_ocr`
+   is not honored there. Blocks the 3 stale Phase C tests.
+7. [ ] Isolate tests from the real `data/pipeline.db` (`storage/checkpoint.py` binds
+   `DB_PATH` at import; Phase C tests patch only `extract.get_settings`).
+8. [ ] Validate `region_type` against the SPEC §5.4 closed set — unmapped labels
+   currently pass through verbatim.
 
 ## Open Questions
 
-- [ ] Which layout model becomes the standard? (Formula-region counts differ 6–7×
-  between Paddle-family and Surya; which is closer to ground truth?)
-- [ ] Was dropping the OCR fallback from the formula path intentional, or
-  refactor fallout? (Blocks the 3 remaining test failures.)
+- [ ] Which layout model becomes the standard? **Cannot be answered until
+  controlled mode exists** (RUL-0007). Prior signal is void.
+- [ ] PP-DocLayoutV3's `id2label` has duplicate names — `formula` at both id 5 and
+  id 15, `footer` at 8/9, `header` at 12/13, `text` at 22/23 — which
+  `normalize_layout_label` collapses by name. Are two distinct formula subtypes
+  being flattened? Relevant to the 29-formula-regions-per-page question.
+- [ ] Was dropping the OCR fallback from the formula path intentional, or refactor
+  fallout? (Blocks the 3 remaining test failures.)
+- [ ] Should DEC-0016 be promoted to an ANCHOR.md Locked Decision? Deliberately
+  **not** promoted yet — it is accepted but unimplemented.
+- [ ] Is the CC 7.5 / no-bfloat16 constraint worth generalizing from RUL-0006 into
+  its own rule? It has now bitten twice (Surya vLLM, PaddleOCR-VL) and is the
+  strongest filter on provider selection. Proposed, not created.
 
 ## Blockers
 
-- None. (PaddleOCR `/detect` and Surya vLLM spawn both fixed this session;
-  Surya still requires Docker + ~7 min cold start per RUL-0006.)
+- None technical. All three providers run end-to-end on this machine. The layout
+  *decision* is blocked on controlled mode, which is work, not a blocker.
 
 ## Files touched this session
 
-- `src/pocket_specialist/phases/extract.py` — P0 NameError fix
-  (`layout_provider_name` threaded into `_run_layout_enabled_pdf_graph`).
-- `src/pocket_specialist/layout/paddle_service.py` — `enable_mkldnn=False` on
-  CPU; `coordinate` bbox parsing in `_bbox_from_payload`.
-- `src/pocket_specialist/layout/service.py` — snapshot backend handle before
-  `manager.stop()` in `_stop_loaded_backend`.
-- `tests/test_surya_layout_service.py` — offload fake now nulls the handle in
-  `stop()` (true regression test for the offload fix).
-- `wiki/RUL-0006.md`, `wiki/DEC-0015.md`, `wiki/INDEX.md` — new records + regen.
-- `STATE.md` — updated.
-- Carried over, still uncommitted: `compat/enrichment.py`, `compat/render.py`,
-  `compat/export.py` (RUL-0002/DEC-0014 sys.exit fixes).
+- `docs/layout-path-review.md` — **new**, full implementation-vs-expected review.
+- `wiki/CON-0004.md`, `wiki/DEC-0016.md`, `wiki/DEC-0017.md`, `wiki/RUL-0007.md` — new.
+- `wiki/INDEX.md` — regenerated (28 records).
+- `STATE.md` — this file.
+- **No source files were modified this session.**
 
 ## Run / test commands
 
@@ -124,9 +143,15 @@ PYTHONPATH=src services/paddleocr_layout_service/.venv/bin/python \
 VLLM_DTYPE=float16 PYTHONPATH=src services/surya_layout_service/.venv/bin/python \
   -m pocket_specialist.layout.service --host 127.0.0.1 --port 8004
 
-# Side-by-side comparison for a single page (Paddle service must be up;
-# point base_url at the right port)
+# Side-by-side comparison. NOTE: one base_url is shared by both service
+# providers, so today only ONE service can be reached per run — see Next #2.
 PIPELINE_LAYOUT_BASE_URL=http://127.0.0.1:8003 \
   PYTHONPATH=src .venv/bin/python -m pocket_specialist.cli \
   compare-layout-page <pdf> --page 6 --dpi 192 --output-dir /tmp/layout_compare
+
+# Verify what actually reaches PP-DocLayoutV3 (any DPI -> 800x800)
+PYTHONPATH=src .venv/bin/python -c "
+from transformers import AutoImageProcessor
+p = AutoImageProcessor.from_pretrained('PaddlePaddle/PP-DocLayoutV3_safetensors')
+print(p.size, p.do_resize)"
 ```
